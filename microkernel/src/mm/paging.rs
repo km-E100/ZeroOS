@@ -27,8 +27,15 @@ pub const USER_STACK_LEN: usize = 0x0000_0000_0002_0000; // 128 KiB user stack
 static mut ID_MAP_BASE: u64 = 0;
 static mut ID_MAP_SIZE: u64 = 0;
 /// Temporary kernel VA used to map arbitrary user-pages during ELF loading.
-/// Must lie inside the kernel's identity-mapped 2GiB region (L0[0]).
-const TEMP_ELF_MAP_BASE: usize = 0x0000_0000_3000_0000;
+/// Must lie inside the kernel L0[0] region (< 512GiB) but ABOVE the identity
+/// map's 2MiB blocks (>= 2GiB, L1 index >= 2), so that map_temp_page creates
+/// fresh L2/L3 tables instead of clobbering an existing block descriptor.
+///
+/// 此前 TEMP_ELF_MAP_BASE = 0x3000_0000 落在恒等映射的 2MiB block 内：
+/// ensure_child_table 把 block 描述符误当表描述符，L3 页表项被写到
+/// 物理 0x3000_0000（QEMU virt 空洞，写入被静默丢弃），临时映射从未
+/// 真正生效，用户进程代码页全是零。
+const TEMP_ELF_MAP_BASE: usize = 0x0000_0000_9000_0000;
 
 pub fn configure_identity_map(base: u64, size: u64) {
     unsafe {
@@ -323,6 +330,15 @@ unsafe fn ensure_child_table(
 ) -> Result<*mut PageTable, MapError> {
     let entry = (*parent).0[index];
     if entry & TABLE_DESC_VALID != 0 {
+        if entry & TABLE_DESC_TABLE == 0 {
+            // 条目是 block 描述符（bit1=0），不能当作下级表使用。
+            // 历史上 map_temp_page 因此把 L3 页表项写穿到 block 的物理地址
+            // （0x3000_0000），临时映射从未生效。这里直接 panic 暴露错误。
+            panic!(
+                "ensure_child_table: block descriptor 0x{:016x} at table index {} cannot be used as a table",
+                entry, index
+            );
+        }
         Ok(descriptor_to_table(entry))
     } else {
         let table = alloc_page_table_fallible()?;
