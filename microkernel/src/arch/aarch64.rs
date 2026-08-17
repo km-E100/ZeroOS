@@ -116,10 +116,17 @@ pub unsafe fn disable_irq(id: u32) {
 pub unsafe fn install_kernel_page_table(l1_phys: u64) {
     // 将 TTBR0_EL1/TTBR1_EL1 都指向同一个根页表。
     // 在保留固件 TCR/MAIR 配置的前提下，接管整个 EL1/EL0 地址空间。
+    //
+    // 切换后必须刷新 TLB：固件映射的残留条目会掩盖新页表的属性，
+    // 内核会"靠旧 TLB 苟活"，直到第一次取指冷页才崩溃
+    // （2025-11-15 死机日志的第二个根因）。
     asm!(
         "dsb ish",
         "msr ttbr0_el1, {0}",
         "msr ttbr1_el1, {0}",
+        "isb",
+        "tlbi vmalle1",
+        "dsb ish",
         "isb",
         in(reg) l1_phys,
         options(nostack)
@@ -139,9 +146,13 @@ pub unsafe fn enable_interrupts() {
 }
 
 pub unsafe fn set_user_ttbr(root_phys: u64) {
+    // 切换 TTBR0 后同样刷新 TLB，避免跨地址空间残留映射。
     asm!(
         "dsb ish",
         "msr ttbr0_el1, {0}",
+        "isb",
+        "tlbi vmalle1",
+        "dsb ish",
         "isb",
         in(reg) root_phys,
         options(nostack)

@@ -54,17 +54,22 @@ pub unsafe fn init_kernel_page_table() {
     const BLOCKS_PER_L2: usize = 512; // 512 * 2MiB = 1GiB
     const NUM_L2_TABLES: usize = 2; // map first 2 GiB via two L2 tables
 
-    // 页面属性：有效 block，Normal 内存，Inner-shareable，AF=1，
-    // AP=RW for EL0/EL1（暂时不做特权隔离，先保证 EL0 可访问栈与内核段）。
+    // 页面属性：有效 block，Normal 内存，Inner-shareable，AF=1。
+    // AP[2:1]=0b00 => EL1 可读写，EL0 无访问权限（内核恒等映射不对用户态开放）。
+    //
+    // 注意：此前的实现错误地在 BLOCK_FLAGS 里加了 DESC_PXN（bit 53），
+    // 导致整个恒等映射对 EL1 也禁止取指：内核一旦真正走自己的页表取指
+    // 就触发 permission fault（2025-11-15 死机日志的根因）。修复方式是
+    // 去掉 PXN，并在切换页表后刷新 TLB（见 arch/aarch64.rs）。
     const PTE_VALID: u64 = 1 << 0;
     const PTE_BLOCK: u64 = 0 << 1;
     const PTE_AF: u64 = 1 << 10;
     const PTE_SH_INNER: u64 = 3 << 8;
-    // AP[2:1]=00 => EL0/EL1 均可读写。
-    const PTE_AP_RW_ALL: u64 = 0 << 6;
+    // AP[2:1]=0b00 => EL1 RW，EL0 无权限（ARMv8-A D5.3.3）。
+    const PTE_AP_EL1_RW_EL0_NONE: u64 = 0 << 6;
     const PTE_ATTRIDX0: u64 = 0 << 2;
     const BLOCK_FLAGS: u64 =
-        PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | PTE_AP_RW_ALL | PTE_ATTRIDX0 | DESC_PXN;
+        PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | PTE_AP_EL1_RW_EL0_NONE | PTE_ATTRIDX0;
 
     // L0: 根表，所有 entry 先清零。
     let l0 =
