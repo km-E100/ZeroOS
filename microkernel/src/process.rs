@@ -164,8 +164,14 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
     pid
 }
 
-pub fn spawn_user(_entry: ThreadEntry, _name: &'static str) -> ProcessId {
-    panic!("spawn_user() is deprecated. Use spawn_user_from_bootfs() instead.");
+pub fn spawn_user(entry: ThreadEntry, name: &'static str) -> ProcessId {
+    // 恢复真实实现：console shell 是编译进内核的"内核内进程"，
+    // 以函数指针为入口（与 ServiceEntry::KernelFn 同类）。
+    // 注意：入口位于内核镜像内，进程以 EL0 运行，首次取指会因
+    // 内核页表 AP=00（EL0 无权限）触发 instruction abort 而被终止
+    // ——用户态异常路径的修复属于后续工作。
+    crate::info!("process::spawn_user called for name={}", name);
+    spawn(entry, name)
 }
 
 pub fn spawn_user_from_bootfs(
