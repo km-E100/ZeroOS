@@ -143,13 +143,17 @@ pub unsafe fn init_kernel_page_table() {
 }
 
 pub unsafe fn activate_kernel_page_table() {
-    // 固件的 TCR_EL1 配置（T0SZ=20, TG0=4KiB）以 L1 作为翻译起始级别，
-    // 因此 TTBR0/TTBR1 应该指向内核 L1 页表。
-    let l1_virt = unsafe { &crate::mm::kernel_l1::__zero_kernel_l1 as *const PageTable as usize };
-    let l1_phys = l1_virt as u64; // identity mapping
-    crate::info!("paging: installing kernel L1 @phys=0x{:016x}", l1_phys);
+    // 固件 TCR_EL1 的 T0SZ=20（44-bit VA，4KiB granule）=> 翻译起始级是 L0，
+    // TTBR0/TTBR1 必须指向 L0 根表（kernel_l0），而不是 L1 表。
+    //
+    // 此前错误地指向 L1 表：在 TLB 未被刷新时固件残留映射掩盖了错误，
+    // 一旦刷新 TLB（修复后），L1 表会被硬件当作 L0 表解读，
+    // 内核取指立即翻译到错误的物理地址（实机验证：切表即崩）。
+    let l0_virt = unsafe { &crate::mm::kernel_l0::__zero_kernel_l0 as *const PageTable as usize };
+    let l0_phys = l0_virt as u64; // identity mapping
+    crate::info!("paging: installing kernel L0 @phys=0x{:016x}", l0_phys);
     unsafe {
-        crate::arch::install_kernel_page_table(l1_phys);
+        crate::arch::install_kernel_page_table(l0_phys);
     }
 }
 
@@ -420,7 +424,7 @@ pub unsafe fn activate_user_address_space(addr_space: &AddressSpace) {
 }
 
 pub unsafe fn deactivate_user_address_space() {
-    crate::arch::set_user_ttbr(kernel_l1_phys());
+    crate::arch::set_user_ttbr(kernel_l0_phys());
 }
 
 #[allow(static_mut_refs)]
@@ -429,8 +433,8 @@ pub unsafe fn destroy_user_address_space(space: &AddressSpace) {
     // 目前没有为每个进程分配独立页表，无需回收。
 }
 
-fn kernel_l1_phys() -> u64 {
-    unsafe { &crate::mm::kernel_l1::__zero_kernel_l1 as *const PageTable as usize as u64 }
+fn kernel_l0_phys() -> u64 {
+    unsafe { &crate::mm::kernel_l0::__zero_kernel_l0 as *const PageTable as usize as u64 }
 }
 
 pub unsafe fn map_user_phys_page(
