@@ -1,0 +1,7 @@
+#!/bin/sh
+APP_ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+echo "Hello from Zero OS sample app!"
+if [ -f "$APP_ROOT/Resources/message.txt" ]; then
+    echo "---"
+    cat "$APP_ROOT/Resources/message.txt"
+fi

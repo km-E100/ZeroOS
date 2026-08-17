@@ -1,0 +1,9 @@
+name = "Hello"
+identifier = "com.zero.templates.hello"
+version = "1.0.0"
+storage = "HelloData"
+
+# 选填字段，演示可扩展配置。
+description = "Zero OS 示例应用，展示 main/config 新结构"
+permissions = ["console.write"]
+args = []

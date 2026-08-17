@@ -1,0 +1,15 @@
+[package]
+name = "zero-microkernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+spin = { workspace = true }
+heapless = { version = "0.8", default-features = false }
+userlib = { path = "../userland/userlib" }
+[dependencies.zero-abi]
+path = "../libs/abi"

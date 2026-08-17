@@ -1,0 +1,12 @@
+[package]
+name = "zero-installer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+anyhow = "1"
+mkzfs = { path = "../tools" }

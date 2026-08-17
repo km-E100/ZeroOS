@@ -1,0 +1,59 @@
+rustup toolchain install nightly
+rustup target add aarch64-unknown-none --toolchain nightly
+
+
+# 构建用户态服务与工具
+cargo run -p xtask -- build-servers
+cargo run -p xtask -- build-installer
+cargo run -p xtask -- build-recovery
+
+# 构建微内核/裸机内核
+cargo run -p xtask -- build-kernel
+cargo +nightly build \
+  -Z build-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-none \
+  -p zero-kernel
+
+
+# 构建 Zero OS UEFI 引导程序
+cargo +nightly build \
+  -Z build-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-uefi \
+  -p bootloader-uefi
+
+
+# 把 kernel/rootfs 目录打包为 bundle
+cargo run -p xtask -- build-rootfs
+
+# 调用安装器，用 mkzfs 写出 rootfs 镜像
+cargo run -p zero-installer
+
+
+# 收集内核、rootfs、工具并打包成 ISO
+cargo run -p xtask -- build-iso
+
+# Zero OS 自研 UEFI Loader 默认 0 秒进入系统，连续失败 3 次自动进入恢复。
+# Zero OS 成功启动后请在系统里执行 `bootctl`
+# （默认操作 /boot/EFI/ZEROOS/boot.env）清除失败计数。
+
+
+qemu-system-aarch64 \
+  -machine virt \
+  -cpu cortex-a72 \
+  -m 1024 \
+  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+  -serial mon:stdio \
+  -display none \
+  -cdrom target/zero-os.iso
+
+
+qemu-system-aarch64 \
+  -machine virt \
+  -cpu cortex-a72 \
+  -m 1024 \
+  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+  -serial mon:stdio \
+  -display none \
+  -cdrom target/zero-os.iso \
+  -drive if=none,file=target/zero-rootfs.img,format=raw,id=zdisk \
+  -device virtio-blk-device,drive=zdisk,bus=virtio-mmio-bus.0

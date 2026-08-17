@@ -1,0 +1,8 @@
+# 构建产物
+/target/
+
+# macOS 垃圾
+.DS_Store
+
+# 运行日志（遗物 qemu.log 已压缩为 qemu.log.gz 存档）
+/qemu.log
