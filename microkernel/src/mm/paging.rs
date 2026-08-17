@@ -259,9 +259,13 @@ pub unsafe fn map_temp_page(phys: usize) -> *mut u8 {
     }
     let l1 = (&crate::mm::kernel_l1::__zero_kernel_l1 as *const PageTable) as *mut PageTable;
 
-    let l2 = ensure_child_table(l1, l2_idx).expect("temp map: ensure L2");
+    // 逐级使用对应的索引（l1_idx / l2_idx / l3_idx）。
+    // 此前误用 l2_idx 作 L1 表索引、l3_idx 作 L2 表索引，页表项全部
+    // 写错位置：0x30000000 时代写穿到 block 地址；0x90000000 时代
+    // walk 落在 L1[2]=0 上，直接 translation fault level 1。
+    let l2 = ensure_child_table(l1, l1_idx).expect("temp map: ensure L2");
     TEMP_L2 = l2;
-    let l3 = ensure_child_table(l2, l3_idx).expect("temp map: ensure L3");
+    let l3 = ensure_child_table(l2, l2_idx).expect("temp map: ensure L3");
     TEMP_L3 = l3;
 
     let phys_masked = (phys as u64) & PHYS_ADDR_MASK;
