@@ -1,6 +1,6 @@
 use crate::elf::{PF_W, PF_X};
 use crate::mm::address_space::{self, AddressSpace, MapError, USER_STACK_LEN, USER_STACK_TOP};
-use crate::mm::paging::{map_temp_page, unmap_temp_page, PAGE_SIZE};
+use crate::mm::paging::PAGE_SIZE;
 use crate::mm::phys;
 use crate::rootfs;
 use crate::user_elf;
@@ -408,8 +408,9 @@ fn map_user_elf_segments(
             let page_last = page_va + PAGE_SIZE;
             let copy_start = cmp::max(seg_start, page_first);
             let copy_end = cmp::min(seg_start + data_len, page_last);
-            let kptr = unsafe { map_temp_page(phys) };
+            // 恒等映射下物理页可直接读写，无需临时映射。
             unsafe {
+                let kptr = phys as *mut u8;
                 core::ptr::write_bytes(kptr, 0, PAGE_SIZE);
                 if copy_start < copy_end {
                     let src_off = copy_start - seg_start;
@@ -421,7 +422,6 @@ fn map_user_elf_segments(
                         len,
                     );
                 }
-                unmap_temp_page();
             }
             unsafe {
                 space.map_page_phys(page_va, phys, writable, executable)?;

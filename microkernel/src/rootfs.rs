@@ -4,7 +4,7 @@ use core::{cmp, mem, ptr};
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::mm::address_space::{AddressSpace, MapError};
-use crate::mm::paging::{map_temp_page, unmap_temp_page, PAGE_SIZE};
+use crate::mm::paging::PAGE_SIZE;
 use crate::mm::phys;
 use spin::Mutex;
 use zero_abi::boot::{RootFsEntry, RootFsImage};
@@ -127,9 +127,8 @@ pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, us
 
         let path_phys = phys::alloc_page().expect("bootfs: OOM");
         unsafe {
-            let dst = map_temp_page(path_phys);
-            core::ptr::copy_nonoverlapping(path.as_ptr(), dst, path_len);
-            unmap_temp_page();
+            // 恒等映射下物理页可直接写入。
+            core::ptr::copy_nonoverlapping(path.as_ptr(), path_phys as *mut u8, path_len);
         }
 
         let data = unsafe { entry.data() };
@@ -139,9 +138,7 @@ pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, us
 
         let data_phys = phys::alloc_page().expect("bootfs: OOM");
         unsafe {
-            let dst = map_temp_page(data_phys);
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data_len);
-            unmap_temp_page();
+            core::ptr::copy_nonoverlapping(data.as_ptr(), data_phys as *mut u8, data_len);
         }
 
         files.push(UserBootFile {
@@ -225,12 +222,12 @@ pub fn build_user_bootfs_for_process(
         let phys = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
 
         unsafe {
-            let dst = map_temp_page(phys);
+            // 恒等映射下物理页可直接写入。
+            let dst = phys as *mut u8;
             ptr::copy_nonoverlapping(meta_bytes.as_ptr().add(offset), dst, chunk);
             if chunk < PAGE_SIZE {
                 ptr::write_bytes(dst.add(chunk), 0, PAGE_SIZE - chunk);
             }
-            unmap_temp_page();
             aspace.map_page_phys(virt, phys, true, false)?;
         }
 

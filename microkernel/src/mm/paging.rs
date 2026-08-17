@@ -1,6 +1,4 @@
-use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::phys;
 
@@ -26,16 +24,6 @@ pub const USER_STACK_TOP: usize = 0x0000_FFFF_F000;
 pub const USER_STACK_LEN: usize = 0x0000_0000_0002_0000; // 128 KiB user stack
 static mut ID_MAP_BASE: u64 = 0;
 static mut ID_MAP_SIZE: u64 = 0;
-/// Temporary kernel VA used to map arbitrary user-pages during ELF loading.
-/// Must lie inside the kernel L0[0] region (< 512GiB) but ABOVE the identity
-/// map's 2MiB blocks (>= 2GiB, L1 index >= 2), so that map_temp_page creates
-/// fresh L2/L3 tables instead of clobbering an existing block descriptor.
-///
-/// 此前 TEMP_ELF_MAP_BASE = 0x3000_0000 落在恒等映射的 2MiB block 内：
-/// ensure_child_table 把 block 描述符误当表描述符，L3 页表项被写到
-/// 物理 0x3000_0000（QEMU virt 空洞，写入被静默丢弃），临时映射从未
-/// 真正生效，用户进程代码页全是零。
-const TEMP_ELF_MAP_BASE: usize = 0x0000_0000_9000_0000;
 
 pub fn configure_identity_map(base: u64, size: u64) {
     unsafe {
@@ -228,77 +216,11 @@ fn alloc_page_table_fallible() -> Result<*mut PageTable, MapError> {
     alloc_page_table_raw().ok_or(MapError::OutOfMemory)
 }
 
-static mut TEMP_L2: *mut PageTable = core::ptr::null_mut();
-static mut TEMP_L3: *mut PageTable = core::ptr::null_mut();
-static ZERO_TEMP_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 unsafe fn zero_physical_page(phys: usize) {
-    if ZERO_TEMP_ACTIVE
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_ok()
-    {
-        let tmp = map_temp_page(phys);
-        ptr::write_bytes(tmp, 0, PAGE_SIZE);
-        unmap_temp_page();
-        ZERO_TEMP_ACTIVE.store(false, Ordering::Release);
-    } else {
-        // Re-entrant zeroing can occur while map_temp_page() is instantiating
-        // its own page tables; fall back to the identity-mapped alias.
-        ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
-    }
-}
-
-/// Map a single physical page at a reserved kernel VA for temporary access.
-pub unsafe fn map_temp_page(phys: usize) -> *mut u8 {
-    let va = TEMP_ELF_MAP_BASE;
-    let (l0_idx, l1_idx, l2_idx, l3_idx) = page_table_indices(va);
-
-    if l0_idx != 0 {
-        // Kernel L0 currently only wires index 0; using others would require more setup.
-        panic!("temp map: L0 index {} unsupported", l0_idx);
-    }
-    let l1 = (&crate::mm::kernel_l1::__zero_kernel_l1 as *const PageTable) as *mut PageTable;
-
-    // 逐级使用对应的索引（l1_idx / l2_idx / l3_idx）。
-    // 此前误用 l2_idx 作 L1 表索引、l3_idx 作 L2 表索引，页表项全部
-    // 写错位置：0x30000000 时代写穿到 block 地址；0x90000000 时代
-    // walk 落在 L1[2]=0 上，直接 translation fault level 1。
-    let l2 = ensure_child_table(l1, l1_idx).expect("temp map: ensure L2");
-    TEMP_L2 = l2;
-    let l3 = ensure_child_table(l2, l2_idx).expect("temp map: ensure L3");
-    TEMP_L3 = l3;
-
-    let phys_masked = (phys as u64) & PHYS_ADDR_MASK;
-    // Kernel RW, inner-shareable, AF=1, non-executable.
-    let desc = phys_masked
-        | DESC_VALID
-        | (AP_EL1_RW_EL0_NONE << AP_SHIFT)
-        | DESC_AF
-        | DESC_SH_INNER
-        | DESC_ATTRIDX_NORMAL
-        | DESC_UXN
-        | DESC_PXN;
-    (*l3).0[l3_idx] = desc;
-    asm!("dsb ish; isb", options(nostack));
-    crate::info!("temp map: phys=0x{:016x} -> virt=0x{:016x}", phys, va);
-    va as *mut u8
-}
-
-pub unsafe fn unmap_temp_page() {
-    let va = TEMP_ELF_MAP_BASE;
-    if TEMP_L3.is_null() {
-        return;
-    }
-    let (_, _, _, l3_idx) = page_table_indices(va);
-    (*TEMP_L3).0[l3_idx] = 0;
-    asm!(
-        "dsb ish",
-        "tlbi vae1is, {addr}",
-        "dsb ish",
-        "isb",
-        addr = in(reg) (va as u64 >> 12),
-        options(nostack)
-    );
+    // 内核恒等映射覆盖整个 RAM，物理页可以直接按地址清零，
+    // 无需临时映射（map_temp_page 的页表建立与清零互相递归，
+    // 且索引/表覆盖问题曾导致写穿与 translation fault）。
+    ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
 }
 
 #[allow(static_mut_refs)]
@@ -418,9 +340,8 @@ unsafe fn map_zero_region(
     while mapped < total {
         let virt = base + mapped;
         let phys = alloc_user_page()?;
-        let kptr = map_temp_page(phys);
-        ptr::write_bytes(kptr, 0, PAGE_SIZE);
-        unmap_temp_page();
+        // 恒等映射下物理页可直接清零，无需临时映射。
+        ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
         map_physical_page(space, virt, phys, ap, false)?;
         mapped += PAGE_SIZE;
     }
