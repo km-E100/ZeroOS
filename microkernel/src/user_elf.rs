@@ -4,7 +4,7 @@
 use heapless::Vec;
 
 use crate::elf::{
-    parse_elf_header, parse_program_headers, ElfError, ElfProgramHeader, PF_X, PT_LOAD,
+    parse_elf_header, parse_program_header, ElfError, ElfProgramHeader, PF_X, PT_LOAD,
 };
 use crate::rootfs;
 
@@ -24,15 +24,15 @@ pub struct UserElf {
 pub fn build_user_elf(path: &str) -> Result<UserElf, ElfError> {
     let elf_bytes = rootfs::read_file(path).ok_or(ElfError::FileNotFound)?;
     let ehdr = parse_elf_header(elf_bytes)?;
-    let phdrs = parse_program_headers(elf_bytes, &ehdr)?;
 
     let mut segments: Vec<UserElfSegment, 8> = Vec::new();
     let mut entry_vaddr: Option<u64> = None;
-    for ph in phdrs {
+    for index in 0..ehdr.phnum {
+        let ph = parse_program_header(elf_bytes, &ehdr, index as usize)?;
         if ph.p_type != PT_LOAD {
             continue;
         }
-        validate_segment_bounds(ph, elf_bytes.len())?;
+        validate_segment_bounds(&ph, elf_bytes.len())?;
         if entry_vaddr.is_none() && (ph.p_flags & PF_X) != 0 {
             entry_vaddr = Some(ph.p_vaddr);
         }

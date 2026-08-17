@@ -105,38 +105,46 @@ pub fn parse_elf_header(data: &[u8]) -> Result<ElfHeader, ElfError> {
     })
 }
 
-/// Parse the program header table. Returns a slice backed by `data`.
+/// Read the index-th program header by byte-copying its fields.
 ///
-/// If `phnum` is zero, an empty slice is returned.
-pub fn parse_program_headers<'a>(
-    data: &'a [u8],
+/// 按索引逐字段字节拷贝（小端），不依赖输入数据的对齐：
+/// include_bytes! 嵌入的 rootfs 文件在 .rodata 中只按 1 字节对齐，
+/// 直接强转 *const ElfProgramHeader（align 8）会触发 UB。
+pub fn parse_program_header(
+    data: &[u8],
     ehdr: &ElfHeader,
-) -> Result<&'a [ElfProgramHeader], ElfError> {
+    index: usize,
+) -> Result<ElfProgramHeader, ElfError> {
     let entsz = ehdr.phentsize as usize;
     if entsz != core::mem::size_of::<ElfProgramHeader>() {
         return Err(ElfError::UnsupportedProgramHeaderSize);
     }
     let count = ehdr.phnum as usize;
-    // Allow zero headers; return an empty slice.
-    if count == 0 {
-        return Ok(&[]);
+    if index >= count {
+        return Err(ElfError::InvalidProgramHeaderCount);
     }
 
     let phoff = ehdr.phoff as usize;
-    let total = entsz
-        .checked_mul(count)
-        .ok_or(ElfError::ProgramHeaderSizeMismatch)?;
-    let end = phoff
-        .checked_add(total)
+    let off = phoff
+        .checked_add(index * entsz)
+        .ok_or(ElfError::ProgramHeaderOutOfBounds)?;
+    let end = off
+        .checked_add(entsz)
         .ok_or(ElfError::ProgramHeaderOutOfBounds)?;
     if end > data.len() {
         return Err(ElfError::ProgramHeaderOutOfBounds);
     }
 
-    // Safety: bounds checked above; layout matches #[repr(C)] ElfProgramHeader.
-    let slice = unsafe {
-        let ptr = data.as_ptr().add(phoff) as *const ElfProgramHeader;
-        core::slice::from_raw_parts(ptr, count)
-    };
-    Ok(slice)
+    let b = &data[off..end];
+    // ELF64 小端 phdr 布局：p_type u32, p_flags u32, 六个 u64。
+    Ok(ElfProgramHeader {
+        p_type: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+        p_flags: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+        p_offset: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+        p_vaddr: u64::from_le_bytes(b[16..24].try_into().unwrap()),
+        p_paddr: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        p_filesz: u64::from_le_bytes(b[32..40].try_into().unwrap()),
+        p_memsz: u64::from_le_bytes(b[40..48].try_into().unwrap()),
+        p_align: u64::from_le_bytes(b[48..56].try_into().unwrap()),
+    })
 }
