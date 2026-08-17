@@ -16,12 +16,16 @@ pub fn init_arch(boot_info: &BootInfo) {
     arch::init(boot_info);
     crate::info!("boot::init_arch: arch init done");
     crate::info!("boot::init_arch: mm init");
-    // 保留 [0, __bss_end) 给内核自身（镜像 + 页表 + 栈），
+    // 保留 RAM 内 [0, kernel_image_bytes) 给内核自身（镜像 + 页表 + 栈），
     // 避免物理分配器把内核 .bss 页分配出去导致页表/栈被覆盖。
+    // 注意：__bss_end 是 VA（内核链接在 0x4000_0000 起），分配器的保留
+    // 参数是 RAM 内偏移字节数，必须减去 RAM_BASE，否则保留量会超过
+    // 总内存导致全部内存被保留、alloc 必 OOM。
     let kernel_end = unsafe { &__bss_end as *const u8 as usize };
-    let reserved = kernel_end.max(16 * 1024 * 1024);
+    let kernel_image_bytes = kernel_end.saturating_sub(crate::mm::phys::RAM_BASE);
+    let reserved = kernel_image_bytes.max(16 * 1024 * 1024);
     crate::info!(
-        "boot::init_arch: reserving 0x{:x} bytes for kernel image",
+        "boot::init_arch: reserving 0x{:x} bytes of RAM for kernel image",
         reserved
     );
     mm::init(512 * 1024 * 1024, reserved);

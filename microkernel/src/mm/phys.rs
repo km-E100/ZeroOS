@@ -4,6 +4,11 @@ use spin::Mutex;
 pub const PAGE_SIZE: usize = 4096;
 const MAX_PAGES: usize = 1024 * 1024; // 4 GiB / 4KiB pages (upper bound)
 
+/// QEMU virt 机器的 RAM 物理基址（1GiB 内存时区间为 0x4000_0000..0x8000_0000）。
+/// 此前分配器把物理地址 0 当作 RAM 起点，分配出的"物理页"全部落在
+/// 固件/MMIO 空洞（0x1007000 等），用户数据写进去被静默丢弃。
+pub const RAM_BASE: usize = 0x4000_0000;
+
 static BITMAP: Mutex<[u64; MAX_PAGES / 64]> = Mutex::new([0; MAX_PAGES / 64]);
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 static FREE_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -58,7 +63,7 @@ pub fn alloc_page() -> Option<usize> {
             if (*slot & (1u64 << bit)) == 0 {
                 *slot |= 1u64 << bit;
                 FREE_PAGES.fetch_sub(1, Ordering::SeqCst);
-                return Some(page * PAGE_SIZE);
+                return Some(RAM_BASE + page * PAGE_SIZE);
             }
         }
     }
@@ -66,7 +71,7 @@ pub fn alloc_page() -> Option<usize> {
 }
 
 pub fn free_page(addr: usize) {
-    let page = addr / PAGE_SIZE;
+    let page = addr.saturating_sub(RAM_BASE) / PAGE_SIZE;
     let mut bitmap = BITMAP.lock();
     clear_bit(&mut bitmap[..], page);
     FREE_PAGES.fetch_add(1, Ordering::SeqCst);
