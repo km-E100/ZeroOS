@@ -51,7 +51,11 @@ pub mod boot {
         }
 
         pub unsafe fn as_slice(&self) -> &'static [RootFsEntry] {
-            slice::from_raw_parts(self.entries, self.entry_count)
+            if self.entries.is_null() || self.entry_count == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(self.entries, self.entry_count)
+            }
         }
     }
 
@@ -123,7 +127,11 @@ pub mod driver {
         }
 
         pub unsafe fn as_slice(&self) -> &'static [DriverDescriptor] {
-            slice::from_raw_parts(self.entries, self.count)
+            if self.entries.is_null() || self.count == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(self.entries, self.count)
+            }
         }
     }
 

@@ -1,6 +1,11 @@
 use zero_abi::boot::{RootFsEntry, RootFsImage};
 
-const ROOTFS_ENTRIES: [RootFsEntry; 6] = [
+// 内核自带的 rootfs 条目。通过 #[no_mangle] 强符号覆盖 boot/boot.S 中
+// 同名弱符号（默认是 .quad 0 占位），使 boot_info_struct 指向真实数据。
+#[no_mangle]
+#[used]
+#[link_section = ".rodata.boot"]
+pub static __zero_rootfs_entries: [RootFsEntry; 6] = [
     RootFsEntry::new(
         "/etc/motd",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs/etc/motd")),
@@ -39,12 +44,10 @@ const ROOTFS_ENTRIES: [RootFsEntry; 6] = [
     ),
 ];
 
-//#[no_mangle]
-//#[used]
-//pub static __zero_rootfs_entries: [RootFsEntry; ROOTFS_ENTRIES.len()] = ROOTFS_ENTRIES;
-
-//#[no_mangle]
-//#[used]
-//#[link_section = ".rodata.boot"]
-//pub static __zero_rootfs_image: RootFsImage =
-//    RootFsImage::new(__zero_rootfs_entries.as_ptr(), __zero_rootfs_entries.len());
+#[no_mangle]
+#[used]
+#[link_section = ".rodata.boot"]
+pub static __zero_rootfs_image: RootFsImage = RootFsImage::new(
+    &__zero_rootfs_entries as *const RootFsEntry,
+    __zero_rootfs_entries.len(),
+);

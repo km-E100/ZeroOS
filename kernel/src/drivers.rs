@@ -1,6 +1,11 @@
 use zero_abi::driver::{DriverDescriptor, DriverKind, DriverTable};
 
-const DRIVER_DESCRIPTORS: [DriverDescriptor; 3] = [
+// QEMU virt 平台的驱动描述符，通过强符号覆盖 boot.S 弱符号占位，
+// 内核 drivers::init 才能拿到真实的设备表。
+#[no_mangle]
+#[used]
+#[link_section = ".rodata.boot"]
+pub static __zero_driver_entries: [DriverDescriptor; 3] = [
     DriverDescriptor::new("uart0-pl011", DriverKind::Pl011, 0x0900_0000, 0x1000, 33),
     DriverDescriptor::new(
         "virtio-blk0",
@@ -18,9 +23,10 @@ const DRIVER_DESCRIPTORS: [DriverDescriptor; 3] = [
     ),
 ];
 
-//#[no_mangle]
-//pub static __zero_driver_entries: [DriverDescriptor; DRIVER_DESCRIPTORS.len()] = DRIVER_DESCRIPTORS;
-
-//#[no_mangle]
-//pub static __zero_driver_table: DriverTable =
-//    DriverTable::new(__zero_driver_entries.as_ptr(), __zero_driver_entries.len());
+#[no_mangle]
+#[used]
+#[link_section = ".rodata.boot"]
+pub static __zero_driver_table: DriverTable = DriverTable::new(
+    &__zero_driver_entries as *const DriverDescriptor,
+    __zero_driver_entries.len(),
+);

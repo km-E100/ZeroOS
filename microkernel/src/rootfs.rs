@@ -248,6 +248,17 @@ pub fn build_user_bootfs_for_process(
 // -----------------------------------------------------------------------------
 //  read_file() – load file contents
 // -----------------------------------------------------------------------------
-pub fn read_file(_path: &str) -> Option<&'static [u8]> {
+/// 在根文件系统镜像中按路径查找文件内容。
+/// 此前实现永远返回 None，导致 build_user_elf / map_user_elf_segments
+/// 全部失败，任何用户进程都无法启动。
+pub fn read_file(path: &str) -> Option<&'static [u8]> {
+    let image = image()?;
+    let entries = unsafe { image.as_slice() };
+    for entry in entries {
+        let entry_path = unsafe { entry.path() };
+        if entry_path == path {
+            return Some(unsafe { entry.data() });
+        }
+    }
     None
 }
