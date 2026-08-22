@@ -34,12 +34,22 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
         return;
     }
     let total = usize::min(memory_bytes / PAGE_SIZE, MAX_PAGES);
-    let reserved =
-        usize::min(reserved_bytes / PAGE_SIZE, total).max(1);
+    // ⚠ 必须天花板除法：地板除会把保留区**末尾不满一页的零头**（如
+    // __bss_end 只溢出 0x40 字节）让给分配器——首个页表分配恰好领到
+    // 该页并写入描述符，砸碎落在页首的内核静态变量（实机：
+    // ROOTFS_PTR@__bss_end-0x40 被写成 0x4101e003，launchd spawn 即崩）。
+    let reserved = usize::min(reserved_pages_for(reserved_bytes), total).max(1);
     let mut mm = MM.lock();
     unsafe {
         mm.init(BITMAP_WORDS.as_ptr() as *mut u64, BITMAP_WORDS.len(), RAM_BASE, total, reserved);
     }
+}
+
+/// 保留**字节数** → 保留页数：天花板除法（部分末页必须整页保留）。
+/// ⚠ 回归背景：地板除曾把 __bss_end 溢出 0x40 字节的末页让给分配器，
+/// 首个页表分配写入描述符砸碎页首内核静态变量（ROOTFS_PTR 实机崩）。
+pub const fn reserved_pages_for(bytes: usize) -> usize {
+    bytes.div_ceil(PAGE_SIZE)
 }
 
 /// 分配一页物理内存，返回物理地址；无空闲页返回 None。
@@ -78,6 +88,21 @@ pub fn free_pages() -> usize {
 
 pub fn page_table_pages() -> usize {
     PAGE_TABLE_PAGES.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reservation_bytes_round_up_to_pages() {
+        // 回归：0x40 字节零头也必须占满一页
+        assert_eq!(reserved_pages_for(0), 0);
+        assert_eq!(reserved_pages_for(1), 1);
+        assert_eq!(reserved_pages_for(4096), 1);
+        assert_eq!(reserved_pages_for(4097), 2);
+        assert_eq!(reserved_pages_for(0x101d040), 0x101e);
+    }
 }
 
 pub fn total_pages() -> usize {
