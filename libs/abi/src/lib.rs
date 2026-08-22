@@ -460,11 +460,11 @@ pub mod ipc {
 ///
 /// 调用约定见 crate 级文档；返回值见 [`SyscallResult`]。
 ///
-/// ## 未实现号位
+/// ## 实现状态（2026-08-22 核对）
 ///
-/// [`GetPid`](Syscall::GetPid)（号位 21）已占位但**内核尚未实现**
-/// （`trap.rs` 解码到未知号会终止进程），调用前必须由内核 Agent
-/// 完成 `decode_syscall` 与 `syscalls::handle` 的对接。
+/// 号位 0–21 已全部在内核 `trap.rs::decode_syscall` + `syscalls::handle`
+/// 落地；GetPid 已实机验证（shell `pid` 命令返回正确 PID）。
+/// 阻塞语义：号位 1 空队列时挂起进程，send 唤醒（continuation 收尾）。
 pub mod syscall {
     use super::ThreadEntry;
 
@@ -563,9 +563,7 @@ pub mod syscall {
             name_ptr: usize,
             name_len: usize,
         },
-        /// (21) 查询当前进程 PID。**号位已冻结，内核实现待协调** ——
-        /// 在 `microkernel/src/trap.rs` 与 `syscalls.rs` 对接前调用
-        /// 会被当作未知系统调用终止进程。
+        /// (21) 查询当前进程 PID（已实现并实机验证）。
         GetPid,
     }
 
