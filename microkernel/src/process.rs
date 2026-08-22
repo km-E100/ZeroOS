@@ -71,6 +71,9 @@ struct ProcessRecord {
     entry_point: Option<usize>,
     user_stack_top: Option<usize>,
     started: bool,
+    /// 挂起的阻塞接收（通道号）：进程在阻塞中被唤醒后，由 dispatch 在
+    /// 重入用户态前完成该系统调用的收尾（continuation 语义，对照 XNU）。
+    pending_recv: Option<u32>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(2);
@@ -167,6 +170,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         entry_point: None,
         user_stack_top: None,
         started: true,
+        pending_recv: None,
     });
 
     pid
@@ -279,6 +283,26 @@ pub fn set_state_slot(slot: usize, state: ProcessState) {
     if let Some(record) = &mut table[slot] {
         record.state = state;
     }
+}
+
+/// 设置/取走挂起的阻塞接收（continuation 机制，见 ProcessRecord 注释）。
+pub fn set_pending_recv(slot: usize, chan: u32) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(record) = &mut table[slot] {
+        record.pending_recv = Some(chan);
+    }
+}
+
+/// 取走挂起标记（dispatch 在重入用户态前调用一次）。
+pub fn take_pending_recv(slot: usize) -> Option<u32> {
+    let mut table = PROCESS_TABLE.lock();
+    table.get_mut(slot).and_then(|record| record.as_mut()).and_then(|record| record.pending_recv.take())
+}
+
+/// 按槽位读状态（scheduler 的 dispatch 状态保护用）。
+pub fn state_slot(slot: usize) -> Option<ProcessState> {
+    let table = PROCESS_TABLE.lock();
+    table.get(slot).and_then(|entry| entry.as_ref()).map(|record| record.state)
 }
 
 pub fn state(pid: ProcessId) -> Option<ProcessState> {
@@ -586,6 +610,7 @@ pub fn fork(
             entry_point: parent_record.entry_point,
             user_stack_top: parent_record.user_stack_top,
             started: true,
+            pending_recv: None,
         });
     }
 

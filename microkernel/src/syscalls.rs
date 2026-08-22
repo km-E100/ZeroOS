@@ -75,6 +75,31 @@ fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
     Ok(())
 }
 
+/// 阻塞接收的收尾（由 scheduler::dispatch 在重入用户态前调用）。
+/// 虚假唤醒（唤醒者发送后消息被他人取走等）自动重新挂起。
+pub fn complete_receive(slot: usize, chan: u32) {
+    let pid = crate::process::pid_at_slot(slot).expect("pending recv: no pid");
+    let frame = unsafe { crate::process::trap_frame(slot) };
+    loop {
+        match crate::ipc::receive(pid, chan) {
+            Ok(message) => {
+                unsafe {
+                    let user_buffer = (*frame).regs[2] as usize;
+                    let result = copy_message_to_user(user_buffer, &message);
+                    (*frame).regs[0] =
+                        crate::trap::encode_result(result.map(|_| 0));
+                }
+                return;
+            }
+            Err(_) => {
+                let _ = crate::ipc::register_waiter(pid, chan);
+                crate::process::set_pending_recv(slot, chan);
+                crate::scheduler::block_current();
+            }
+        }
+    }
+}
+
 pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
     match syscall {
         Syscall::SendMessage {
@@ -95,11 +120,25 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let caller_slot = crate::scheduler::current_slot();
             let caller_pid =
                 crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
-            let message = crate::ipc::receive(caller_pid, channel).map_err(map_ipc_error)?;
-            unsafe {
-                copy_message_to_user(user_buffer, &message)?;
+            match crate::ipc::receive(caller_pid, channel) {
+                Ok(message) => {
+                    unsafe {
+                        copy_message_to_user(user_buffer, &message)?;
+                    }
+                    Ok(0)
+                }
+                Err(crate::ipc::IpcError::Empty) => {
+                    // 阻塞语义（对照 Mach mach_msg）：队列空 → 登记等待者
+                    // 并挂起进程。单核 + EL1 关中断 ⇒ 登记→置 Blocked→切换
+                    // 原子，无丢失唤醒窗口。被 send 唤醒后由 dispatch 调
+                    // complete_receive 完成收尾（continuation）。
+                    crate::ipc::register_waiter(caller_pid, channel)
+                        .map_err(map_ipc_error)?;
+                    crate::process::set_pending_recv(caller_slot, channel);
+                    crate::scheduler::block_current()
+                }
+                Err(e) => Err(map_ipc_error(e)),
             }
-            Ok(0)
         }
         Syscall::ConsoleRead { user_buffer, len } => {
             if len == 0 {

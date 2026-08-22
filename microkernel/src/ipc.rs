@@ -20,7 +20,17 @@ pub fn create_channel_for(owner: ProcessId, desc: ChannelDesc) -> Result<(), Ipc
 }
 
 pub fn send(caller: ProcessId, chan: u32, msg: &Message) -> Result<(), IpcError> {
-    CHANNEL_TABLE.lock().send(caller, chan, *msg)
+    // 锁纪律：持通道表锁完成入队并取出待唤醒者；释放锁后才触碰调度器。
+    let wake = CHANNEL_TABLE.lock().send(caller, chan, *msg)?;
+    if let Some(pid) = wake {
+        crate::scheduler::wake(pid);
+    }
+    Ok(())
+}
+
+/// 登记阻塞接收等待者。成功后调用方应立即 scheduler::block_current()。
+pub fn register_waiter(caller: ProcessId, chan: u32) -> Result<(), IpcError> {
+    CHANNEL_TABLE.lock().register_waiter(caller, chan)
 }
 
 pub fn receive(caller: ProcessId, chan: u32) -> Result<Message, IpcError> {
@@ -66,14 +76,18 @@ impl ChannelTable {
         }
     }
 
-    fn send(&mut self, caller: ProcessId, chan: u32, msg: Message) -> Result<(), IpcError> {
+    /// 发送。成功时返回该通道上**待唤醒的接收者**（如有）——调用方
+    /// 必须在释放 CHANNEL_TABLE 锁之后调用 scheduler::wake（锁序：
+    /// 通道表 → 就绪队列，绝不反向，也不得持锁进调度器）。
+    fn send(&mut self, caller: ProcessId, chan: u32, msg: Message) -> Result<Option<ProcessId>, IpcError> {
         let channel = self
             .channels
             .iter_mut()
             .find(|c| c.in_use && c.id == chan)
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
-        channel.queue.push(msg, channel.capacity)
+        channel.queue.push(msg, channel.capacity)?;
+        Ok(channel.pop_waiter())
     }
 
     fn receive(&mut self, caller: ProcessId, chan: u32) -> Result<Message, IpcError> {
@@ -85,7 +99,47 @@ impl ChannelTable {
         channel.ensure_access(caller)?;
         channel.queue.pop()
     }
+
+    /// 登记接收等待者（阻塞式接收的挂起点）。容量 4：超出返回 Busy，
+    /// 调用方应退化为轮询（与 Mach msg-wait 上限语义同型）。
+    fn register_waiter(&mut self, caller: ProcessId, chan: u32) -> Result<(), IpcError> {
+        let channel = self
+            .channels
+            .iter_mut()
+            .find(|c| c.in_use && c.id == chan)
+            .ok_or(IpcError::Invalid)?;
+        channel.ensure_access(caller)?;
+        if channel
+            .waiters
+            .iter()
+            .any(|w| *w == Some(caller))
+        {
+            return Ok(()); // 重复登记幂等
+        }
+        if let Some(slot) = channel.waiters.iter_mut().find(|w| w.is_none()) {
+            *slot = Some(caller);
+            Ok(())
+        } else {
+            Err(IpcError::ChannelBusy)
+        }
+    }
+
+    /// 注销等待者（进程退出/不再等待时；当前由 wake 消费替代，
+    /// 保留给未来超时/信号路径）。
+    #[allow(dead_code)]
+    fn unregister_waiter(&mut self, caller: ProcessId, chan: u32) {
+        if let Some(channel) = self.channels.iter_mut().find(|c| c.in_use && c.id == chan) {
+            for w in channel.waiters.iter_mut() {
+                if *w == Some(caller) {
+                    *w = None;
+                }
+            }
+        }
+    }
 }
+
+/// 每通道接收等待者上限。超出后调用方退化为轮询。
+const WAITERS_PER_CHANNEL: usize = 4;
 
 #[derive(Copy, Clone)]
 struct Channel {
@@ -94,6 +148,8 @@ struct Channel {
     capacity: usize,
     owner: Option<ProcessId>,
     queue: MessageQueue,
+    /// 阻塞接收的等待者队列（send 成功后逐一唤醒）。
+    waiters: [Option<ProcessId>; WAITERS_PER_CHANNEL],
 }
 
 impl Channel {
@@ -104,6 +160,7 @@ impl Channel {
             capacity: 0,
             owner: None,
             queue: MessageQueue::new(),
+            waiters: [None; WAITERS_PER_CHANNEL],
         }
     }
 
@@ -113,6 +170,7 @@ impl Channel {
         self.capacity = 0;
         self.owner = None;
         self.queue.reset();
+        self.waiters = [None; WAITERS_PER_CHANNEL];
     }
 
     fn configure(&mut self, desc: ChannelDesc, owner: Option<ProcessId>) {
@@ -121,6 +179,17 @@ impl Channel {
         self.capacity = usize::min(desc.capacity as usize, MAX_QUEUE).max(1);
         self.owner = owner;
         self.queue.reset();
+        self.waiters = [None; WAITERS_PER_CHANNEL];
+    }
+
+    /// 取走一个等待者（FIFO）。send 成功后由调用方触发调度器唤醒。
+    fn pop_waiter(&mut self) -> Option<ProcessId> {
+        for w in self.waiters.iter_mut() {
+            if let Some(pid) = w.take() {
+                return Some(pid);
+            }
+        }
+        None
     }
 
     fn ensure_access(&self, caller: ProcessId) -> Result<(), IpcError> {

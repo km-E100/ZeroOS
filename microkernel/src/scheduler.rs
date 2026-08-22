@@ -67,7 +67,12 @@ fn dispatch(pid: ProcessId) -> ! {
     };
 
     if let Some(slot) = current_slot {
-        process::set_state_slot(slot, ProcessState::Runnable);
+        // 仅 Running → Runnable。Blocked（阻塞等 IPC）/ Dying 的进程
+        // 绝不能被 dispatch 的换出逻辑"复活"——否则状态声称可运行却
+        // 不在就绪队列，造成永久饥饿。
+        if process::state_slot(slot) == Some(ProcessState::Running) {
+            process::set_state_slot(slot, ProcessState::Runnable);
+        }
     }
 
     unsafe {
@@ -90,6 +95,13 @@ fn dispatch(pid: ProcessId) -> ! {
         unsafe {
             crate::arch::enter_user_mode(&space, tf);
         }
+    }
+
+    // 阻塞接收的 continuation：被唤醒的进程在重入用户态前完成挂起的
+    // ReceiveMessage（把消息拷到用户缓冲、写回返回值）。complete_receive
+    // 可能再次阻塞（虚假唤醒），noreturn 由其内部处理。
+    if let Some(chan) = process::take_pending_recv(next_slot) {
+        crate::syscalls::complete_receive(next_slot, chan);
     }
 
     let next_ctx = unsafe { process::context_ptr(next_slot) };
@@ -229,6 +241,25 @@ pub fn exit_current() -> ! {
     let slot = current_slot();
     process::remove_slot(slot);
     reschedule()
+}
+
+/// 阻塞当前进程（Blocked：不进就绪队列，直到 wake(pid)）。
+/// 阻塞式 IPC 的基石：调用方必须**先**在任何表/通道里登记等待意图、
+/// 释放自己的锁，再调用本函数（锁纪律第 1 条：Guard 不得跨 noreturn）。
+pub fn block_current() -> ! {
+    let slot = current_slot();
+    process::set_state_slot(slot, ProcessState::Blocked);
+    reschedule()
+}
+
+/// 唤醒一个阻塞进程：Blocked → Runnable 并入队。非 Blocked 状态
+/// （已可运行/已退出）为幂等 no-op，防止重复入队破坏状态机不变量。
+pub fn wake(pid: ProcessId) {
+    if process::state(pid) != Some(ProcessState::Blocked) {
+        return;
+    }
+    process::set_state(pid, ProcessState::Runnable);
+    enqueue(pid);
 }
 
 #[cfg(test)]
