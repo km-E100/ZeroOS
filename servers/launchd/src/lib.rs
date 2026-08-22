@@ -90,6 +90,13 @@ impl ServiceRecord {
     }
 }
 
+/// 状态：4 = not-installed（已规划、二进制尚未部署进 rootfs）。
+const STATUS_NOT_INSTALLED: u8 = 4;
+
+/// 已规划服务清单。二进制就绪并由内核登记前以 [not-installed] 呈现，
+/// 让 `launchd list` 如实反映系统蓝图而非空白。
+const KNOWN_SERVICES: [&str; 5] = ["fsd", "blkdrv", "securityd", "service-controller", "ipcrouter"];
+
 /// 服务表：全部状态驻留在 `server_main` 栈帧，单线程无需锁。
 struct ServiceTable {
     records: [Option<ServiceRecord>; SERVICE_TABLE_CAP],
@@ -217,6 +224,12 @@ pub extern "C" fn _start() -> ! {
 pub extern "C" fn server_main() -> ! {
     let mut table = ServiceTable::new();
 
+    // 预登记已规划服务（not-installed）：spawn 请求会被内核以 NotFound
+    // 拒绝，这里先行占位让 list/status 有完整视图。
+    for name in KNOWN_SERVICES {
+        table.upsert(name, None, STATUS_NOT_INSTALLED);
+    }
+
     println("Zero OS launchd (EL0 service) online");
     println("  channel req=0x240 resp=0x241; spawn via syscall 20");
 
@@ -263,6 +276,7 @@ fn handle_list(table: &ServiceTable, text: &mut TextBuf) -> u32 {
             0 => "[idle]",
             1 => "[starting]",
             2 => "[running]",
+            4 => "[not-installed]",
             _ => "[failed]",
         });
         if let Some(pid) = rec.pid {
