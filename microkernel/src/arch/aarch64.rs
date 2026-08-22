@@ -8,11 +8,11 @@ use crate::process::Context;
 mod gic;
 mod timer;
 
-const SPSR_EL0T_MASKED: u64 = (1 << 6) | (1 << 7) | (1 << 8);
-// M[3:0]=0b0000 (EL0t)，DAIF 全清 → EL0 可被 timer 抢占。
+// eret 进 EL0t 的 SPSR：M[3:0]=0b0000（EL0t），DAIF 全清 → EL0 可被 timer 抢占。
 // 内核侧全程保持 IRQ 屏蔽（异常入口硬件自动置 I=1），只有 eret 回 EL0 时
 // 通过 SPSR 恢复 I=0 —— 单核自旋锁场景下这是唯一不会重入死锁的中断策略。
-const SPSR_EL0T_IRQ_ON: u64 = 0;
+// 该值由 restore_context 从帧内 #264 恢复；帧初始化时写 0（见 process::init_user）。
+
 
 global_asm!(
     ".section .vectors,\"ax\"\n\
@@ -141,13 +141,6 @@ pub fn init(_boot_info: &BootInfo) {
     crate::info!("arch/aarch64: vector table installed");
 }
 
-pub unsafe fn context_switch(current: Option<*mut Context>, next: *mut Context) -> ! {
-    if let Some(cur) = current {
-        save_trap_frame(cur);
-    }
-    restore_context(next)
-}
-
 /// 仅恢复目标现场并 eret（**绝不保存当前寄存器**）。
 ///
 /// ⚠ 所有权契约（2026-08-22 重构，修复「双保存」实机损坏）：
@@ -254,38 +247,6 @@ pub unsafe fn enter_user_mode(_aspace: &AddressSpace, tf: *const Context) -> ! {
         (*tf).sp_el0
     );
     restore_context(tf as *mut Context)
-}
-
-unsafe fn save_trap_frame(frame: *mut Context) {
-    asm!(
-        "stp x0, x1, [{frame}, #0]
-         stp x2, x3, [{frame}, #16]
-         stp x4, x5, [{frame}, #32]
-         stp x6, x7, [{frame}, #48]
-         stp x8, x9, [{frame}, #64]
-         stp x10, x11, [{frame}, #80]
-         stp x12, x13, [{frame}, #96]
-         stp x14, x15, [{frame}, #112]
-         stp x16, x17, [{frame}, #128]
-         stp x18, x19, [{frame}, #144]
-         stp x20, x21, [{frame}, #160]
-         stp x22, x23, [{frame}, #176]
-         stp x24, x25, [{frame}, #192]
-         stp x26, x27, [{frame}, #208]
-         stp x28, x29, [{frame}, #224]
-         str x30, [{frame}, #240]
-         mrs x16, sp_el0
-         str x16, [{frame}, #248]
-         mrs x16, elr_el1
-         str x16, [{frame}, #256]
-         mrs x16, spsr_el1
-         str x16, [{frame}, #264]
-         mov x16, sp
-         str x16, [{frame}, #272]",
-        frame = in(reg) frame,
-        out("x16") _,
-        options(nostack)
-    );
 }
 
 pub unsafe fn restore_context(frame: *mut Context) -> ! {

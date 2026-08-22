@@ -12,8 +12,10 @@ use spin::Mutex;
 use zero_abi::{ProcessId, ThreadEntry};
 
 const MAX_PROCESSES: usize = 64;
-const USER_STACK_SIZE: usize = 0x4000;
-const KERNEL_STACK_SIZE: usize = 0x4000;
+/// 内核栈 64KiB（×64 槽 = 4MiB 静态区）：对照 Linux THREAD_SIZE 16K/
+/// XNU kernel_stack 16K——我们无中断栈分离，所有 EL1 工作（含 IPC 拷贝、
+/// 页表操作）都在本栈，取 4 倍余量防深层调用链溢出。
+const KERNEL_STACK_SIZE: usize = 0x1_0000;
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TrapFrame {
@@ -457,11 +459,12 @@ pub fn first_run_context(slot: usize) -> Option<(AddressSpace, *mut TrapFrame)> 
     if record.started {
         return None;
     }
-    if let (Some(space), Some(entry), Some(stack)) =
+    // entry/stack 仅作就绪校验（真实值已在 TrapFrame 内，由 enter_user_mode 恢复）。
+    if let (Some(space), Some(_entry), Some(_stack)) =
         (record.addr_space, record.entry_point, record.user_stack_top)
     {
         record.started = true;
-        let tf = unsafe { TRAP_FRAMES[slot].get() };
+        let tf = TRAP_FRAMES[slot].get();
         Some((space, tf))
     } else {
         None

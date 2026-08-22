@@ -1,13 +1,13 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::{cmp, mem, ptr};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::mm::address_space::{AddressSpace, MapError};
 // PAGE_SIZE 已由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
 use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
-use spin::Mutex;
+
 use zero_abi::boot::{RootFsEntry, RootFsImage};
 use zero_abi::bootfs::{UserBootFile, UserBootFs};
 
@@ -16,7 +16,6 @@ use zero_abi::bootfs::{UserBootFile, UserBootFs};
 //  Global State
 // -----------------------------------------------------------------------------
 static ROOTFS_PTR: AtomicPtr<RootFsImage> = AtomicPtr::new(ptr::null_mut());
-static BOOTFS_CACHE: Mutex<Option<Vec<UserBootFile>>> = Mutex::new(None);
 
 pub const USER_BOOTFS_BASE: usize = 0x0000_8000_0000;
 
@@ -32,10 +31,11 @@ pub fn init(image_ptr: *const RootFsImage) {
         return;
     }
 
-    // 这里先只读 header 两个字段，不走 as_slice / entry.path() 之类复杂路径
-    let image = unsafe { &*image_ptr };
+    // 全量校验（指针/对齐/条目完整性）后再登记——损坏的 rootfs 描述符
+    // 若带病上线，会在任意 read_file 路径以更难定位的方式爆炸。
+    let image = validate_rootfs_image(image_ptr);
     crate::info!(
-        "rootfs::init: header entry_count={} entries_ptr=0x{:016x}",
+        "rootfs::init: validated entry_count={} entries_ptr=0x{:016x}",
         image.entry_count,
         image.entries as usize
     );
@@ -209,7 +209,7 @@ pub fn build_user_bootfs_for_process(
         return Ok(UserBootFs { entries_ptr: 0, entries_len: 0 });
     }
 
-    let mut cursor = assign_user_bootfs_virtual_addresses(&mut files, user_base);
+    let cursor = assign_user_bootfs_virtual_addresses(&mut files, user_base);
 
     // Map pages（每个文件可能跨多页，路径与数据分别映射完整页数）
     for file in files.iter() {

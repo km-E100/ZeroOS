@@ -570,9 +570,10 @@ fn format_sync_exception(decoded: &DecodedEsr, ctx: &TrapContext) -> String {
         SyncExceptionKind::DataAbort(info) => {
             let _ = write!(
                 msg,
-                "[trap] {} data abort: {}",
+                "[trap] {} data abort: {} (dfsc=0b{:06b})",
                 origin,
                 fault_kind_str(info.kind),
+                dfsc_raw(&info),
             );
             append_level(info.level, &mut msg);
             let _ = write!(msg, " far=0x{:016x} elr=0x{:016x}", ctx.far, ctx.elr);
@@ -637,6 +638,11 @@ fn append_level(level: Option<u8>, msg: &mut String) {
     if let Some(level) = level {
         let _ = write!(msg, " at level {}", level);
     }
+}
+
+/// DFSC 原始码诊断出口（保留字段被本函数消费）。
+fn dfsc_raw(info: &FaultInfo) -> u8 {
+    info.dfsc
 }
 
 impl From<u64> for TrapKind {

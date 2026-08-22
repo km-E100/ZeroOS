@@ -1,8 +1,10 @@
-use core::ptr::write_volatile;
+use core::ptr::{read_volatile, write_volatile};
 
 const UART_BASE: usize = 0x0900_0000;
 const UART_DR: usize = UART_BASE + 0x00;
 const UART_FR: usize = UART_BASE + 0x18;
+/// bit5 = TXFF（TX FIFO 满）。
+const FR_TXFF: u32 = 1 << 5;
 const UART_IBRD: usize = UART_BASE + 0x24;
 const UART_FBRD: usize = UART_BASE + 0x28;
 const UART_LCRH: usize = UART_BASE + 0x2c;
@@ -18,8 +20,8 @@ pub fn init() {
         // 设置波特率 (假定 24MHz 时钟，115200)
         write_volatile(UART_IBRD as *mut u32, 13);
         write_volatile(UART_FBRD as *mut u32, 2);
-        // 8 位数据，无 FIFO
-        write_volatile(UART_LCRH as *mut u32, 3 << 5);
+        // 8 位数据 + 使能 FIFO（FEN=bit4）：无 FIFO 时易溢出丢字符。
+        write_volatile(UART_LCRH as *mut u32, (3 << 5) | (1 << 4));
         // 启动 UART (TX/RX)
         write_volatile(UART_CR as *mut u32, (1 << 0) | (1 << 8) | (1 << 9));
     }
@@ -40,9 +42,13 @@ pub fn write_bytes(bytes: &[u8]) {
 
 pub fn write_byte(byte: u8) {
     unsafe {
-        // 调试阶段，为彻底排除 UART 等待逻辑导致的卡死，这里不再
-        // 轮询 TX FIFO 状态，直接写入数据寄存器。
-        // 若 TX 忙，最多只是丢日志，不会阻塞内核执行。
+        // 有界等待 TX FIFO 腾空：内核日志完整性优先于极端情形下的微秒级
+        // 延迟；上限防止硬件异常时卡死执行流（与 pl011 驱动同策略）。
+        let mut retries = 100_000usize;
+        while retries > 0 && read_volatile(UART_FR as *const u32) & FR_TXFF != 0 {
+            retries -= 1;
+            core::hint::spin_loop();
+        }
         write_volatile(UART_DR as *mut u32, byte as u32);
     }
 }

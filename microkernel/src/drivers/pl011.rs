@@ -63,13 +63,6 @@ static STATE: Mutex<State> = Mutex::new(State::new());
 /// 因 TX FIFO 满被丢弃的字节总数（诊断用）。
 static TX_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
-// ── RX 路径仪表（定位串口风暴用；量级确认后可降级为 debug） ─────────
-static IRQ_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-static IRQ_DRAINED: AtomicUsize = AtomicUsize::new(0);
-static IRQ_NUL_BYTES: AtomicUsize = AtomicUsize::new(0);
-static IRQ_LAST_MIS: AtomicUsize = AtomicUsize::new(0);
-static LAST_BYTES: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
-
 /// 初始化 PL011：幂等，重复调用直接返回，
 /// 不重复写寄存器、不重复注册 IRQ 处理器。
 pub fn init(descriptor: &DriverDescriptor) {
