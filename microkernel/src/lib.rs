@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod arch;
 pub mod boot;
 pub mod bootinfo;
+pub mod debug;
 pub mod drivers; // drivers/ 目录模块（驱动与中断服务，拆分自 drivers.rs）
 pub mod elf;
 pub mod ipc;

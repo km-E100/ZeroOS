@@ -333,12 +333,15 @@ fn log_unknown_sync(esr: u64) {
     let iss = esr & 0x01ff_ffff;
     let slot = ctx.slot.unwrap_or(usize::MAX);
     let pid_raw = ctx.pid.map(|p| p.raw()).unwrap_or(0);
+    // 符号化回溯（对标 Linux oops）：ELR 归到最近符号；无表则维持裸地址。
+    let sym = crate::debug::symbol_note(ctx.elr);
     crate::error!(
-        "trap: unknown sync ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x} far=0x{:016x} slot={} pid={}",
+        "trap: unknown sync ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x}{} far=0x{:016x} slot={} pid={}",
         ec,
         iss,
         esr,
         ctx.elr,
+        sym,
         ctx.far,
         slot,
         pid_raw
@@ -359,8 +362,11 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
     let far = read_far_el1();
     let spsr = unsafe { (*frame).spsr_el1 };
     let sp = unsafe { (*frame).sp_el1 };
+    // 符号化回溯（对标 Linux oops 的 func+0xoff）：bootloader 灌表后
+    // ELR 落到最近内核符号，如 (__zero_trap_handler+0x24)；无表时为空串。
+    let sym = crate::debug::symbol_note(elr);
     crate::error!(
-        "[KERNEL FAULT] {reason}: ESR=0x{esr:016x} FAR=0x{far:016x} ELR=0x{elr:016x} \
+        "[KERNEL FAULT] {reason}: ESR=0x{esr:016x} FAR=0x{far:016x} ELR=0x{elr:016x}{sym} \
          SPSR=0x{spsr:016x} SP_EL1=0x{sp:016x} slot={slot} pid={pid} frame={frame:p}"
     );
     dump_frame_registers(frame);

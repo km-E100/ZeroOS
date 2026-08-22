@@ -78,11 +78,29 @@ pub struct LoadedSegment {
     pub flags: u32,
 }
 
+/// 单条内核符号记录（symtab 原始信息的最小子集）。
+#[derive(Clone)]
+pub struct KernelSymbol {
+    /// 符号名（经 sh_link 指向的 .strtab 解析）。
+    pub name: alloc::string::String,
+    /// st_value：加载后 VA（内核恒等映射时即物理地址）。
+    pub value: u64,
+    /// 原始 st_info：低 4 位为 STT 类型，高 4 位为绑定。
+    pub info: u8,
+}
+
+impl KernelSymbol {
+    /// STT 类型（st_info 低 4 位）。
+    pub fn sym_type(&self) -> u8 {
+        self.info & 0x0f
+    }
+}
+
 pub struct ElfImage {
     pub entry: u64,
     pub segments: Vec<LoadedSegment>,
-    // 符号名 -> 符号值（加载后的 VA）。仅用于内核镜像的引导参数打补丁。
-    symbols: Vec<(alloc::string::String, u64)>,
+    // 已解析符号表。用于引导参数打补丁与符号汇槽填充。
+    symbols: Vec<KernelSymbol>,
 }
 
 impl ElfImage {
@@ -145,18 +163,23 @@ impl ElfImage {
     pub fn symbol_address(&self, name: &str) -> Option<u64> {
         self.symbols
             .iter()
-            .find(|(sym, _)| sym.as_str() == name)
-            .map(|(_, value)| *value)
+            .find(|sym| sym.name.as_str() == name)
+            .map(|sym| sym.value)
+    }
+
+    /// 全量符号表（只读视图），供符号汇槽填充等引导期用途。
+    pub fn symbols(&self) -> &[KernelSymbol] {
+        &self.symbols
     }
 }
 
-/// 解析 SHT_SYMTAB / SHT_DYNSYM 符号表，收集 name -> st_value。
+/// 解析 SHT_SYMTAB / SHT_DYNSYM 符号表，收集 (名字, st_value, st_info)。
 /// 内核是 debug（未 strip）构建，symtab 一定存在；找不到时仅告警。
 /// 符号名经 sh_link 指向的 .strtab 节解析（st_name 相对该节偏移）。
 fn parse_symbol_table(
     data: &[u8],
     header: &Elf64Ehdr,
-) -> Result<Vec<(alloc::string::String, u64)>, Status> {
+) -> Result<Vec<KernelSymbol>, Status> {
     const SHT_STRTAB: u32 = 3;
 
     let shoff = header.e_shoff as usize;
@@ -206,7 +229,11 @@ fn parse_symbol_table(
                 .position(|b| *b == 0)
                 .ok_or(Status::INVALID_PARAMETER)?;
             if let Ok(name) = alloc::string::String::from_utf8(tail[..len].to_vec()) {
-                out.push((name, sym.st_value));
+                out.push(KernelSymbol {
+                    name,
+                    value: sym.st_value,
+                    info: sym.st_info,
+                });
             }
         }
     }
