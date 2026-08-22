@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use xshell::{cmd, Shell};
 
 const ESP_IMAGE_NAME: &str = "esp.img";
-const ESP_SIZE_MB: u32 = 256;
+/// ESP 容量：内容实测 ~72MiB（内核+双 EFI+64M rootfs 镜像），取 96MiB
+/// 留增长余量。此前固定 256MiB 且 esp.img 会作为普通文件再进 ISO 一次，
+/// 白白翻倍镜像体积（546MB ISO 的主因）。
+const ESP_SIZE_MB: u32 = 96;
 
 pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
     build_components(sh)?;
