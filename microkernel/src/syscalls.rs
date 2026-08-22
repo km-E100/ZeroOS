@@ -20,21 +20,56 @@ struct MmioLease {
 
 static MMIO_LEASES: Mutex<Vec<MmioLease>> = Mutex::new(Vec::new());
 
-/// Minimum virtual address that we consider valid for user mappings.
-/// The kernel and all user code/stacks are linked at or above 0x4008_0000
-/// (see boot/linker.ld), while low addresses like 0x0..0x1000 are unmapped
-/// under the firmware's page tables.
-const USER_VA_MIN: usize = 0x4000_0000;
+/// 用户地址空间布局（与 mm/paging.rs 一致）：
+/// - [USER_VA_LO, 1GiB)：用户代码/数据（L1[0] 私有副本，可映射）
+/// - [1GiB, 2GiB)：内核专用共享表（L1[1]），用户指针一律拒绝
+/// - [2GiB, USER_VA_MAX]：bootfs 与用户栈（L1[2]/L1[3] 私有表，可映射）
+const USER_VA_LO: usize = 0x0020_0000;
+const KERNEL_REGION_START: usize = 0x4000_0000; // 1 GiB
+const KERNEL_REGION_END: usize = 0x8000_0000; // 2 GiB
+const USER_VA_MAX: usize = 0x0000_FFFF_F000; // 用户栈顶（4GiB - 4KiB）
 
+/// QEMU virt 外设空间（MMIO 设备区）：GIC/PL011/virtio-mmio 都在
+/// [0x0800_0000, 0x1000_0000)。mmio lease 的 phys 必须落在此区间。
+const DEVICE_MMIO_LO: usize = 0x0800_0000;
+const DEVICE_MMIO_HI: usize = 0x1000_0000;
+
+/// 用户指针校验（第一道：地址范围 + 布局）。
+///
+/// 📌 协调点（mm Agent）：当前只查范围，不查映射存在性 —— 未映射页
+/// 仍会由硬件 data abort 兜底杀进程（可用），但要防"读脏地址才爆炸"
+/// 的窗口。待 mm Agent 落地 `AddressSpace::translate_user_addr` 或等价
+/// 页表 walk（见 mm/paging.rs：L0→L1→L2→L3 四级翻译 + PHYS_ADDR_MASK），
+/// 在此追加"逐页映射存在性"检查：每个 4KiB 页的 L3 entry valid &&
+/// 非块描述符。调用方已按页步进拷贝（见 copy_slice_from/to_user），
+/// 每页一个校验点即可无缝接入。
 fn validate_user_ptr(addr: usize, size: usize) -> Result<(), SysError> {
     if addr == 0 {
         return Err(SysError::InvalidArgument);
     }
-    if addr < USER_VA_MIN {
+    if addr < USER_VA_LO {
+        return Err(SysError::InvalidArgument);
+    }
+    if addr >= KERNEL_REGION_START && addr < KERNEL_REGION_END {
+        // 内核恒等映射区：共享页表本体，绝不能把用户缓冲区的拷贝写进去。
         return Err(SysError::InvalidArgument);
     }
     let end = addr.checked_add(size).ok_or(SysError::InvalidArgument)?;
-    if end < USER_VA_MIN {
+    if end > USER_VA_MAX {
+        return Err(SysError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// mmio lease 校验：phys 必须落在 QEMU virt 设备区且长度不越界。
+fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
+    let base = base as usize;
+    let len = len as usize;
+    if len == 0 || base < DEVICE_MMIO_LO {
+        return Err(SysError::InvalidArgument);
+    }
+    let end = base.checked_add(len).ok_or(SysError::InvalidArgument)?;
+    if end > DEVICE_MMIO_HI {
         return Err(SysError::InvalidArgument);
     }
     Ok(())
@@ -179,6 +214,8 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let caller_slot = crate::scheduler::current_slot();
             ensure_privileged(caller_slot)?;
             let descriptor = descriptor_for_index(index)?;
+            // 校验 lease 的 phys（mmio_base）落在设备区，防驱动表被污染。
+            validate_mmio_region(descriptor.mmio_base, descriptor.mmio_len)?;
             acquire_mmio(caller_slot, index)?;
             unsafe {
                 write_mmio_info(user_buffer, descriptor.mmio_base, descriptor.mmio_len)?;
@@ -221,6 +258,12 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         }
         Syscall::Exit { status: _ } => crate::scheduler::exit_current(),
         Syscall::Yield => crate::scheduler::yield_current(),
+        Syscall::GetPid => {
+            let caller_slot = crate::scheduler::current_slot();
+            let caller_pid =
+                crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
+            Ok(caller_pid.raw())
+        }
     }
 }
 
@@ -313,36 +356,62 @@ fn release_mmio(slot: usize, index: u32) -> Result<(), SysError> {
 }
 
 unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
-    validate_user_ptr(addr, core::mem::size_of::<Message>())?;
-    let ptr = addr as *const Message;
-    // Basic alignment check: require pointer aligned to Message
-    if ptr as usize % core::mem::align_of::<Message>() != 0 {
+    // 基本对齐检查：Message 指针需按自身对齐。
+    if addr % core::mem::align_of::<Message>() != 0 {
         return Err(SysError::InvalidArgument);
     }
-    Ok(ptr.read())
+    let mut msg = Message::empty();
+    let bytes = core::slice::from_raw_parts_mut(
+        (&mut msg as *mut Message).cast::<u8>(),
+        core::mem::size_of::<Message>(),
+    );
+    copy_slice_from_user(addr, bytes)?;
+    Ok(msg)
 }
 
 unsafe fn copy_message_to_user(addr: usize, msg: &Message) -> Result<(), SysError> {
-    validate_user_ptr(addr, core::mem::size_of::<Message>())?;
-    let ptr = addr as *mut Message;
-    if ptr as usize % core::mem::align_of::<Message>() != 0 {
+    if addr % core::mem::align_of::<Message>() != 0 {
         return Err(SysError::InvalidArgument);
     }
-    ptr.write(*msg);
-    Ok(())
+    let bytes = core::slice::from_raw_parts(
+        (msg as *const Message).cast::<u8>(),
+        core::mem::size_of::<Message>(),
+    );
+    copy_slice_to_user(addr, bytes)
 }
 
+/// 逐页步进拷贝到用户空间：每页单独校验（跨页 boundary 安全；
+/// 也是将来逐页"映射存在性"检查的挂载点）。
 unsafe fn copy_slice_to_user(addr: usize, data: &[u8]) -> Result<(), SysError> {
-    validate_user_ptr(addr, data.len())?;
-    let ptr = addr as *mut u8;
-    ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+    let mut remaining = data.len();
+    let mut src_off = 0usize;
+    let mut cur = addr;
+    while remaining > 0 {
+        let page_avail = crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
+        let chunk = remaining.min(page_avail);
+        validate_user_ptr(cur, chunk)?;
+        ptr::copy_nonoverlapping(data.as_ptr().add(src_off), cur as *mut u8, chunk);
+        cur += chunk;
+        src_off += chunk;
+        remaining -= chunk;
+    }
     Ok(())
 }
 
+/// 逐页步进拷贝自用户空间（同上，方向相反）。
 unsafe fn copy_slice_from_user(addr: usize, dst: &mut [u8]) -> Result<(), SysError> {
-    validate_user_ptr(addr, dst.len())?;
-    let ptr = addr as *const u8;
-    ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len());
+    let mut remaining = dst.len();
+    let mut dst_off = 0usize;
+    let mut cur = addr;
+    while remaining > 0 {
+        let page_avail = crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
+        let chunk = remaining.min(page_avail);
+        validate_user_ptr(cur, chunk)?;
+        ptr::copy_nonoverlapping(cur as *const u8, dst.as_mut_ptr().add(dst_off), chunk);
+        cur += chunk;
+        dst_off += chunk;
+        remaining -= chunk;
+    }
     Ok(())
 }
 
@@ -367,19 +436,15 @@ unsafe fn write_shm_create_result(
     ptr_value: usize,
     len: usize,
 ) -> Result<(), SysError> {
-    validate_user_ptr(addr, 3 * core::mem::size_of::<u64>())?;
-    let ptr = addr as *mut u64;
-    ptr.add(0).write(handle as u64);
-    ptr.add(1).write(ptr_value as u64);
-    ptr.add(2).write(len as u64);
-    Ok(())
+    let rec = [handle as u64, ptr_value as u64, len as u64];
+    let bytes = core::slice::from_raw_parts(rec.as_ptr().cast::<u8>(), rec.len() * 8);
+    copy_slice_to_user(addr, bytes)
 }
 
 unsafe fn write_driver_info(
     addr: usize,
     descriptor: &zero_abi::driver::DriverDescriptor,
 ) -> Result<(), SysError> {
-    validate_user_ptr(addr, core::mem::size_of::<DriverInfoRecord>())?;
     #[repr(C)]
     struct DriverInfoRecord {
         kind: u32,
@@ -393,15 +458,65 @@ unsafe fn write_driver_info(
         mmio_len: descriptor.mmio_len,
         irq: descriptor.irq,
     };
-    let ptr = addr as *mut DriverInfoRecord;
-    ptr.write(record);
-    Ok(())
+    let bytes = core::slice::from_raw_parts(
+        (&record as *const DriverInfoRecord).cast::<u8>(),
+        core::mem::size_of::<DriverInfoRecord>(),
+    );
+    copy_slice_to_user(addr, bytes)
 }
 
 unsafe fn write_mmio_info(addr: usize, base: u64, len: u64) -> Result<(), SysError> {
-    validate_user_ptr(addr, 2 * core::mem::size_of::<u64>())?;
-    let ptr = addr as *mut u64;
-    ptr.add(0).write(base);
-    ptr.add(1).write(len);
-    Ok(())
+    let rec = [base, len];
+    let bytes = core::slice::from_raw_parts(rec.as_ptr().cast::<u8>(), rec.len() * 8);
+    copy_slice_to_user(addr, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_ptr_rejects_null() {
+        assert!(validate_user_ptr(0, 1).is_err());
+    }
+
+    #[test]
+    fn validate_ptr_rejects_below_user_va_lo() {
+        assert!(validate_user_ptr(USER_VA_LO - 1, 1).is_err());
+        assert!(validate_user_ptr(USER_VA_LO, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_ptr_rejects_kernel_region() {
+        assert!(validate_user_ptr(KERNEL_REGION_START, 1).is_err());
+        assert!(validate_user_ptr(KERNEL_REGION_START + 0x1000, 4096).is_err());
+        assert!(validate_user_ptr(KERNEL_REGION_END - 1, 1).is_err());
+    }
+
+    #[test]
+    fn validate_ptr_rejects_overflow_and_top() {
+        assert!(validate_user_ptr(usize::MAX, 2).is_err());
+        assert!(validate_user_ptr(USER_VA_MAX - 3, 4).is_err());
+        assert!(validate_user_ptr(USER_VA_MAX - 4, 4).is_ok());
+    }
+
+    #[test]
+    fn validate_ptr_boundary_case() {
+        // 恰好落在 1GiB 边界以下（0x3FFF_FFFF 属于用户区末尾）
+        assert!(validate_user_ptr(KERNEL_REGION_START - 1, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_mmio_region_cases() {
+        // QEMU virt：PL011 @0x0900_0000 len 0x1000 合法
+        assert!(validate_mmio_region(0x0900_0000, 0x1000).is_ok());
+        // 区间外拒绝
+        assert!(validate_mmio_region(0x0900_0000, 0x1000_0000).is_err());
+        assert!(validate_mmio_region(0x0000_0000, 0x1000).is_err());
+        assert!(validate_mmio_region(0x0900_0000, 0).is_err());
+        assert!(validate_mmio_region(0x07ff_ffff, 0x1000).is_err());
+        // 上界含端
+        assert!(validate_mmio_region(0x0ff0_0000, 0x0010_0000).is_ok());
+        assert!(validate_mmio_region(0x0ff0_0000, 0x0010_0001).is_err());
+    }
 }

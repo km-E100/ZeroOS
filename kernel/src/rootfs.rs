@@ -5,7 +5,7 @@ use zero_abi::boot::{RootFsEntry, RootFsImage};
 #[no_mangle]
 #[used]
 #[link_section = ".rodata.boot"]
-pub static __zero_rootfs_entries: [RootFsEntry; 6] = [
+pub static __zero_rootfs_entries: [RootFsEntry; 7] = [
     RootFsEntry::new(
         "/etc/motd",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs/etc/motd")),
@@ -40,6 +40,13 @@ pub static __zero_rootfs_entries: [RootFsEntry; 6] = [
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/rootfs/System/Core/zero-launchd"
+        )),
+    ),
+    RootFsEntry::new(
+        "/Applications/Shell",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/rootfs/Applications/Shell"
         )),
     ),
 ];

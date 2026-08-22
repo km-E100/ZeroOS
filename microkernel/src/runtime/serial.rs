@@ -1,4 +1,4 @@
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::write_volatile;
 
 const UART_BASE: usize = 0x0900_0000;
 const UART_DR: usize = UART_BASE + 0x00;

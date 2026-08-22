@@ -187,7 +187,7 @@ fn handle_start(req: &ControlRequest, msg: &mut String<RESPONSE_TEXT_MAX>) -> Di
         }
         Err(err) => {
             let _ = msg.push_str("spawn failed: ");
-            let _ = msg.push_str(describe_sys_error(err));
+            let _ = msg.push_str(err.as_str());
             update_service_record(req, STATUS_FAILED, "spawn failed", None);
             emit_event(
                 req.path.as_str(),
@@ -222,7 +222,7 @@ fn handle_restart(req: &ControlRequest, msg: &mut String<RESPONSE_TEXT_MAX>) -> 
         }
         Err(err) => {
             let _ = msg.push_str("restart failed: ");
-            let _ = msg.push_str(describe_sys_error(err));
+            let _ = msg.push_str(err.as_str());
             update_service_record(req, STATUS_FAILED, "restart failed", None);
             emit_event(
                 req.path.as_str(),
@@ -233,20 +233,6 @@ fn handle_restart(req: &ControlRequest, msg: &mut String<RESPONSE_TEXT_MAX>) -> 
             );
             DispatchAction::Respond(2)
         }
-    }
-}
-
-fn describe_sys_error(err: zero_abi::syscall::SysError) -> &'static str {
-    use zero_abi::syscall::SysError::*;
-    match err {
-        InvalidArgument => "invalid argument",
-        PermissionDenied => "permission denied",
-        ChannelUnavailable => "channel unavailable",
-        NotFound => "not found",
-        NoMemory => "no memory",
-        WouldBlock => "would block",
-        DeviceError => "device error",
-        Busy => "busy",
     }
 }
 

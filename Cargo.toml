@@ -16,6 +16,8 @@ members = [
     "userland/commands",
     "userland/libfsclient",
     "userland/libblkclient",
+    "userland/user_app",
+    "userland/userlib",
     "xtask",
     "bootloader-uefi",
     "tools",

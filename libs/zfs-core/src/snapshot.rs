@@ -70,6 +70,18 @@ impl SnapshotManager {
         self.snapshots.iter().find(|snap| snap.id == id)
     }
 
+    pub fn iter(&self) -> core::slice::Iter<'_, Snapshot> {
+        self.snapshots.iter()
+    }
+
+    /// 任一存活快照的目录是否引用了该数据块（CoW 保护判定）。
+    pub fn references(&self, block: u64) -> bool {
+        self.snapshots
+            .iter()
+            .flat_map(|snap| snap.directory.values())
+            .any(|entry| entry.blocks.contains(&block))
+    }
+
     pub fn remove(&mut self, id: u64) -> Option<Snapshot> {
         let index = self.snapshots.iter().position(|s| s.id == id)?;
         Some(self.snapshots.remove(index))

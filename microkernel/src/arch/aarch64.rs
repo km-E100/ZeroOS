@@ -9,6 +9,10 @@ mod gic;
 mod timer;
 
 const SPSR_EL0T_MASKED: u64 = (1 << 6) | (1 << 7) | (1 << 8);
+// M[3:0]=0b0000 (EL0t)，DAIF 全清 → EL0 可被 timer 抢占。
+// 内核侧全程保持 IRQ 屏蔽（异常入口硬件自动置 I=1），只有 eret 回 EL0 时
+// 通过 SPSR 恢复 I=0 —— 单核自旋锁场景下这是唯一不会重入死锁的中断策略。
+const SPSR_EL0T_IRQ_ON: u64 = 0;
 
 global_asm!(
     ".section .vectors,\"ax\"\n\
@@ -161,21 +165,34 @@ pub unsafe fn set_user_ttbr(root_phys: u64) {
 
 pub unsafe fn enter_user_mode(aspace: &AddressSpace, tf: *const Context) -> ! {
     let ttbr0 = aspace.ttbr0_phys();
-    let spsr = SPSR_EL0T_MASKED;
-    set_user_ttbr(ttbr0);
-    crate::info!("enter_user_mode: TTBR0=0x{:016x}", ttbr0);
+    let spsr = SPSR_EL0T_IRQ_ON;
+    // TTBR0 已由 dispatch 的 space.activate() 切好；这里不重复写。
+    crate::info!(
+        "enter_user_mode: TTBR0=0x{:016x} ELR=0x{:x} SP_EL0=0x{:x} SPSR=0x{:x}",
+        ttbr0,
+        (*tf).elr_el1,
+        (*tf).sp_el0,
+        spsr
+    );
+    // ⚠ 栈切换必须在**同一个** asm 块里完成：给编译器看到"mov sp"却声明
+    // options(nostack) 会让 LLVM 误以为 sp 未变，后续所有 [sp+N] 局部
+    // 引用全部错位（实测 &space 指向垃圾 → root_phys=0 → TTBR0:=0 → 死机）。
     asm!(
-        // Restore argument registers x0-x3 (others stay 0 for now except x30).
+        // 切换内核栈（trap frame 里预存的 sp_el1 = kernel_stack_top）。
+        // 此后不再触碰旧帧，全部经寄存器操作。
+        "ldr x16, [{tf}, #272]",
+        "mov sp, x16",
+        // Restore argument registers x0-x3.
         "ldp x0, x1, [{tf}, #0]",
         "ldp x2, x3, [{tf}, #16]",
         // Restore LR from trap frame (regs[30]).
         "ldr x30, [{tf}, #240]",
         // Populate SP_EL0 (user stack pointer) and ELR_EL1 (resume PC).
-        "ldr x16, [{tf}, #248]", // sp_el0
+        "ldr x16, [{tf}, #248]",
         "msr sp_el0, x16",
-        "ldr x16, [{tf}, #256]", // elr_el1
+        "ldr x16, [{tf}, #256]",
         "msr elr_el1, x16",
-        // Program SPSR_EL1 for an ERet into EL0t with IRQ/FIQ/SError masked.
+        // Program SPSR_EL1 for an ERet into EL0t with IRQ/FIQ/SError enabled.
         "msr spsr_el1, {spsr}",
         "eret",
         spsr = in(reg) spsr,

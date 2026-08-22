@@ -2,11 +2,16 @@
 name = "zero-launchd"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zero-launchd"
+path = "src/bin/main.rs"
+test = false
 
 [dependencies]
-
-[profile.release]
-panic = "abort"
-
-[profile.dev]
-panic = "abort"
+zero-abi = { path = "../../libs/abi" }
+userlib = { path = "../../userland/userlib" }

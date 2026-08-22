@@ -9,7 +9,7 @@ use crate::{process, scheduler};
 static SERVICE_REGISTRY: Mutex<[Option<ServiceDescriptor>; 16]> = Mutex::new([None; 16]);
 
 pub fn launch_core(_info: &BootInfo) {
-    crate::info!("services::launch_core: begin");
+    crate::debug!("services::launch_core: begin");
     init_channels();
 
     let bundled = [
@@ -121,7 +121,7 @@ fn launch_service(descriptor: ServiceDescriptor) {
     match spawn_server(&descriptor) {
         Ok(pid) => scheduler::enqueue(pid),
         Err(err) => {
-            crate::info!("failed to spawn service {}: {:?}", descriptor.name, err);
+            crate::warn!("failed to spawn service {}: {:?}", descriptor.name, err);
             if descriptor.essential {
                 panic!(
                     "essential service {} failed to start: {:?}",
@@ -137,7 +137,7 @@ fn spawn_server(descriptor: &ServiceDescriptor) -> Result<ProcessId, ServiceErro
         ServiceEntry::KernelFn(_) => "KernelFn",
         ServiceEntry::Bootfs(_) => "Bootfs",
     };
-    crate::info!("spawn_server: name={} entry={}", descriptor.name, kind);
+    crate::debug!("spawn_server: name={} entry={}", descriptor.name, kind);
     match descriptor.entry {
         ServiceEntry::KernelFn(entry) => {
             let pid = process::spawn(entry, descriptor.name);

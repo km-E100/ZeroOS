@@ -1,6 +1,7 @@
 use crate::elf::{PF_W, PF_X};
 use crate::mm::address_space::{self, AddressSpace, MapError, USER_STACK_LEN, USER_STACK_TOP};
-use crate::mm::paging::PAGE_SIZE;
+// PAGE_SIZE 由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
+use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
 use crate::rootfs;
 use crate::user_elf;
@@ -124,7 +125,7 @@ pub fn init() {
 }
 
 pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
-    crate::info!("process::spawn called for name={}", name);
+    crate::debug!("process::spawn called for name={}", name);
     let pid = ProcessId::new(NEXT_PID.fetch_add(1, Ordering::SeqCst));
 
     let mut table = PROCESS_TABLE.lock();
@@ -170,7 +171,7 @@ pub fn spawn_user(entry: ThreadEntry, name: &'static str) -> ProcessId {
     // 注意：入口位于内核镜像内，进程以 EL0 运行，首次取指会因
     // 内核页表 AP=00（EL0 无权限）触发 instruction abort 而被终止
     // ——用户态异常路径的修复属于后续工作。
-    crate::info!("process::spawn_user called for name={}", name);
+    crate::debug!("process::spawn_user called for name={}", name);
     spawn(entry, name)
 }
 
@@ -179,7 +180,7 @@ pub fn spawn_user_from_bootfs(
     name: &'static str,
     privileged: bool,
 ) -> Result<ProcessId, ProcessError> {
-    crate::info!("spawn_user_from_bootfs: path={}", path);
+    crate::debug!("spawn_user_from_bootfs: path={}", path);
     let elf = user_elf::build_user_elf(path).map_err(ProcessError::ElfError)?;
     let pid = spawn(thread_exit, name);
     let Some(slot) = slot_for_pid(pid) else {
@@ -291,6 +292,12 @@ pub unsafe fn user_stack_top(slot: usize) -> usize {
     user_stack_top_raw(slot)
 }
 
+/// ⚠ 设计局限（本轮不改契约）：user_stack_top_raw 忽略 slot，
+/// 所有进程共用同一个用户栈顶 USER_STACK_TOP（0x0000_FFFF_F000）。
+/// shell ABI（含 fork 的栈重定位计算）依赖"栈顶与槽位无关"这一假设，
+/// 因此本轮保留。未来方向：per-slot 栈顶（每个进程私有 128KiB 栈窗口）
+/// 需同步修改 fork() 的栈基重算、exec 的栈重置与 user_shell ABI，
+/// 属于破坏性变更，应单独一轮做并配套升级。
 fn user_stack_top_raw(slot: usize) -> usize {
     let _ = slot;
     USER_STACK_TOP
@@ -305,21 +312,57 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
     table[slot].map(|record| record.pid)
 }
 
+/// 回收进程槽位：从 PROCESS_TABLE 移除记录（含 pid/name 审计）、
+/// 释放地址空间（页表回收，见下方协调点）、清 CURRENT_SLOT（若指向该槽）。
+///
+/// 📌 协调点（mm Agent）：地址空间销毁由 `mm::address_space` 提供——
+/// 现经 `AddressSpace::destroy()` → `paging::destroy_user_address_space()`
+/// 桥接，本轮 mm Agent 负责落地该函数的实现（当前为空占位）。
+/// 销毁必须发生在 PROCESS_TABLE 锁外：记录是 Copy，take() 后 Guard
+/// 立即释放。将来若 mm Agent 直接暴露同名自由函数
+/// `mm::address_space::destroy_user_address_space(&AddressSpace)`，
+/// 把 `space.destroy()` 换成对其的直接调用即可（桥接在销毁逻辑落定后
+/// 属于冗余层）。
+///
+/// TRAP_FRAMES/KERNEL_STACKS 是 64×16KiB 静态数组，槽位回用即可，
+/// 无需释放。
 pub fn remove_slot(slot: usize) {
-    let mut table = PROCESS_TABLE.lock();
-    if let Some(record) = table[slot] {
+    assert!(slot < MAX_PROCESSES, "remove_slot: slot {} out of range", slot);
+    let record = {
+        let mut table = PROCESS_TABLE.lock();
+        table[slot].take()
+    };
+
+    if let Some(record) = record {
         if let Some(space) = record.addr_space {
+            // 锁外销毁：避免持进程表锁进入物理页分配器
+            //（表锁→分配器锁的反转风险，见 scheduler.rs 锁纪律第 3 条）。
             unsafe {
                 space.destroy();
             }
         }
+        crate::warn!(
+            "process {} (pid={} slot={}) removed: slot reclaimed",
+            record.name,
+            record.pid.raw(),
+            slot
+        );
+    } else {
+        crate::debug!("process::remove_slot: slot={} already empty", slot);
     }
-    table[slot] = None;
+
+    // 自退出场景：CURRENT_SLOT 仍指向本槽，先清掉，免得调度器把已回收
+    // 槽当作"上一个进程"置回 Runnable。
+    crate::scheduler::clear_current_slot_if(slot);
 }
 
 pub fn address_space(slot: usize) -> Option<AddressSpace> {
     let table = PROCESS_TABLE.lock();
-    table[slot].and_then(|record| record.addr_space)
+    let out = table[slot].and_then(|record| record.addr_space);
+    if let Some(s) = out {
+        crate::debug!("process::address_space: slot={} root=0x{:x}", slot, s.ttbr0_phys());
+    }
+    out
 }
 
 #[allow(dead_code)]
@@ -359,9 +402,19 @@ pub fn first_run_context(slot: usize) -> Option<(AddressSpace, *mut TrapFrame)> 
 
 #[no_mangle]
 extern "C" fn thread_exit() -> ! {
-    loop {
-        core::hint::spin_loop();
+    // 进程主函数返回（LR=thread_exit）后的收尾 trampoline：
+    // 标记 Dying → 走调度器退出路径（remove_slot + reschedule），
+    // 槽位与地址空间在此回收。
+    //
+    // 说明：若该 trampoline 在 EL0 下被取指（内核区 AP 对 EL0 关闭），
+    // 会先触发 instruction abort → 异常路径同样以 Dying + exit_current
+    // 终止并回收；两个入口殊途同归，不会再有"死循环占槽"。
+    let slot = crate::scheduler::current_slot();
+    if let Some(pid) = pid_at_slot(slot) {
+        crate::warn!("thread_exit: pid={} slot={} exiting (user main returned)", pid.raw(), slot);
     }
+    set_state_slot(slot, ProcessState::Dying);
+    crate::scheduler::exit_current()
 }
 
 fn align_up(value: usize, align: usize) -> usize {
@@ -384,11 +437,12 @@ fn map_user_elf_segments(
     path: &str,
 ) -> Result<(), MapError> {
     let elf_bytes = rootfs::read_file(path).ok_or(MapError::OutOfMemory)?;
+    crate::debug!("map_user_elf_segments: root_phys=0x{:x} path={}", space.ttbr0_phys(), path);
     for seg in elf.segments.iter() {
         if seg.memsz == 0 {
             continue;
         }
-        crate::info!(
+        crate::debug!(
             "map_user_elf_segments: vbase=0x{:x} mem_size=0x{:x} file_size=0x{:x}",
             seg.vaddr,
             seg.memsz,
@@ -404,7 +458,7 @@ fn map_user_elf_segments(
 
         for page_va in (page_start..page_end).step_by(PAGE_SIZE) {
             let phys = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
-            crate::info!(
+            crate::debug!(
                 "map_user_elf_segments: page_va=0x{:x} phys=0x{:x}",
                 page_va,
                 phys
@@ -452,6 +506,15 @@ pub fn fork(
     let child_slot;
     let child_pid = ProcessId::new(NEXT_PID.fetch_add(1, Ordering::SeqCst));
 
+    // 地址空间克隆必须在持锁外进行（分配物理页/可能失败），
+    // 且 clone_space 当前显式失败（见 address_space.rs 注释）。
+    let addr_space = if let Some(space) = parent_record.addr_space {
+        let cloned = address_space::clone_space(&space).map_err(ProcessError::MapError)?;
+        Some(cloned)
+    } else {
+        None
+    };
+
     {
         let mut table = PROCESS_TABLE.lock();
         let (slot_index, slot) = table
@@ -460,12 +523,6 @@ pub fn fork(
             .find(|(_, slot)| slot.is_none())
             .ok_or(ProcessError::TableFull)?;
         child_slot = slot_index;
-
-        let addr_space = if let Some(space) = parent_record.addr_space {
-            Some(crate::mm::address_space::clone_space(&space))
-        } else {
-            None
-        };
 
         *slot = Some(ProcessRecord {
             pid: child_pid,

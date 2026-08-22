@@ -135,6 +135,12 @@ fn build_components(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo build -p zero-microkernel").run()?;
     cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
+
+    // 在 build-rootfs 打包之前，把刚构建的用户态裸机 ELF 同步进 kernel/rootfs
+    // （zero-shell / zero-launchd；产物缺失时回退仓库已有 blob 并 warn）。
+    // build-rootfs 内部还会再做一次同步，这里显式执行以保证顺序清晰。
+    crate::sync_userland_blobs(sh, true)?;
+
     cmd!(sh, "cargo run -p xtask -- build-rootfs").run()?;
     cmd!(sh, "cargo run -p zero-installer").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-kernel").run()?;

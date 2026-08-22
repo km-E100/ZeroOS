@@ -177,3 +177,89 @@ impl MessageQueue {
         Ok(msg)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(n: u32) -> Message {
+        let mut m = Message::empty();
+        m.code = n;
+        m
+    }
+
+    #[test]
+    fn queue_empty_pop() {
+        let mut q = MessageQueue::new();
+        assert!(matches!(q.pop(), Err(IpcError::Empty)));
+    }
+
+    #[test]
+    fn queue_push_pop_roundtrip() {
+        let mut q = MessageQueue::new();
+        for n in 1..=8 {
+            q.push(msg(n), MAX_QUEUE).unwrap();
+        }
+        for n in 1..=8 {
+            assert_eq!(q.pop().unwrap().code, n);
+        }
+        assert!(matches!(q.pop(), Err(IpcError::Empty)));
+    }
+
+    #[test]
+    fn queue_full_rejected() {
+        let mut q = MessageQueue::new();
+        for n in 0..MAX_QUEUE {
+            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+        }
+        // 容量=16 时第 17 个被拒
+        assert!(matches!(
+            q.push(msg(999), MAX_QUEUE),
+            Err(IpcError::ChannelBusy)
+        ));
+        // 限定更小 capacity 同样生效
+        let mut q2 = MessageQueue::new();
+        for n in 0..4 {
+            q2.push(msg(n as u32), 4).unwrap();
+        }
+        assert!(matches!(q2.push(msg(4), 4), Err(IpcError::ChannelBusy)));
+    }
+
+    #[test]
+    fn queue_wrap_around() {
+        let mut q = MessageQueue::new();
+        for n in 0..MAX_QUEUE {
+            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+        }
+        for n in 0..MAX_QUEUE {
+            assert_eq!(q.pop().unwrap().code, n as u32);
+        }
+        // head 已绕回，再入队出队顺序仍正确（容量仍为 MAX_QUEUE）
+        for n in 100..(100 + MAX_QUEUE) {
+            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+        }
+        for n in 100..(100 + MAX_QUEUE) {
+            assert_eq!(q.pop().unwrap().code, n as u32);
+        }
+        assert!(matches!(q.pop(), Err(IpcError::Empty)));
+    }
+
+    #[test]
+    fn channel_capacity_floor() {
+        // configure 会把容量夹在 [1, MAX_QUEUE]
+        let mut c = Channel::new();
+        c.configure(
+            ChannelDesc { id: 1, capacity: 0 },
+            None,
+        );
+        assert_eq!(c.capacity, 1);
+        c.configure(
+            ChannelDesc {
+                id: 1,
+                capacity: 999,
+            },
+            None,
+        );
+        assert_eq!(c.capacity, MAX_QUEUE);
+    }
+}

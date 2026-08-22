@@ -39,6 +39,36 @@ struct Elf64Phdr {
     p_align: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Shdr {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+const SHT_SYMTAB: u32 = 2;
+const SHT_DYNSYM: u32 = 11;
+const SHN_UNDEF: u16 = 0;
+
 pub struct LoadedSegment {
     pub virtual_addr: u64,
     pub physical_addr: u64,
@@ -51,6 +81,8 @@ pub struct LoadedSegment {
 pub struct ElfImage {
     pub entry: u64,
     pub segments: Vec<LoadedSegment>,
+    // 符号名 -> 符号值（加载后的 VA）。仅用于内核镜像的引导参数打补丁。
+    symbols: Vec<(alloc::string::String, u64)>,
 }
 
 impl ElfImage {
@@ -94,16 +126,91 @@ impl ElfImage {
             });
         }
 
+        let symbols = parse_symbol_table(data, &header)?;
+
         log_info!(
-            "ELF entry=0x{:016x}, segments={} ",
+            "ELF entry=0x{:016x}, segments={}, symbols={} ",
             header.e_entry,
-            segments.len()
+            segments.len(),
+            symbols.len()
         );
         Ok(ElfImage {
             entry: header.e_entry,
             segments,
+            symbols,
         })
     }
+
+    /// 在内核镜像（已按 p_vaddr 恒等映射加载）中查找符号的加载地址。
+    pub fn symbol_address(&self, name: &str) -> Option<u64> {
+        self.symbols
+            .iter()
+            .find(|(sym, _)| sym.as_str() == name)
+            .map(|(_, value)| *value)
+    }
+}
+
+/// 解析 SHT_SYMTAB / SHT_DYNSYM 符号表，收集 name -> st_value。
+/// 内核是 debug（未 strip）构建，symtab 一定存在；找不到时仅告警。
+/// 符号名经 sh_link 指向的 .strtab 节解析（st_name 相对该节偏移）。
+fn parse_symbol_table(
+    data: &[u8],
+    header: &Elf64Ehdr,
+) -> Result<Vec<(alloc::string::String, u64)>, Status> {
+    const SHT_STRTAB: u32 = 3;
+
+    let shoff = header.e_shoff as usize;
+    let shentsize = header.e_shentsize as usize;
+    let shnum = header.e_shnum as usize;
+
+    // 第一遍：收集所有节的 (类型, 内容偏移, 内容长度, sh_link)。
+    let mut sections = Vec::new();
+    for idx in 0..shnum {
+        let offset = shoff + idx * shentsize;
+        if offset + shentsize > data.len() {
+            break;
+        }
+        let sh = unsafe { *(data.as_ptr().add(offset) as *const Elf64Shdr) };
+        sections.push((sh.sh_type, sh.sh_offset as usize, sh.sh_size as usize, sh.sh_link as usize));
+    }
+
+    let mut out = Vec::new();
+    for (ty, sym_off, sym_size, strtab_idx) in &sections {
+        if *ty != SHT_SYMTAB && *ty != SHT_DYNSYM {
+            continue;
+        }
+        let (strtab_off, strtab_size) = match sections.get(*strtab_idx) {
+            Some((SHT_STRTAB, off, size, _)) => (*off, *size),
+            _ => continue,
+        };
+        let entsize = mem::size_of::<Elf64Sym>();
+        let end = sym_off + sym_size;
+        if end > data.len() {
+            continue;
+        }
+        for pos in (*sym_off..end).step_by(entsize) {
+            if pos + entsize > data.len() {
+                break;
+            }
+            let sym = unsafe { *(data.as_ptr().add(pos) as *const Elf64Sym) };
+            if sym.st_shndx == SHN_UNDEF || sym.st_name == 0 {
+                continue;
+            }
+            let name_off = strtab_off + sym.st_name as usize;
+            if name_off >= strtab_off + strtab_size || name_off >= data.len() {
+                continue;
+            }
+            let tail = &data[name_off..];
+            let len = tail
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or(Status::INVALID_PARAMETER)?;
+            if let Ok(name) = alloc::string::String::from_utf8(tail[..len].to_vec()) {
+                out.push((name, sym.st_value));
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn load_segments(bs: &BootServices, image: &ElfImage, file_data: &[u8]) -> Result<(), Status> {

@@ -1,3 +1,4 @@
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -83,7 +84,13 @@ impl<D: BlockDevice> Volume<D> {
 
         let mut allocator = BlockAllocator::new(1, total_blocks.saturating_sub(1));
         for &block in &reserved {
-            allocator.mark_used(block);
+            // 分配器基址为 1：块 0（超级块副本 A 所在区）天然不可分配，
+            // 无需也不可对其 mark_used；越界项视为隐式保留。
+            if allocator.in_range(block) {
+                allocator
+                    .mark_used(block)
+                    .expect("reserved blocks in range");
+            }
         }
 
         options.reserved_blocks = reserved;
@@ -150,7 +157,12 @@ impl<D: BlockDevice> Volume<D> {
 
         if let Some(existing) = self.directory.remove(path) {
             for block in existing.blocks {
-                self.allocator.free(block);
+                if self.snapshots.references(block) {
+                    continue;
+                }
+                self.allocator
+                    .free(block)
+                    .expect("freed blocks must be allocated");
                 let _ = self.journal.record(JournalEntry::Free { block });
             }
         }
@@ -161,7 +173,7 @@ impl<D: BlockDevice> Volume<D> {
             let block = self
                 .allocator
                 .allocate()
-                .ok_or(ZfsError::AllocationFailed)?;
+                .map_err(|_| ZfsError::AllocationFailed)?;
             self.journal.record(JournalEntry::Allocate { block })?;
             blocks.push(block);
         }
@@ -211,7 +223,12 @@ impl<D: BlockDevice> Volume<D> {
     pub fn remove_file(&mut self, path: &str) -> Result<(), ZfsError> {
         let entry = self.directory.remove(path).ok_or(ZfsError::NotFound)?;
         for block in entry.blocks {
-            self.allocator.free(block);
+            if self.snapshots.references(block) {
+                continue;
+            }
+            self.allocator
+                .free(block)
+                .expect("freed blocks must be allocated");
             let _ = self.journal.record(JournalEntry::Free { block });
         }
         Ok(())
@@ -247,6 +264,37 @@ impl<D: BlockDevice> Volume<D> {
         Ok(())
     }
 
+    pub fn delete_snapshot(&mut self, id: u64) -> Result<(), ZfsError> {
+        let removed = self
+            .snapshots
+            .remove(id)
+            .ok_or(ZfsError::SnapshotNotFound)?;
+        let mut live: BTreeSet<u64> = self
+            .directory
+            .snapshot()
+            .values()
+            .flat_map(|entry| entry.blocks.iter().copied())
+            .collect();
+        for snap in self.snapshots.iter() {
+            for entry in snap.directory.values() {
+                live.extend(entry.blocks.iter().copied());
+            }
+        }
+        for block in removed
+            .directory
+            .values()
+            .flat_map(|entry| entry.blocks.iter().copied())
+        {
+            if live.contains(&block) {
+                continue;
+            }
+            if self.allocator.free(block).is_ok() {
+                let _ = self.journal.record(JournalEntry::Free { block });
+            }
+        }
+        Ok(())
+    }
+
     pub fn import_file(&mut self, path: &str, data: &[u8]) -> Result<(), ZfsError> {
         self.write_file(path, data, None)
     }
@@ -277,13 +325,19 @@ fn parse_superblock(raw: &[u8]) -> Option<SuperBlock> {
 fn create_default_superblock(block_size: u32) -> SuperBlock {
     SuperBlock {
         magic: *SUPERBLOCK_MAGIC,
-        version: 1,
+        version: 2,
         block_size,
         cluster_size: 4096,
         root_dir: InodeId(1),
         journal_head: 1,
         flags: 0,
         fs_uuid: [0u8; 16],
+        sb_sequence: 1,
+        region_start: 4,
+        region_len: 0,
+        active_half: 0,
+        sb_crc: 0,
+        reserved: [0u8; 24],
     }
 }
 
@@ -312,16 +366,18 @@ mod tests {
     use alloc::vec::Vec;
     use spin::Mutex;
 
-    static MEMORY: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static MEMORY_A: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static MEMORY_B: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static MEMORY_C: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-    fn create_volume() -> Volume<crate::device::MemoryBlockDevice> {
-        let device = crate::device::MemoryBlockDevice::new(&MEMORY);
+    fn create_volume(storage: &'static Mutex<Vec<u8>>) -> Volume<crate::device::MemoryBlockDevice> {
+        let device = crate::device::MemoryBlockDevice::new(storage);
         Volume::mount(device, MountOptions::default()).unwrap()
     }
 
     #[test]
     fn write_read_roundtrip() {
-        let mut volume = create_volume();
+        let mut volume = create_volume(&MEMORY_A);
         let data = b"hello world";
         volume.write_file("/hello.txt", data, None).unwrap();
         let mut buf = Vec::new();
@@ -331,7 +387,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_restore() {
-        let mut volume = create_volume();
+        let mut volume = create_volume(&MEMORY_B);
         volume.write_file("/hello", b"a", None).unwrap();
         let snapshot = volume.create_snapshot("first").unwrap();
         volume.write_file("/hello", b"b", None).unwrap();
@@ -339,5 +395,16 @@ mod tests {
         let mut buf = Vec::new();
         volume.read_file("/hello", &mut buf).unwrap();
         assert_eq!(&buf, b"a");
+    }
+
+    #[test]
+    fn snapshot_releases_blocks_on_delete() {
+        let mut volume = create_volume(&MEMORY_C);
+        let free_before = volume.allocator_snapshot().free;
+        volume.write_file("/data", b"snapshot payload", None).unwrap();
+        let snapshot = volume.create_snapshot("keep").unwrap();
+        volume.write_file("/data", b"v2", None).unwrap();
+        volume.delete_snapshot(snapshot.id).unwrap();
+        assert_eq!(volume.allocator_snapshot().free, free_before - 1);
     }
 }

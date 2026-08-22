@@ -5,7 +5,7 @@ extern crate alloc;
 pub mod arch;
 pub mod boot;
 pub mod bootinfo;
-pub mod drivers;
+pub mod drivers; // drivers/ 目录模块（驱动与中断服务，拆分自 drivers.rs）
 pub mod elf;
 pub mod ipc;
 pub mod mm;
@@ -18,7 +18,6 @@ pub mod shm;
 pub mod syscalls;
 pub mod trap;
 pub mod user_elf;
-pub mod user_shell;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use zero_abi::BootInfo;
@@ -58,8 +57,12 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     info!("Zero OS microkernel ready; launching userland servers");
     services::launch_core(boot_info);
     info!("kernel_main: services::launch_core returned");
-    let user_pid = process::spawn_user(user_shell::user_entry, "console");
-    scheduler::enqueue(user_pid);
+    // console 现在是真正的用户态进程：从 rootfs 加载独立 ELF，
+    // 只通过 userlib ABI 与内核交互，不访问任何内核地址。
+    match process::spawn_user_from_bootfs("/Applications/Shell", "console", false) {
+        Ok(user_pid) => scheduler::enqueue(user_pid),
+        Err(e) => info!("failed to spawn console: {:?}", e),
+    }
     scheduler::run()
 }
 

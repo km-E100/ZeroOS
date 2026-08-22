@@ -55,40 +55,50 @@ struct TrapContext {
     pid: Option<ProcessId>,
 }
 
+/// 异常/IRQ 总入口（由 arch 侧 trap_entry 调起，noreturn）。
+///
+/// 锁纪律：本路径进入 terminate / exit_current / reschedule 前必须
+/// 已释放全部 MutexGuard —— 所有 lock() 均以语句级表达式使用，
+/// 不存在跨函数调用的 Guard（见 scheduler.rs 头部锁纪律注释）。
 #[no_mangle]
 pub extern "C" fn __zero_trap_handler(frame: *mut TrapFrame, kind: u64) -> ! {
-    crate::info!("__zero_trap_handler: kind={} frame={:p}", kind, frame);
+    crate::debug!("trap: kind={} frame={:p}", kind, frame);
     match TrapKind::from(kind) {
-        TrapKind::Sync => {
-            crate::info!("__zero_trap_handler: entering handle_sync");
-            handle_sync(frame)
-        }
-        TrapKind::Irq => {
-            crate::info!("__zero_trap_handler: entering handle_irq");
-            handle_irq(frame)
-        }
+        TrapKind::Sync => handle_sync(frame),
+        TrapKind::Irq => handle_irq(frame),
     }
 }
 
 fn handle_sync(frame: *mut TrapFrame) -> ! {
     let esr = read_esr_el1();
-    crate::info!("handle_sync: ESR_EL1=0x{:016x}", esr);
+    crate::debug!("trap: sync ESR_EL1=0x{:016x}", esr);
     let decoded = decode_esr(esr);
     match decoded.kind {
         SyncExceptionKind::Svc => handle_svc(frame, esr),
         SyncExceptionKind::DataAbort(_) | SyncExceptionKind::InstructionAbort(_) => {
             let ctx = capture_trap_context();
             let message = format_sync_exception(&decoded, &ctx);
-            crate::info!("{}", message);
             if decoded.from_el0 {
+                // 用户态故障：审计行保留 info，然后杀进程回收槽位。
+                crate::info!("{}", message);
+                crate::info!(
+                    "[trap] DBG LR=0x{:016x} FP=0x{:016x} x11=0x{:016x} x0=0x{:016x} x1=0x{:016x}",
+                    unsafe { (*frame).regs[30] },
+                    unsafe { (*frame).regs[29] },
+                    unsafe { (*frame).regs[11] },
+                    unsafe { (*frame).regs[0] },
+                    unsafe { (*frame).regs[1] },
+                );
                 terminate_faulting_process(&ctx)
             } else {
-                trap_panic("kernel sync exception", esr)
+                // EL1 内核态同步异常：完整上下文 + 重启，绝不裸死循环。
+                crate::error!("{}", message);
+                kernel_sync_fault(&message, esr, frame)
             }
         }
         SyncExceptionKind::Other => {
             log_unknown_sync(esr);
-            trap_panic("unknown sync exception", esr)
+            kernel_sync_fault("unknown sync exception", esr, frame)
         }
     }
 }
@@ -97,8 +107,9 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
     unsafe {
         let raw = crate::arch::acknowledge_irq();
         let irq = crate::arch::interrupt_number(raw);
-        crate::info!(
-            "handle_irq: raw=0x{:08x} irq={} is_timer={}",
+        // 每次 tick 都执行到此：整条路径只留一行 debug（默认关闭）。
+        crate::debug!(
+            "trap: irq raw=0x{:08x} irq={} is_timer={}",
             raw,
             irq,
             crate::arch::is_timer_irq(irq)
@@ -106,17 +117,18 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
         if crate::arch::is_timer_irq(irq) {
             crate::arch::program_next_tick();
             crate::arch::end_irq(raw);
-            crate::info!("handle_irq: timer tick, yielding current");
+            crate::debug!("trap: timer tick, yielding current");
             crate::scheduler::yield_current()
         } else {
             let handled = crate::drivers::handle_irq(irq);
             crate::arch::end_irq(raw);
-            crate::info!("handle_irq: non-timer irq={} handled={}", irq, handled);
+            // 未处理的非 timer IRQ 属异常事件，但可能高频重放（UART 调试
+            // 线），故仍走 debug；跟踪低频事件时打开 debug 级日志即可。
+            crate::debug!("trap: non-timer irq={} handled={}", irq, handled);
             if handled {
-                crate::info!("handle_irq: restoring frame after handled IRQ");
                 crate::arch::restore_frame(frame)
             } else {
-                crate::info!("handle_irq: yielding current after unhandled IRQ");
+                crate::debug!("trap: unhandled irq={}, yielding current", irq);
                 crate::scheduler::yield_current()
             }
         }
@@ -124,6 +136,19 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
 }
 
 fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
+    // ⛔ 仅允许 EL0t 发起 SVC：校验保存的 SPSR_EL1.M[3:0] 必须为 0b0000。
+    // SVC 的 EC（0x15）无法区分来源 EL —— SPSR.M 才是权威字段；
+    // EL1 内核态发 SVC 视为内核 bug，直接打印完整上下文并复位。
+    let saved_m = unsafe { (*frame).spsr_el1 & 0x0f };
+    if saved_m != 0 {
+        crate::error!(
+            "SVC issued from EL1 (kernel bug): SPSR.M[3:0]=0b{:04b} esr=0x{:016x}",
+            saved_m,
+            esr
+        );
+        kernel_sync_fault("SVC issued from EL1 (kernel bug)", esr, frame)
+    }
+
     let imm = (esr & 0xffff) as u16;
     unsafe {
         match imm {
@@ -136,12 +161,12 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
                         regs[0] = encode_result(result);
                         crate::arch::restore_frame(frame)
                     }
-                    None => trap_panic("invalid syscall", esr),
+                    None => kernel_sync_fault("invalid syscall number", esr, frame),
                 }
             }
             1 => crate::scheduler::yield_current(),
             2 => crate::scheduler::exit_current(),
-            _ => trap_panic("unknown svc", esr),
+            _ => kernel_sync_fault("unknown svc immediate", esr, frame),
         }
     }
 }
@@ -227,11 +252,14 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
             name_ptr: regs[1] as usize,
             name_len: regs[2] as usize,
         }),
+        21 => Some(Syscall::GetPid),
         _ => None,
     }
 }
 
-fn encode_result(result: Result<u64, SysError>) -> u64 {
+/// 用户态返回码编码（与 userland/userlib 的 decode_result 一一对应，
+/// 参见 ipc/syscall ABI）。
+pub fn encode_result(result: Result<u64, SysError>) -> u64 {
     match result {
         Ok(value) => value,
         Err(err) => match err {
@@ -253,8 +281,8 @@ fn log_unknown_sync(esr: u64) {
     let iss = esr & 0x01ff_ffff;
     let slot = ctx.slot.unwrap_or(usize::MAX);
     let pid_raw = ctx.pid.map(|p| p.raw()).unwrap_or(0);
-    crate::info!(
-        "trap: sync exception ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x} far=0x{:016x} slot={} pid={}",
+    crate::error!(
+        "trap: unknown sync ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x} far=0x{:016x} slot={} pid={}",
         ec,
         iss,
         esr,
@@ -265,8 +293,48 @@ fn log_unknown_sync(esr: u64) {
     );
 }
 
-fn trap_panic(msg: &str, esr: u64) -> ! {
-    crate::info!("trap panic: {msg} (ESR=0x{esr:016x})");
+/// EL1 内核态同步异常 / 内核 bug 的统一出口：
+/// 打印完整上下文（ESR/FAR/ELR/SPSR/SP、槽号、pid、trap frame 指针），
+/// 然后尝试复位机器；复位不可用时打印 "SYSTEM HALT" 后停机（日志直写
+/// PL011，已完整落盘）。
+fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
+    let slot = crate::scheduler::current_slot_opt();
+    let pid = slot
+        .and_then(|s| process::pid_at_slot(s).map(|p| p.raw()))
+        .unwrap_or(0);
+    let slot = slot.unwrap_or(usize::MAX);
+    let elr = read_elr_el1();
+    let far = read_far_el1();
+    let spsr = unsafe { (*frame).spsr_el1 };
+    let sp = unsafe { (*frame).sp_el1 };
+    crate::error!(
+        "[KERNEL FAULT] {reason}: ESR=0x{esr:016x} FAR=0x{far:016x} ELR=0x{elr:016x} \
+         SPSR=0x{spsr:016x} SP_EL1=0x{sp:016x} slot={slot} pid={pid} frame={frame:p}"
+    );
+    reset_or_halt()
+}
+
+/// 复位或停机。
+///
+/// aarch64/QEMU virt：SMC #0 进 EL3 走 PSCI SYSTEM_RESET（FID=0x8400_0008，
+/// PSCI 0.2 标准），QEMU 自带 EL3 固件会真实复位机器。
+/// 若固件/EL3 缺失，SMC 会作为同步异常绕回异常向量（arch 侧
+/// default_exception 兜底打印并停机）—— 于是我们提前把 SYSTEM HALT
+/// 与全部上下文落盘，保证诊断信息不丢。
+///
+/// 真实硬件路径（协调点，arch Agent）：硬件 WDT（如 dw_wdt / SP805）
+/// 触发复位；arch Agent 落地 `arch::reset()` 后应改调它。
+fn reset_or_halt() -> ! {
+    crate::error!("SYSTEM HALT: 内核故障，尝试复位后停机");
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let fid: u64 = 0x8400_0008; // PSCI SYSTEM_RESET
+        asm!("smc #0", in("x0") fid, options(nostack));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // host 测试/其他目标：直接停机（永不返回）。
+    }
     loop {
         core::hint::spin_loop();
     }
@@ -307,6 +375,9 @@ fn capture_trap_context() -> TrapContext {
     }
 }
 
+/// 终止故障进程。锁纪律：两个 lock()（PROCESS_TABLE / CURRENT_SLOT）
+/// 都是语句级 Guard，进入 exit_current → reschedule 前已全部释放，
+/// 绝无跨 noreturn 调用持锁。
 fn terminate_faulting_process(ctx: &TrapContext) -> ! {
     if let Some(slot) = ctx.slot {
         process::set_state_slot(slot, ProcessState::Dying);
@@ -430,5 +501,217 @@ impl From<u64> for TrapKind {
             1 => TrapKind::Irq,
             _ => TrapKind::Sync,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 与 userland/userlib::decode_result 保持一致的解码（仅测试用，
+    /// 验证 encode 是它的逆操作）。
+    fn decode_result(value: u64) -> Result<u64, SysError> {
+        match value {
+            val if val == u64::MAX => Err(SysError::InvalidArgument),
+            val if val == u64::MAX - 1 => Err(SysError::PermissionDenied),
+            val if val == u64::MAX - 2 => Err(SysError::ChannelUnavailable),
+            val if val == u64::MAX - 3 => Err(SysError::NotFound),
+            val if val == u64::MAX - 4 => Err(SysError::NoMemory),
+            val if val == u64::MAX - 5 => Err(SysError::WouldBlock),
+            val if val == u64::MAX - 6 => Err(SysError::DeviceError),
+            val if val == u64::MAX - 7 => Err(SysError::Busy),
+            other => Ok(other),
+        }
+    }
+
+    #[test]
+    fn encode_decode_ok_roundtrip() {
+        for value in [0u64, 1, 42, u64::MAX - 8, (1 << 48) - 1] {
+            assert_eq!(decode_result(encode_result(Ok(value))), Ok(value));
+        }
+    }
+
+    #[test]
+    fn encode_decode_err_roundtrip() {
+        let errors = [
+            SysError::InvalidArgument,
+            SysError::PermissionDenied,
+            SysError::ChannelUnavailable,
+            SysError::NotFound,
+            SysError::NoMemory,
+            SysError::WouldBlock,
+            SysError::DeviceError,
+            SysError::Busy,
+        ];
+        for err in errors {
+            let encoded = encode_result(Err(err));
+            assert!(
+                encoded >= u64::MAX - 7,
+                "error sentinel must live in reserved range: got 0x{encoded:x}"
+            );
+            assert_eq!(decode_result(encoded), Err(err));
+        }
+    }
+
+    extern "C" fn fake_entry() -> ! {
+        loop {}
+    }
+
+    fn regs(number: u64, args: [u64; 4]) -> [u64; 31] {
+        let mut regs = [0u64; 31];
+        regs[0] = number;
+        regs[1] = args[0];
+        regs[2] = args[1];
+        regs[3] = args[2];
+        regs[4] = args[3];
+        regs
+    }
+
+    #[test]
+    fn decode_syscall_table() {
+        assert!(matches!(
+            decode_syscall(&regs(0, [1, 0x8000_0000, 0, 0])),
+            Some(Syscall::SendMessage { channel: 1, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(1, [1, 0x8000_0000, 0, 0])),
+            Some(Syscall::ReceiveMessage { channel: 1, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(2, [0, 0, 0, 0])),
+            Some(Syscall::Fork)
+        ));
+        // Exec: entry 必须非零
+        assert!(decode_syscall(&regs(3, [0, 0, 0, 0])).is_none());
+        assert!(matches!(
+            decode_syscall(&regs(3, [fake_entry as usize as u64, 7, 0, 0])),
+            Some(Syscall::Exec { arg: 7, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(4, [0, 0, 0, 0])),
+            Some(Syscall::Yield)
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(5, [-1i32 as u64, 0, 0, 0])),
+            Some(Syscall::Exit { status: -1 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(6, [0x8000_0000, 512, 0, 0])),
+            Some(Syscall::ConsoleRead { len: 512, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(7, [42, 0x8000_0000, 512, 0])),
+            Some(Syscall::BlockRead { lba: 42, len: 512, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(8, [42, 0x8000_0000, 4096, 0])),
+            Some(Syscall::BlockWrite { lba: 42, len: 4096, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(9, [0x8000_0000, 32, 0, 0])),
+            Some(Syscall::ConsoleWrite { len: 32, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(10, [4096, 0x8000_0000, 0, 0])),
+            Some(Syscall::ShmCreate { size: 4096, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(11, [3, 0, 0, 0])),
+            Some(Syscall::ShmMap { handle: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(12, [3, 0, 0, 0])),
+            Some(Syscall::ShmLen { handle: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(13, [3, 0, 0, 0])),
+            Some(Syscall::ShmRetain { handle: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(14, [3, 0, 0, 0])),
+            Some(Syscall::ShmRelease { handle: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(15, [0, 0, 0, 0])),
+            Some(Syscall::DriverCount)
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(16, [0, 0x8000_0000, 0, 0])),
+            Some(Syscall::DriverInfo { index: 0, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(17, [3, 0, 0, 0])),
+            Some(Syscall::ShmPhys { handle: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(18, [0, 0x8000_0000, 0, 0])),
+            Some(Syscall::MmioMap { index: 0, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(19, [0, 0, 0, 0])),
+            Some(Syscall::MmioUnmap { index: 0 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(20, [0x8000_0000, 8, 0, 0])),
+            Some(Syscall::SpawnService { name_len: 8, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(21, [0, 0, 0, 0])),
+            Some(Syscall::GetPid)
+        ));
+        assert!(decode_syscall(&regs(22, [0, 0, 0, 0])).is_none());
+        assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
+    }
+
+    #[test]
+    fn decode_esr_classes() {
+        // EC=0x15 SVC（AArch64）
+        assert!(matches!(
+            decode_esr(0x15u64 << 26).kind,
+            SyncExceptionKind::Svc
+        ));
+        // EC=0x24 data abort from lower EL：DFSC=0b000101 → translation L1
+        let esr = (0x24u64 << 26) | 0b000101;
+        match decode_esr(esr).kind {
+            SyncExceptionKind::DataAbort(info) => {
+                assert_eq!(info.kind, FaultKind::Translation);
+                assert_eq!(info.level, Some(1));
+                assert!(decode_esr(esr).from_el0);
+            }
+            _ => panic!("expected data abort"),
+        }
+        // EC=0x25 data abort same EL（内核态）：from_el0=false
+        let esr = (0x25u64 << 26) | 0b001101; // permission L1
+        match decode_esr(esr).kind {
+            SyncExceptionKind::DataAbort(info) => {
+                assert_eq!(info.kind, FaultKind::Permission);
+                assert!(!decode_esr(esr).from_el0);
+            }
+            _ => panic!("expected data abort"),
+        }
+        // EC=0x21 instruction abort same EL
+        let esr = (0x21u64 << 26) | 0b000100;
+        match decode_esr(esr).kind {
+            SyncExceptionKind::InstructionAbort(info) => {
+                assert_eq!(info.kind, FaultKind::Translation);
+                assert_eq!(info.level, Some(0));
+            }
+            _ => panic!("expected instruction abort"),
+        }
+        // 未知 EC
+        assert!(matches!(
+            decode_esr(0x01u64 << 26).kind,
+            SyncExceptionKind::Other
+        ));
+    }
+
+    #[test]
+    fn decode_fault_unknown() {
+        let info = decode_fault_info(0);
+        assert_eq!(info.kind, FaultKind::AddressSize);
+        assert_eq!(info.level, Some(0));
+        let info = decode_fault_info(0b111111);
+        assert_eq!(info.kind, FaultKind::Unknown);
+        assert_eq!(info.level, None);
     }
 }

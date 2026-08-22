@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod crc;
 pub mod crypto;
 pub mod device;
 pub mod directory;

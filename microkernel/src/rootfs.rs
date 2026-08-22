@@ -4,7 +4,8 @@ use core::{cmp, mem, ptr};
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::mm::address_space::{AddressSpace, MapError};
-use crate::mm::paging::PAGE_SIZE;
+// PAGE_SIZE 已由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
+use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
 use spin::Mutex;
 use zero_abi::boot::{RootFsEntry, RootFsImage};
@@ -115,6 +116,33 @@ pub fn entries() -> Option<&'static [RootFsEntry]> {
 // -----------------------------------------------------------------------------
 //  Build user bootfs metadata
 // -----------------------------------------------------------------------------
+/// 一个文件/路径所需物理页数（向上取整），支持任意大小文件。
+pub const fn pages_for_len(len: usize) -> usize {
+    len.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE
+}
+
+/// 把数据按页拷贝到新分配的**物理连续**页中，返回 (首页物理地址, 页数)。
+/// 用户侧看到的地址总是连续的（虚拟连续 + 物理连续），首页基址可直接推导后续页。
+fn copy_into_pages(src: &[u8]) -> Option<(usize, usize)> {
+    if src.is_empty() {
+        return Some((0, 0));
+    }
+    let pages = pages_for_len(src.len());
+    let first = phys::alloc_pages_contiguous(pages)?;
+    let mut copied = 0usize;
+    for i in 0..pages {
+        let current = first + i * PAGE_SIZE;
+        let chunk = cmp::min(PAGE_SIZE, src.len() - copied);
+        unsafe {
+            // 恒等映射下物理页可直接写入。
+            core::ptr::write_bytes(current as *mut u8, 0, PAGE_SIZE);
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), current as *mut u8, chunk);
+        }
+        copied += chunk;
+    }
+    Some((first, pages))
+}
+
 pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, usize) {
     let entries = unsafe { image.as_slice() };
     let mut files = Vec::with_capacity(entries.len());
@@ -122,24 +150,14 @@ pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, us
     for entry in entries {
         let path = unsafe { entry.path() };
         let path_len = path.len();
-
-        assert!(path_len <= PAGE_SIZE, "bootfs path too long");
-
-        let path_phys = phys::alloc_page().expect("bootfs: OOM");
-        unsafe {
-            // 恒等映射下物理页可直接写入。
-            core::ptr::copy_nonoverlapping(path.as_ptr(), path_phys as *mut u8, path_len);
-        }
-
         let data = unsafe { entry.data() };
         let data_len = data.len();
 
-        assert!(data_len <= PAGE_SIZE, "bootfs data too large");
-
-        let data_phys = phys::alloc_page().expect("bootfs: OOM");
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), data_phys as *mut u8, data_len);
-        }
+        // 支持多页文件（如 /Applications/Shell 这种 2.6MB 的 ELF）。
+        // path_phys / data_phys 记录首页物理地址即可：虚拟地址连续，
+        // 且物理地址在下发用户态前会被抹除，消费者只依赖 data_ptr/data_len。
+        let (path_phys, _) = copy_into_pages(path.as_bytes()).expect("bootfs: OOM");
+        let (data_phys, _) = copy_into_pages(data).expect("bootfs: OOM");
 
         files.push(UserBootFile {
             path_phys: path_phys as u64,
@@ -162,10 +180,10 @@ pub fn assign_user_bootfs_virtual_addresses(
 ) -> usize {
     for file in files.iter_mut() {
         file.path_ptr = base as u64;
-        base += PAGE_SIZE;
+        base += pages_for_len(file.path_len as usize) * PAGE_SIZE;
 
         file.data_ptr = base as u64;
-        base += PAGE_SIZE;
+        base += pages_for_len(file.data_len as usize) * PAGE_SIZE;
     }
     base
 }
@@ -193,11 +211,27 @@ pub fn build_user_bootfs_for_process(
 
     let mut cursor = assign_user_bootfs_virtual_addresses(&mut files, user_base);
 
-    // Map pages
+    // Map pages（每个文件可能跨多页，路径与数据分别映射完整页数）
     for file in files.iter() {
         unsafe {
-            aspace.map_page_phys(file.path_ptr as usize, file.path_phys as usize, false, false)?;
-            aspace.map_page_phys(file.data_ptr as usize, file.data_phys as usize, false, false)?;
+            let path_pages = pages_for_len(file.path_len as usize);
+            for i in 0..path_pages {
+                aspace.map_page_phys(
+                    file.path_ptr as usize + i * PAGE_SIZE,
+                    file.path_phys as usize + i * PAGE_SIZE,
+                    false,
+                    false,
+                )?;
+            }
+            let data_pages = pages_for_len(file.data_len as usize);
+            for i in 0..data_pages {
+                aspace.map_page_phys(
+                    file.data_ptr as usize + i * PAGE_SIZE,
+                    file.data_phys as usize + i * PAGE_SIZE,
+                    false,
+                    false,
+                )?;
+            }
         }
     }
 

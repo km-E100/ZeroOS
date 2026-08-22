@@ -45,6 +45,9 @@ zero_bss:
 
 // -----------------------------------------------------------------------------
 // 静态引导信息（可由链接时覆盖）
+// 布局与 libs/abi 的 BootInfo 逐字段对齐（6 个 8 字节字段）：
+//   __zero_ipc_server_entry / __zero_zfs_server_entry / __zero_launchd_entry
+//   / __zero_rootfs_image / __zero_driver_table / __zero_memory_bytes
 // -----------------------------------------------------------------------------
 .section .rodata.boot, "a"
 .align 3
@@ -55,6 +58,7 @@ boot_info_struct:
     .quad __zero_launchd_entry
     .quad __zero_rootfs_image
     .quad __zero_driver_table
+    .quad __zero_memory_bytes
 
 // 默认服务器入口占位符（可被强符号覆盖）
 .section .text.boot
@@ -86,6 +90,16 @@ __zero_rootfs_image:
 .type __zero_driver_table, %object
 __zero_driver_table:
     .quad 0
+    .quad 0
+
+// 可用物理内存字节数占位（BootInfo.memory_bytes 指向的位置）。
+// 0 = 未知：内核 mm 初始化时回退到默认 512 MiB。
+// UEFI 路径由 bootloader 在启动前把真实值写回这里；
+// 也可由内核强符号覆盖（[no_mangle] static __zero_memory_bytes: u64）。
+.align 3
+.weak __zero_memory_bytes
+.type __zero_memory_bytes, %object
+__zero_memory_bytes:
     .quad 0
 
 // -----------------------------------------------------------------------------

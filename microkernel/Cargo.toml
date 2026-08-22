@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["rlib", "staticlib"]
+# no_std 库不能以 test 档（panic=unwind）构建 doctest，否则报
+# "unwinding panics are not supported without std"。本库无 doctest，直接关闭。
+doctest = false
 
 [dependencies]
 spin = { workspace = true }
