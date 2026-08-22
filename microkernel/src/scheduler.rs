@@ -31,6 +31,15 @@ use crate::process::{self, ProcessState};
 static RUNQUEUE: Mutex<RunQueue> = Mutex::new(RunQueue::new());
 static CURRENT_SLOT: Mutex<Option<usize>> = Mutex::new(None);
 
+/// 时间片长度（timer tick 数）。当前进程连续占用超过该数量 tick 后
+/// 才被强制让出——单进程独跑时消除每 tick 一次的无效上下文切换
+/// （对照 Linux CFS 的 sched_latency / XNU timeslice 概念）。
+pub const SLICE_TICKS: u32 = 4;
+
+/// 每槽已消耗 tick 记账。u32 原子数组避免持锁（tick 路径在 IRQ 内）。
+static SLICE_USED: [core::sync::atomic::AtomicU32; 64] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 64];
+
 pub fn init() {
     RUNQUEUE.lock().clear();
     *CURRENT_SLOT.lock() = None;
@@ -57,6 +66,8 @@ fn dispatch(pid: ProcessId) -> ! {
     let next_slot = process::slot_for_pid(pid).expect("scheduler: unknown pid");
     crate::debug!("scheduler::dispatch: pid={} slot={}", pid.raw(), next_slot);
     process::set_state(pid, ProcessState::Running);
+    // 新调度周期：时间片清零（SLICE_TICKS 内不被强制抢占）。
+    SLICE_USED[next_slot].store(0, core::sync::atomic::Ordering::Relaxed);
 
     // 持锁窗口：读出上一个 current 并写入新的，单语句块结束即释放。
     let current_slot = {
@@ -246,6 +257,20 @@ pub fn exit_current() -> ! {
 /// 阻塞当前进程（Blocked：不进就绪队列，直到 wake(pid)）。
 /// 阻塞式 IPC 的基石：调用方必须**先**在任何表/通道里登记等待意图、
 /// 释放自己的锁，再调用本函数（锁纪律第 1 条：Guard 不得跨 noreturn）。
+/// timer tick 记账：当前进程消耗一个 tick。
+/// 返回 true 表示时间片耗尽应抢占；false 则中断直接返回原进程
+/// （省去一次完整上下文切换，单进程独跑时收益最大）。
+pub fn on_tick_consume() -> bool {
+    let slot = current_slot_opt().unwrap_or(0);
+    let used = SLICE_USED[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if used >= SLICE_TICKS {
+        SLICE_USED[slot].store(0, core::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn block_current() -> ! {
     let slot = current_slot();
     process::set_state_slot(slot, ProcessState::Blocked);

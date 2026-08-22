@@ -313,3 +313,57 @@ mod tests {
         }
     }
 }
+
+// ─── FP 链栈回溯（对照 Linux arch/arm64/kernel/stacktrace.c）────────
+//
+// AArch64 帧指针约定：每帧开头 `stp x29, x30, [sp]`，x29 指向该处：
+// [fp] = 上一帧 FP，[fp+8] = 返回地址。内核 debug 构建保留 FP
+// （实测 117 处 stp x29,x30 prologue），回溯因此可行。
+//
+// 终止条件（任一满足即停，绝不猜测性解引用）：
+// * fp 非法（非 16 对齐 / 越出恒等映射窗口 [RAM_BASE, RAM_BASE+2GiB)）
+// * 帧链不再向上（next_fp <= fp：回环或到达栈顶）
+// * 收集帧数达上限
+
+/// 单帧回溯结果。
+pub struct Frame {
+    /// 返回地址（调用点下一条指令）。
+    pub pc: u64,
+    /// symbol_note(pc) 的现成文本（形如 " (__symbol+0xoff)"）。
+    pub note: String,
+}
+
+/// 从起始 FP 沿帧链向上收集至多 max_frames 帧。
+/// fp0 由调用方以 `asm!("mov {}, x29")` 取得（见 [`current_fp`]）。
+pub fn backtrace_from(fp0: u64, max_frames: usize) -> alloc::vec::Vec<Frame> {
+    const RAM_LO: u64 = 0x4000_0000;
+    const RAM_HI: u64 = 0xC000_0000; // 恒等映射上界（2GiB）+ 余量
+    let mut frames = alloc::vec::Vec::new();
+    let mut fp = fp0;
+    for _ in 0..max_frames {
+        if fp < RAM_LO || fp >= RAM_HI || fp & 0xf != 0 {
+            break; // 链断：野 FP 或已离开内核栈区
+        }
+        // Safety：FP 经边界校验后按 AArch64 帧布局读取两字；
+        // 链位于恒等映射内的合法可读内存。
+        let pair = unsafe { *(fp as *const [u64; 2]) };
+        let (next_fp, lr) = (pair[0], pair[1]);
+        let note = symbol_note(lr);
+        frames.push(Frame { pc: lr, note });
+        if next_fp <= fp {
+            break;
+        }
+        fp = next_fp;
+    }
+    frames
+}
+
+/// 当前帧指针（故障路径回溯起点）。
+#[inline(never)]
+pub fn current_fp() -> u64 {
+    let fp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, x29", out(reg) fp);
+    }
+    fp
+}

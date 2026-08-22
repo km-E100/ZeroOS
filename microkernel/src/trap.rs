@@ -138,8 +138,13 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
         if crate::arch::is_timer_irq(irq) {
             crate::arch::program_next_tick();
             crate::arch::end_irq(raw);
-            crate::debug!("trap: timer tick, yielding current");
-            crate::scheduler::yield_current()
+            // 时间片记账：未耗尽则直接返回被打断进程（restore_frame），
+            // 省去一次完整切换；耗尽才走 yield 让出。
+            if crate::scheduler::on_tick_consume() {
+                crate::debug!("trap: timer tick, yielding current");
+                crate::scheduler::yield_current()
+            }
+            crate::arch::restore_frame(frame)
         } else {
             let handled = crate::drivers::handle_irq(irq);
             crate::arch::end_irq(raw);
@@ -370,6 +375,19 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
          SPSR=0x{spsr:016x} SP_EL1=0x{sp:016x} slot={slot} pid={pid} frame={frame:p}"
     );
     dump_frame_registers(frame);
+
+    // FP 链栈回溯（对标 Linux oops 的 Call Trace 段）：从故障现场
+    // 的 x29 起向上收集，逐帧符号化。链断条件见 backtrace_from。
+    // 注意：x29 取自**保存的现场**而非当前内核栈，保证回溯的是
+    // 故障发生时刻的调用链。
+    let fp = unsafe { (*frame).regs[29] };
+    let trace = crate::debug::backtrace_from(fp, 12);
+    if !trace.is_empty() {
+        crate::error!("Call Trace:");
+        for (i, fr) in trace.iter().enumerate() {
+            crate::error!("  #{i} pc=0x{:016x}{}", fr.pc, fr.note);
+        }
+    }
     reset_or_halt()
 }
 
