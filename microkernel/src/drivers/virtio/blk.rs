@@ -1,9 +1,13 @@
 //! virtio-blk 块设备驱动（virtio-mmio legacy，queue 0）。
 //! 单块 I/O 串行化：一次仅一个请求在途。
 //!
-//! 完成等待约束：内核在 EL1 全程屏蔽 IRQ（SPSR 只放行 EL0 中断），
-//! syscall 路径上的完成等待因此必须带界——超时返回错误并复位内部状态
-//! （inflight=false + discard_next），迟到的完成元素在 IRQ 路径被丢弃，
+//! 完成等待设计：内核在 EL1 全程屏蔽 IRQ（SPSR 只放行 EL0 中断），
+//! syscall 路径上的完成等待**不能依赖 irq_handler**——等待线程自己
+//! 直接轮询 used 环（QEMU 对 QUEUE_NOTIFY 是同步处理的，通知返回时
+//! 完成元素通常已就位）。IRQ 路径保留给未来 EL0 上下文的阻塞等待，
+//! 两条路径共用 poll_completion_locked 取结果。
+//! 等待仍带界——超时返回错误并复位内部状态（inflight=false +
+//! discard_next），迟到的完成元素在任一路径被丢弃，
 //! 保证单次超时后设备与驱动都能继续工作。
 
 use alloc::alloc::{alloc_zeroed, Layout};
@@ -127,6 +131,46 @@ pub fn init(descriptor: &DriverDescriptor) {
     register_irq_handler(descriptor.irq, irq_handler);
     unsafe { set_driver_ok(base) };
     info!("driver: virtio-blk 初始化完成 (base=0x{:016x} irq={})", base, descriptor.irq);
+
+    self_test();
+}
+
+/// 上电自检：向专用测试扇区写入特征图案，读回逐字节比对。
+/// 失败仅告警不阻塞启动（设备保持 ready，交由调用方按错误处理）。
+const SELF_TEST_LBA: u64 = 2048; // 1MiB 偏移；避开 userdb（LBA 128）等既有数据
+
+fn self_test() {
+    let mut pattern = [0u8; SECTOR_SIZE];
+    for (i, byte) in pattern.iter_mut().enumerate() {
+        // 与 LBA 相关的确定性图案，全 0 盘也能区分"读到旧数据"与"比对一致"。
+        *byte = (i % 251) as u8 ^ (SELF_TEST_LBA as u8);
+    }
+    if let Err(e) = write_blocks(SELF_TEST_LBA, &pattern) {
+        warn!("driver: virtio-blk 自检写入失败 (LBA={}): {:?}", SELF_TEST_LBA, e);
+        return;
+    }
+    let mut readback = [0u8; SECTOR_SIZE];
+    if let Err(e) = read_blocks(SELF_TEST_LBA, &mut readback) {
+        warn!("driver: virtio-blk 自检读回失败 (LBA={}): {:?}", SELF_TEST_LBA, e);
+        return;
+    }
+    if readback != pattern {
+        if let Some(off) =
+            readback.iter().zip(pattern.iter()).position(|(r, p)| r != p)
+        {
+            warn!(
+                "driver: virtio-blk 自检比对不一致 @{} (读 {:02x} 期望 {:02x})",
+                off, readback[off], pattern[off]
+            );
+        } else {
+            warn!("driver: virtio-blk 自检比对不一致");
+        }
+        return;
+    }
+    info!(
+        "driver: virtio-blk 自检通过：LBA {} 写入+读回 {} 字节比对一致",
+        SELF_TEST_LBA, SECTOR_SIZE
+    );
 }
 
 pub fn is_ready() -> bool {
@@ -279,16 +323,24 @@ fn wait_idle() -> Result<(), BlockError> {
 }
 
 /// 有界等待完成：最多 COMPLETION_RETRIES 次自旋。
+///
+/// 内核在 EL1 屏蔽 IRQ，等待线程必须自己轮询设备（见模块头注释）；
+/// 若 IRQ 路径抢先完成了请求（EL0 上下文），inflight 已清零则直接取缓存结果。
 /// 超时后复位 inflight 并置 discard_next，使后续 I/O 可继续；
-/// 迟到的完成元素在 IRQ 路径被丢弃，避免污染下一次请求的结果。
+/// 迟到的完成元素在任一路径被丢弃，避免污染下一次请求的结果。
 fn wait_for_completion() -> Result<usize, BlockError> {
     for _ in 0..COMPLETION_RETRIES {
-        let (inflight, status, len) = {
-            let state = STATE.lock();
-            (state.inflight, state.last_status, state.last_len)
-        };
-        if !inflight {
-            return if status == 0 { Ok(len) } else { Err(BlockError::DeviceError) };
+        {
+            let mut state = STATE.lock();
+            // IRQ 路径已完成：直接取缓存结果。
+            if !state.inflight {
+                return finish_result(&state);
+            }
+            // 主动轮询：取 used 环 + 应答中断原因。
+            poll_completion_locked(&mut state);
+            if !state.inflight {
+                return finish_result(&state);
+            }
         }
         core::hint::spin_loop();
     }
@@ -301,41 +353,63 @@ fn wait_for_completion() -> Result<usize, BlockError> {
     Err(BlockError::DeviceError)
 }
 
+/// 把缓存的完成结果翻译为返回值：状态字节非 0 视为设备错误。
+fn finish_result(state: &VirtioBlkState) -> Result<usize, BlockError> {
+    if state.last_status == 0 {
+        Ok(state.last_len)
+    } else {
+        Err(BlockError::DeviceError)
+    }
+}
+
+/// 在持有 STATE 锁的前提下直接轮询设备完成队列：
+/// 取空 used 环（丢弃被超时中止的迟到元素）、读状态字节、ACK 中断原因，
+/// 并复位 inflight。返回是否消费到了有效完成元素。
+fn poll_completion_locked(state: &mut VirtioBlkState) -> bool {
+    let Some(queue) = state.queue.as_mut() else {
+        return false;
+    };
+    let mut length: Option<usize> = None;
+    while let Some(elem) = queue.pop_used() {
+        if state.discard_next {
+            // 迟到的完成：属于被超时中止的请求，丢弃并继续。
+            state.discard_next = false;
+            continue;
+        }
+        length = Some(elem.len as usize);
+    }
+    let Some(len) = length else {
+        return false;
+    };
+    unsafe {
+        let status = mmio_read32(state.base, super::REG_INTERRUPT_STATUS);
+        if status != 0 {
+            mmio_write32(state.base, super::REG_INTERRUPT_ACK, status);
+        }
+    }
+    state.last_status = if state.status_ptr.is_null() {
+        0xff
+    } else {
+        unsafe { ptr::read_volatile(state.status_ptr) }
+    };
+    state.last_len = len;
+    state.inflight = false;
+    true
+}
+
 fn irq_handler(_irq: u32) {
     let mut state = STATE.lock();
     if !state.ready {
         debug!("virtio::blk::irq_handler: 尚未初始化");
         return;
     }
+    // ACK 中断原因（即使无新完成也清标志，防重放），
+    // 完成元素统一由 poll_completion_locked 取出。
     unsafe {
         let status = mmio_read32(state.base, super::REG_INTERRUPT_STATUS);
         if status != 0 {
-            mmio_write32(state.base, super::super::virtio::REG_INTERRUPT_ACK, status);
+            mmio_write32(state.base, super::REG_INTERRUPT_ACK, status);
         }
     }
-    let mut completed = false;
-    let mut length = 0usize;
-    // 先取出 discard 标志，避免与 queue 的可变借用冲突。
-    let mut discard = state.discard_next;
-    if let Some(queue) = state.queue.as_mut() {
-        while let Some(elem) = queue.pop_used() {
-            if discard {
-                // 迟到的完成：属于被超时中止的请求，丢弃并等待下一个。
-                discard = false;
-                continue;
-            }
-            completed = true;
-            length = elem.len as usize;
-        }
-    }
-    state.discard_next = discard;
-    if completed {
-        state.last_status = if state.status_ptr.is_null() {
-            0xff
-        } else {
-            unsafe { ptr::read_volatile(state.status_ptr) }
-        };
-        state.last_len = length;
-        state.inflight = false;
-    }
+    poll_completion_locked(&mut state);
 }

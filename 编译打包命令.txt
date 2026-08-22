@@ -37,16 +37,21 @@ cargo run -p xtask -- build-iso
 # （默认操作 /boot/EFI/ZEROOS/boot.env）清除失败计数。
 
 
-qemu-system-aarch64 \
-  -machine virt \
-  -cpu cortex-a72 \
-  -m 1024 \
-  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
-  -serial mon:stdio \
-  -display none \
-  -cdrom target/zero-os.iso
+# ---- QEMU 实机运行（virtio-blk 挂盘）----
 
+# 1) 创建 32MiB raw 测试盘（已存在则跳过；xtask run 与 run-qemu.sh 会自动创建）
+dd if=/dev/zero of=target/disk.img bs=1m count=32
 
+# 2) 一键启动（推荐二选一）：
+#    a) xtask run：串口写 target/qemu-run.log，适合脚本化验证
+cargo run -p xtask -- run            # 正常模式（自动挂盘 target/disk.img）
+cargo run -p xtask -- run recovery   # 恢复模式（-boot d）
+#
+#    b) run-qemu.sh：交互串口 mon:stdio，可直接操作用户态 shell（Ctrl-A X 退出）
+./run-qemu.sh
+
+# 3) 等价手动命令（与上述脚本参数一致）：
+#    槽位约定：virtio-mmio-bus.0 @ 0x0a000000 = 驱动表 virtio-blk0，GIC INTID 48。
 qemu-system-aarch64 \
   -machine virt \
   -cpu cortex-a72 \
@@ -55,5 +60,8 @@ qemu-system-aarch64 \
   -serial mon:stdio \
   -display none \
   -cdrom target/zero-os.iso \
-  -drive if=none,file=target/zero-rootfs.img,format=raw,id=zdisk \
+  -drive if=none,file=target/disk.img,format=raw,id=zdisk \
   -device virtio-blk-device,drive=zdisk,bus=virtio-mmio-bus.0
+
+# 注意：测试盘必须用专用空盘 target/disk.img；
+# 不要挂 zero-rootfs.img——用户态（如 securityd 的 userdb）会真实写入该盘。

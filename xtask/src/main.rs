@@ -6,6 +6,7 @@ use std::path::Path;
 use xshell::{cmd, Shell};
 
 mod image;
+mod qemu;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -238,25 +239,28 @@ fn run(sh: &Shell, mode: &str) -> Result<()> {
     if let Some(parent) = serial_log.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut args: Vec<String> =
-        QEMU_BASE_ARGS.iter().map(|s| s.to_string()).collect();
-    match mode {
-        "normal" => {
-            // 注释：normal 模式可直接把 -serial 换成 mon:stdio 以获得交互串口
-            args.push("-serial".into());
-            args.push(format!("file:{}", serial_log.display()));
-            cmd!(sh, "qemu-system-aarch64 {args...}").run()?;
+
+    let boot_d = match mode {
+        "normal" => false,
+        "recovery" => true,
+        _ => {
+            println!("unknown mode {mode}, defaulting to normal");
+            false
         }
-        "recovery" => {
-            // 恢复模式：从 CDROM 强制启动（对齐原 run 子命令的 -boot d）
-            args.push("-boot".into());
-            args.push("d".into());
-            args.push("-serial".into());
-            args.push(format!("file:{}", serial_log.display()));
-            cmd!(sh, "qemu-system-aarch64 {args...}").run()?;
-        }
-        _ => println!("unknown mode {mode}, defaulting to normal"),
-    }
+    };
+
+    // virtio-blk 测试盘：缺失自动创建（32MiB raw，target/disk.img）。
+    // 参数组装统一走 qemu 模块（与《编译打包命令.txt》/run-qemu.sh 一致）。
+    let disk = qemu::ensure_disk_image(&project_root)?;
+    let args = qemu::build_args(
+        &qemu::iso_path(&project_root),
+        &serial_log,
+        boot_d,
+        Some(&disk),
+    );
+
+    // 注释：交互调试可改用 ./run-qemu.sh（-serial mon:stdio）。
+    cmd!(sh, "qemu-system-aarch64 {args...}").run()?;
     Ok(())
 }
 
