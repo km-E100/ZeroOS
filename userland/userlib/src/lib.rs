@@ -88,6 +88,20 @@ pub fn exit(code: i32) -> ! {
     }
 }
 
+/// 创建当前进程的子进程（号位 2，`Syscall::Fork`）。
+///
+/// 返回值区分父子：
+/// - 父进程：`Ok(child_pid)` —— 内核新分配的子进程 PID；
+/// - 子进程：`Ok(0)` —— 内核把子进程 TrapFrame 的 x0 清零。
+///
+/// 语义：子进程获得父进程用户地址空间的 eager-copy 副本（独立物理页、
+/// 同一虚拟布局），从 svc 返回点之后继续执行；内核栈与 TrapFrame 各自
+/// 独立。错误码见 `SysError`（NoMemory=克隆失败/表满，NotFound=无当前进程）。
+pub fn fork() -> Result<u64, SysError> {
+    let ret = svc_call(2, [0, 0, 0, 0]);
+    decode_result(ret)
+}
+
 /// 从控制台读取最多 `buffer.len()` 字节（号位 6）。
 ///
 /// - 成功返回**实际读取的字节数**（可能小于 `len`）。
@@ -281,10 +295,8 @@ pub fn service_spawn(name: &str) -> Result<u64, SysError> {
 
 /// 查询当前进程 PID（号位 21）。
 ///
-/// **占位实现，内核尚未实现**：`microkernel/src/trap.rs` 的
-/// `decode_syscall` 未对接号位 21，调用会被当作未知系统调用
-/// 终止进程。内核 Agent 完成对接（`GetPid` → 当前 slot 的
-/// pid 查询）之前不要在生产路径调用本函数。
+/// 内核已对接（`trap.rs::decode_syscall` 号位 21 → `syscalls::GetPid`
+/// 返回当前 slot 的 pid），shell 的 `pid` 命令已端到端验证。
 pub fn getpid() -> Result<u64, SysError> {
     let ret = svc_call(21, [0, 0, 0, 0]);
     decode_result(ret)

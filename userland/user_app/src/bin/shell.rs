@@ -77,7 +77,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("bye");
             break;
         } else if cmd == b"help" || cmd == b"?" {
-            println("commands: help info echo whoami pid clear history launchd exit");
+            println("commands: help info echo whoami pid forktest clear history launchd exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
@@ -91,6 +91,37 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                 }
                 Err(e) => {
                     print("pid: syscall failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"forktest" {
+            // 端到端 fork 验证：svc #0 / x0=2。
+            // 返回值区分父子：父=Ok(child_pid)，子=Ok(0)。
+            // 子分支打印后立即 exit，绝不回到主循环——否则两个 shell
+            // 会并发抢终端（read_line 双消费者）。[P]/[C] 前缀用于在
+            // 并发输出交错时辨识来源行（console_write 无进程级串行化）。
+            match userlib::fork() {
+                Ok(0) => {
+                    print("[C] child: alive (pid via getpid)=");
+                    match userlib::getpid() {
+                        Ok(p) => print_u64(p),
+                        Err(e) => {
+                            print("syscall failed (");
+                            print_hex(e.code());
+                            print(")");
+                        }
+                    }
+                    println("");
+                    exit(0); // -> ! ：子进程到此终结，永不返回主循环
+                }
+                Ok(child_pid) => {
+                    print("[P] parent: child_pid=");
+                    print_u64(child_pid);
+                    println("");
+                }
+                Err(e) => {
+                    print("[P] forktest: fork failed (");
                     print_hex(e.code());
                     println(")");
                 }
