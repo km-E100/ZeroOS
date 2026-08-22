@@ -1,5 +1,6 @@
 # 构建产物
 /target/
+**/target/
 
 # macOS 垃圾
 .DS_Store
