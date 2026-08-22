@@ -76,6 +76,7 @@ struct ProcessRecord {
 static NEXT_PID: AtomicU64 = AtomicU64::new(2);
 static PROCESS_TABLE: Mutex<[Option<ProcessRecord>; MAX_PROCESSES]> =
     Mutex::new([const { None }; MAX_PROCESSES]);
+#[repr(C, align(16))]
 struct TrapFrameCell(UnsafeCell<TrapFrame>);
 impl TrapFrameCell {
     const fn new() -> Self {
@@ -88,6 +89,11 @@ impl TrapFrameCell {
 }
 unsafe impl Sync for TrapFrameCell {}
 
+/// ⚠ align(16) 是硬性要求：AAPCS64 规定 SP 任意时刻必须 16 字节对齐。
+/// 裸 [u8; N] 对齐数为 1，静态放置后的栈顶可能仅 8 对齐 —— 编译器在
+/// 中断/系统调用路径生成 str q0（16B SIMD 存储清零局部变量）时触发
+/// alignment fault（实机：launchd status 即崩，far=栈顶+0x70）。
+#[repr(C, align(16))]
 struct StackCell<const N: usize>(UnsafeCell<[u8; N]>);
 impl<const N: usize> StackCell<N> {
     const fn new() -> Self {
