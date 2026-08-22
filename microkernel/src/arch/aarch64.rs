@@ -38,7 +38,73 @@ __vector_table:\n\
      vector_entry __vector_sync_el0_32\n\
      vector_entry __vector_irq_el0_32\n\
      vector_entry __vector_fiq_el0_32\n\
-     vector_entry __vector_serror_el0_32\n"
+     vector_entry __vector_serror_el0_32\n\
+\n\
+     // ─── 异常入口统一存根：唯一合法的现场保存点 ─────────────────────\n\
+     // 契约（2026-08-22 重构）：\n\
+     // * 本宏生成的代码是进程寄存器状态的**唯一**写入者；任何 Rust 路径\n\
+     //   （syscall 处理 / yield / exit / dispatch）都只读写 TRAP_FRAMES，\n\
+     //   绝不重复保存（双保存曾用内核脏寄存器污染用户现场）。\n\
+     // * TPIDR_EL1 由 restore_context/enter_user_mode 在每次 eret 前指向\n\
+     //   当前进程的 TrapFrame —— 存根因此无需触碰任何锁或 Rust 代码即可\n\
+     //   定位保存目标。内核全程屏蔽 IRQ ⇒ 所有异常都来自 EL0 或内核自身\n\
+     //   bug，TPIDR_EL1 恒有效。\n\
+     // * x16 = IP0 被用作帧指针暂存，用户 x16 不保存（AAPCS64 规定 IP0/IP1\n\
+     //   为过程间临时寄存器）；userlib 全部 svc 封装已显式声明 x16/x17\n\
+     //   clobber，编译器不会在 svc 边界跨存活值。x17 先行保存到帧内。\n\
+     // * SP_EL1 在异常进入时由硬件自动切换，其当前值恒为该槽内核栈顶\n\
+     //   （每次 eret 前都从帧内 #272 重置），故直接存入 #272 并复位 SP，\n\
+     //   保证嵌套/重入时栈指针幂等归位。\n\
+     .macro SAVE_TRAP_AND_CALL kind\n\
+         mrs x16, tpidr_el1\n\
+         str x17, [x16, #136]\n\
+         stp x0, x1, [x16, #0]\n\
+         stp x2, x3, [x16, #16]\n\
+         stp x4, x5, [x16, #32]\n\
+         stp x6, x7, [x16, #48]\n\
+         stp x8, x9, [x16, #64]\n\
+         stp x10, x11, [x16, #80]\n\
+         stp x12, x13, [x16, #96]\n\
+         stp x14, x15, [x16, #112]\n\
+         stp x18, x19, [x16, #144]\n\
+         stp x20, x21, [x16, #160]\n\
+         stp x22, x23, [x16, #176]\n\
+         stp x24, x25, [x16, #192]\n\
+         stp x26, x27, [x16, #208]\n\
+         stp x28, x29, [x16, #224]\n\
+         str x30, [x16, #240]\n\
+         mrs x17, sp_el0\n\
+         str x17, [x16, #248]\n\
+         mrs x17, elr_el1\n\
+         str x17, [x16, #256]\n\
+         mrs x17, spsr_el1\n\
+         str x17, [x16, #264]\n\
+         mov x17, sp\n\
+         str x17, [x16, #272]\n\
+         mov sp, x17\n\
+         mov x0, x16\n\
+         mov x1, #\\kind\n\
+         bl __zero_trap_handler\n\
+     .endm\n\
+\n\
+     .global __vector_sync_el1t\n\
+__vector_sync_el1t:\n\
+     SAVE_TRAP_AND_CALL 0\n\
+     .global __vector_irq_el1t\n\
+__vector_irq_el1t:\n\
+     SAVE_TRAP_AND_CALL 1\n\
+     .global __vector_sync_el1h\n\
+__vector_sync_el1h:\n\
+     SAVE_TRAP_AND_CALL 0\n\
+     .global __vector_irq_el1h\n\
+__vector_irq_el1h:\n\
+     SAVE_TRAP_AND_CALL 1\n\
+     .global __vector_sync_el0_64\n\
+__vector_sync_el0_64:\n\
+     SAVE_TRAP_AND_CALL 0\n\
+     .global __vector_irq_el0_64\n\
+__vector_irq_el0_64:\n\
+     SAVE_TRAP_AND_CALL 1\n"
 );
 
 extern "C" {
@@ -79,6 +145,21 @@ pub unsafe fn context_switch(current: Option<*mut Context>, next: *mut Context) 
     if let Some(cur) = current {
         save_trap_frame(cur);
     }
+    restore_context(next)
+}
+
+/// 仅恢复目标现场并 eret（**绝不保存当前寄存器**）。
+///
+/// ⚠ 所有权契约（2026-08-22 重构，修复「双保存」实机损坏）：
+/// 陷阱帧的唯一合法写入者是 `trap_entry`——异常发生的第一瞬间把真实
+/// 寄存器存入 TRAP_FRAMES[slot]，此后内核任何代码路径（yield / exit /
+/// dispatch / 阻塞返回）都不得再次覆盖该帧。此前 context_switch 在
+/// 调度路径上重复执行 save_trap_frame，用内核脏寄存器（x30=处理链返回
+/// 地址、x0-x17 已被 Rust 代码改写、sp_el1=半栈深处）污染了被打断进程
+/// 的用户现场：进程恢复后带着内核地址的 LR 与垃圾易变寄存器继续跑，
+/// 最终以 EL0 访问内核地址的 permission fault 告终（QEMU -d int 实测）。
+#[inline(always)]
+pub unsafe fn switch_to(next: *mut Context) -> ! {
     restore_context(next)
 }
 
@@ -163,42 +244,16 @@ pub unsafe fn set_user_ttbr(root_phys: u64) {
     );
 }
 
-pub unsafe fn enter_user_mode(aspace: &AddressSpace, tf: *const Context) -> ! {
-    let ttbr0 = aspace.ttbr0_phys();
-    let spsr = SPSR_EL0T_IRQ_ON;
+pub unsafe fn enter_user_mode(_aspace: &AddressSpace, tf: *const Context) -> ! {
     // TTBR0 已由 dispatch 的 space.activate() 切好；这里不重复写。
-    crate::info!(
-        "enter_user_mode: TTBR0=0x{:016x} ELR=0x{:x} SP_EL0=0x{:x} SPSR=0x{:x}",
-        ttbr0,
+    // 首启进程同样走全量恢复：x4-x29 必须来自帧内清零值而不是内核残留，
+    // 否则首启现场依赖内核寄存器垃圾（不可复现的 heisenbug 源）。
+    crate::debug!(
+        "enter_user_mode: ELR=0x{:x} SP_EL0=0x{:x}",
         (*tf).elr_el1,
-        (*tf).sp_el0,
-        spsr
+        (*tf).sp_el0
     );
-    // ⚠ 栈切换必须在**同一个** asm 块里完成：给编译器看到"mov sp"却声明
-    // options(nostack) 会让 LLVM 误以为 sp 未变，后续所有 [sp+N] 局部
-    // 引用全部错位（实测 &space 指向垃圾 → root_phys=0 → TTBR0:=0 → 死机）。
-    asm!(
-        // 切换内核栈（trap frame 里预存的 sp_el1 = kernel_stack_top）。
-        // 此后不再触碰旧帧，全部经寄存器操作。
-        "ldr x16, [{tf}, #272]",
-        "mov sp, x16",
-        // Restore argument registers x0-x3.
-        "ldp x0, x1, [{tf}, #0]",
-        "ldp x2, x3, [{tf}, #16]",
-        // Restore LR from trap frame (regs[30]).
-        "ldr x30, [{tf}, #240]",
-        // Populate SP_EL0 (user stack pointer) and ELR_EL1 (resume PC).
-        "ldr x16, [{tf}, #248]",
-        "msr sp_el0, x16",
-        "ldr x16, [{tf}, #256]",
-        "msr elr_el1, x16",
-        // Program SPSR_EL1 for an ERet into EL0t with IRQ/FIQ/SError enabled.
-        "msr spsr_el1, {spsr}",
-        "eret",
-        spsr = in(reg) spsr,
-        tf = in(reg) tf,
-        options(noreturn)
-    );
+    restore_context(tf as *mut Context)
 }
 
 unsafe fn save_trap_frame(frame: *mut Context) {
@@ -235,7 +290,10 @@ unsafe fn save_trap_frame(frame: *mut Context) {
 
 pub unsafe fn restore_context(frame: *mut Context) -> ! {
     asm!(
-        "ldr x16, [x20, #272]
+        // TPIDR_EL1 := 帧指针 —— 异常入口存根靠它零成本定位保存目标。
+        // 必须在任何 eret 前生效；x21 此刻仍持有 frame。
+        "msr tpidr_el1, x21
+         ldr x16, [x20, #272]
          mov sp, x16
          ldr x16, [x20, #248]
          msr sp_el0, x16
@@ -335,15 +393,9 @@ fn default_exception(class: ExceptionClass) -> ! {
     }
 }
 
-#[no_mangle]
-extern "C" fn __vector_sync_el1t() -> ! {
-    default_exception(ExceptionClass::SyncEl1Sp0)
-}
-
-#[no_mangle]
-extern "C" fn __vector_irq_el1t() -> ! {
-    unsafe { trap_entry(1) }
-}
+// __vector_{sync,irq}_{el1t,el1h,el0_64} 现由汇编 SAVE_TRAP_AND_CALL 存根
+// 直接实现（见文件头部 global_asm!）——现场保存必须发生在任何 Rust 代码
+// 执行之前，Rust 函数序言会踩脏用户寄存器。
 
 #[no_mangle]
 extern "C" fn __vector_fiq_el1t() -> ! {
@@ -356,16 +408,6 @@ extern "C" fn __vector_serror_el1t() -> ! {
 }
 
 #[no_mangle]
-extern "C" fn __vector_sync_el1h() -> ! {
-    default_exception(ExceptionClass::SyncEl1Sp1)
-}
-
-#[no_mangle]
-extern "C" fn __vector_irq_el1h() -> ! {
-    unsafe { trap_entry(1) }
-}
-
-#[no_mangle]
 extern "C" fn __vector_fiq_el1h() -> ! {
     default_exception(ExceptionClass::FiqEl1Sp1)
 }
@@ -373,16 +415,6 @@ extern "C" fn __vector_fiq_el1h() -> ! {
 #[no_mangle]
 extern "C" fn __vector_serror_el1h() -> ! {
     default_exception(ExceptionClass::SErrorEl1Sp1)
-}
-
-#[no_mangle]
-extern "C" fn __vector_sync_el0_64() -> ! {
-    unsafe { trap_entry(0) }
-}
-
-#[no_mangle]
-extern "C" fn __vector_irq_el0_64() -> ! {
-    unsafe { trap_entry(1) }
 }
 
 #[no_mangle]
@@ -413,13 +445,6 @@ extern "C" fn __vector_fiq_el0_32() -> ! {
 #[no_mangle]
 extern "C" fn __vector_serror_el0_32() -> ! {
     default_exception(ExceptionClass::SErrorEl0A32)
-}
-
-unsafe fn trap_entry(kind: u64) -> ! {
-    let slot = crate::scheduler::current_slot();
-    let frame_ptr = crate::process::context_ptr(slot);
-    save_trap_frame(frame_ptr);
-    __zero_trap_handler(frame_ptr, kind)
 }
 
 fn current_process_info() -> (Option<usize>, Option<u64>) {

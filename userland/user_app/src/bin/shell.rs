@@ -165,12 +165,16 @@ fn read_line(buf: &mut [u8]) -> usize {
         let mut c: [u8; 1] = [0];
         match console_read(&mut c) {
             Ok(0) => {
-                // 无输入兜底：让出 CPU 避免空转
                 userlib::yield_now();
+                continue;
             }
             Err(SysError::WouldBlock) => {
-                // yield_now 永不返回，切走后在调度器恢复时从循环头继续
+                // ⚠ 必须 continue：yield 会返回到 match 之后的语句，若不加
+                // continue 就会贯穿到 ch=c[0]，把缓冲区残留的 0 当成收到的
+                // 字节 —— 缓冲区被 NUL 填满、真实命令永远匹配不上。
+                // （旧代码靠 yield_now 的错误 -> ! 标注掩盖了这一逻辑。）
                 userlib::yield_now();
+                continue;
             }
             Err(_) => return i,
             Ok(_) => {}

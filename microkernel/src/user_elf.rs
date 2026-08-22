@@ -26,16 +26,12 @@ pub fn build_user_elf(path: &str) -> Result<UserElf, ElfError> {
     let ehdr = parse_elf_header(elf_bytes)?;
 
     let mut segments: Vec<UserElfSegment, 8> = Vec::new();
-    let mut entry_vaddr: Option<u64> = None;
     for index in 0..ehdr.phnum {
         let ph = parse_program_header(elf_bytes, &ehdr, index as usize)?;
         if ph.p_type != PT_LOAD {
             continue;
         }
         validate_segment_bounds(&ph, elf_bytes.len())?;
-        if entry_vaddr.is_none() && (ph.p_flags & PF_X) != 0 {
-            entry_vaddr = Some(ph.p_vaddr);
-        }
         segments
             .push(UserElfSegment {
                 vaddr: ph.p_vaddr,
@@ -47,7 +43,20 @@ pub fn build_user_elf(path: &str) -> Result<UserElf, ElfError> {
             .map_err(|_| ElfError::TooManySegments)?;
     }
 
-    let entry = entry_vaddr.unwrap_or(ehdr.entry);
+    // ⚠ 入口点必须取 ELF 头的 e_entry 字段本身。
+    // 历史缺陷：曾用「第一个可执行 LOAD 段的 p_vaddr」充当入口——那是段基址，
+    // 不是入口！所有用户进程因此从 .text 中某个随机函数的中间开始执行，
+    // 且携带 x30=thread_exit 的陷阱帧寄存器，行为完全不可预测。
+    // 这里额外校验 e_entry 必须落在某个可执行 LOAD 段内，防畸形 ELF。
+    let entry = ehdr.entry;
+    let entry_ok = segments.iter().any(|seg| {
+        (seg.flags & PF_X) != 0
+            && entry >= seg.vaddr
+            && entry < seg.vaddr.saturating_add(seg.memsz)
+    });
+    if !entry_ok {
+        return Err(ElfError::InvalidHeader);
+    }
     Ok(UserElf { entry, segments })
 }
 

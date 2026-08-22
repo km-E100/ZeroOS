@@ -21,36 +21,56 @@ use zero_abi::syscall::SysError;
 #[inline(always)]
 #[allow(dead_code)]
 fn svc_call(number: u16, args: [u64; 4]) -> u64 {
-    let mut ret: u64;
+    let ret: u64;
     unsafe {
         core::arch::asm!(
-            "mov x0, {num}\n\
-             mov x1, {a0}\n\
-             mov x2, {a1}\n\
-             mov x3, {a2}\n\
-             mov x4, {a3}\n\
-             svc #0\n\
-             mov {ret}, x0",
-            num = in(reg) number as u64,
-            a0 = in(reg) args[0],
-            a1 = in(reg) args[1],
-            a2 = in(reg) args[2],
-            a3 = in(reg) args[3],
-            ret = out(reg) ret,
+            "svc #0",
+            in("x0") number as u64,
+            in("x1") args[0],
+            in("x2") args[1],
+            in("x3") args[2],
+            in("x4") args[3],
+            lateout("x0") ret,
+            // 内核异常入口存根牺牲用户 x16（IP0）作帧指针暂存、并改写
+            // x17；AAPCS64 允许，但必须显式告知 LLVM：禁止在 svc 边界
+            // 跨这两个寄存器存活任何值。
+            out("x16") _,
+            out("x17") _,
             options(nostack)
         );
     }
     ret
 }
 
+/* ⚠ 历史教训（2026-08-22 实机定位，保留给所有后来者）：
+ *
+ * 旧实现用 `mov x0,{num}; mov x1,{a0}; ...; svc` + in(reg) 让 LLVM 自由
+ * 选择输入寄存器。当 LLVM 把 {a0} 分配到 x0 时，第一条 `mov x0,{num}`
+ * 会先毁掉 a0 的存放处，后续 `mov x1,{a0}` 读到垃圾 —— 系统调用号正确、
+ * 参数随机。加入 x16/x17 clobber 后寄存器分配恰好踩中此雷：ConsoleRead
+ * 的缓冲区指针变成野值，内核把字节写进未知地址，shell 永远读到 0。
+ *
+ * 修正：固定寄存器约束（in("x0") 等），LLVM 在 asm 前把操作数放进指定
+ * 寄存器、无分配彩票 —— 与 Linux \__syscall_inline 同一做法。
+ */
+
 /// 让出 CPU（等价内核号位 4 `Yield`，经历史快捷入口 `svc #1`）。
 ///
-/// 永不返回：调度器切走后会在合适的时机把控制权交回。
-/// 无输入可读（`ConsoleRead` 返回 `WouldBlock`）时应当调用本函数
-/// 等待，而不是自旋空转。
-pub fn yield_now() -> ! {
+/// **正常返回**：调度器切走后会在合适时机把控制权交回到本函数的
+/// 调用点之后（svc 的返回地址）。无输入可读（`ConsoleRead` 返回
+/// `WouldBlock`）时应当调用本函数等待，而不是自旋空转。
+///
+/// ⚠ 历史教训：本函数曾被误标为 `-> !`，LLVM 遂在 `svc #1` 后放置
+/// unreachable 陷阱（brk #1）；而 yield 实际必然返回，控制流一回来就
+/// 踩中陷阱 —— 实机表现为 shell 打印提示符后立即 panic。
+pub fn yield_now() {
     unsafe {
-        core::arch::asm!("svc #1", options(noreturn));
+        core::arch::asm!(
+            "svc #1",
+            out("x16") _,
+            out("x17") _,
+            options(nostack)
+        );
     }
 }
 
@@ -59,9 +79,10 @@ pub fn yield_now() -> ! {
 /// `code` 为退出状态码；进程进入 Dying 状态后由调度器回收。
 pub fn exit(code: i32) -> ! {
     unsafe {
+        // noreturn asm 不能声明输出；x16/x17 在此路径无所谓（进程即将消亡）。
         core::arch::asm!(
-            "mov x0, {code}\n svc #2",
-            code = in(reg) code as u64,
+            "svc #2",
+            in("x0") code as u64,
             options(noreturn)
         );
     }

@@ -11,6 +11,16 @@
  */
 ENTRY(_start)
 
+/* 显式 PHDRS：不声明时 lld 会按"实际有内容的节"推断段标志，
+ * .data 为空而只有 .bss 时整段被标成只读 R —— 用户态清 .bss 第一笔
+ * 写入即触发 permission fault（2026-08-22 实机复现）。
+ * text=R+X(5)，data=R+W(6)；两段都必须存在，即使某一侧为空。 */
+PHDRS
+{
+    text PT_LOAD FLAGS(5);
+    data PT_LOAD FLAGS(6);
+}
+
 SECTIONS
 {
     . = 0x200000;
@@ -18,22 +28,22 @@ SECTIONS
     .text : ALIGN(4K) {
         KEEP(*(.text.boot))
         *(.text*)
-    }
+    } :text
 
     .rodata : ALIGN(4K) {
         *(.rodata*)
-    }
+    } :text
 
     .data : ALIGN(4K) {
         *(.data*)
-    }
+    } :data
 
     .bss (NOLOAD) : ALIGN(4K) {
         __bss_start = .;
         *(.bss*)
         *(COMMON)
         __bss_end = .;
-    }
+    } :data
 
     /DISCARD/ : {
         *(.comment*)

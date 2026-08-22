@@ -1,4 +1,5 @@
 use alloc::string::String;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{arch::asm, fmt::Write};
 use zero_abi::{
     syscall::{SysError, Syscall},
@@ -12,6 +13,9 @@ pub enum TrapKind {
     Sync = 0,
     Irq = 1,
 }
+
+/// ENOSYS 限流计数器（见 handle_svc 的采样逻辑）。
+static ENOSYS_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum FaultKind {
@@ -36,6 +40,9 @@ enum SyncExceptionKind {
     Svc,
     DataAbort(FaultInfo),
     InstructionAbort(FaultInfo),
+    /// BRK 指令（EC=0x3C）：用户态即 Rust panic / 显式陷阱，
+    /// 语义对标 Linux SIGTRAP —— 终止进程，绝不 HALT 整机。
+    Brk,
     Other,
 }
 
@@ -75,6 +82,19 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
     let decoded = decode_esr(esr);
     match decoded.kind {
         SyncExceptionKind::Svc => handle_svc(frame, esr),
+        SyncExceptionKind::Brk => {
+            let ctx = capture_trap_context();
+            if decoded.from_el0 || ctx.slot.is_some() {
+                crate::info!(
+                    "[trap] EL0 breakpoint (panic/udf): elr=0x{:016x} pid={:?}",
+                    ctx.elr,
+                    ctx.pid.map(|p| p.raw())
+                );
+                terminate_faulting_process(&ctx)
+            } else {
+                kernel_sync_fault("BRK issued from kernel", esr, frame)
+            }
+        }
         SyncExceptionKind::DataAbort(_) | SyncExceptionKind::InstructionAbort(_) => {
             let ctx = capture_trap_context();
             let message = format_sync_exception(&decoded, &ctx);
@@ -89,6 +109,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                     unsafe { (*frame).regs[0] },
                     unsafe { (*frame).regs[1] },
                 );
+                dump_user_pte(ctx.far);
                 terminate_faulting_process(&ctx)
             } else {
                 // EL1 内核态同步异常：完整上下文 + 重启，绝不裸死循环。
@@ -161,12 +182,43 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
                         regs[0] = encode_result(result);
                         crate::arch::restore_frame(frame)
                     }
-                    None => kernel_sync_fault("invalid syscall number", esr, frame),
+                    // ⚠ 用户态发了未知/非法编号：这是用户程序 bug，不是内核
+                    // bug。POSIX 语义 = 返回 ENOSYS 让调用方自行处理；
+                    // 此前直接 kernel_sync_fault 把整台机器 HALT 掉——一个
+                    // 用户态错误就击沉内核（Linux/XNU 均不会如此）。
+                    None => {
+                        let number = (*frame).regs[0];
+                        // 限流：用户态死循环打未知 syscall 时按 2 的幂采样，
+                        // 既保留首现证据又不淹没串口（实测曾 25 秒刷 89 万行）。
+                        let n = ENOSYS_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n == 0 || n.is_power_of_two() {
+                            crate::warn!(
+                                "syscall ENOSYS #{}: number={} elr=0x{:016x} pid={}",
+                                n,
+                                number,
+                                read_elr_el1(),
+                                crate::process::pid_at_slot(crate::scheduler::current_slot())
+                                    .map(|p| p.raw())
+                                    .unwrap_or(0),
+                            );
+                        }
+                        (*frame).regs[0] = encode_result(Err(SysError::NotFound));
+                        crate::arch::restore_frame(frame)
+                    }
                 }
             }
             1 => crate::scheduler::yield_current(),
             2 => crate::scheduler::exit_current(),
-            _ => kernel_sync_fault("unknown svc immediate", esr, frame),
+            _ => {
+                // 未知 svc 立即数同理：ENOSYS 返回，不 HALT。
+                crate::warn!(
+                    "unknown svc immediate {} at elr=0x{:016x}",
+                    imm,
+                    read_elr_el1()
+                );
+                (*frame).regs[0] = encode_result(Err(SysError::NotFound));
+                crate::arch::restore_frame(frame)
+            }
         }
     }
 }
@@ -311,7 +363,47 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
         "[KERNEL FAULT] {reason}: ESR=0x{esr:016x} FAR=0x{far:016x} ELR=0x{elr:016x} \
          SPSR=0x{spsr:016x} SP_EL1=0x{sp:016x} slot={slot} pid={pid} frame={frame:p}"
     );
+    dump_frame_registers(frame);
     reset_or_halt()
+}
+
+/// 全量寄存器现场转储（4 个/行，x0–x30 + sp_el0/elr/spsr/sp_el1）。
+/// 对标 XNU panic report / Linux oops 的寄存器段；内核故障诊断的最低配置。
+fn dump_frame_registers(frame: *mut TrapFrame) {
+    if frame.is_null() {
+        return;
+    }
+    unsafe {
+        let f = &*frame;
+        for row in 0..8 {
+            let base = row * 4;
+            let mut line = String::new();
+            for col in 0..4 {
+                let idx = base + col;
+                if idx < 30 {
+                    let _ = write!(line, "x{idx}=0x{:016x} ", f.regs[idx]);
+                }
+            }
+            match row {
+                7 => {
+                    let _ = write!(
+                        line,
+                        "x30=0x{:016x}",
+                        f.regs[30]
+                    );
+                }
+                _ => {}
+            }
+            crate::error!("  {}", line);
+        }
+        crate::error!(
+            "  sp_el0=0x{:016x} elr=0x{:016x} spsr=0x{:016x} sp_el1=0x{:016x}",
+            f.sp_el0,
+            f.elr_el1,
+            f.spsr_el1,
+            f.sp_el1
+        );
+    }
 }
 
 /// 复位或停机。
@@ -324,12 +416,24 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
 ///
 /// 真实硬件路径（协调点，arch Agent）：硬件 WDT（如 dw_wdt / SP805）
 /// 触发复位；arch Agent 落地 `arch::reset()` 后应改调它。
+/// 故障路径重入保护：复位调用本身再次异常时（如 PSCI conduit 缺失），
+/// 直接静默停机，绝不递归打印（实测 smc 弹回曾造成 HALT 日志无限刷屏）。
+static IN_FAULT_PATH: AtomicBool = AtomicBool::new(false);
+
 fn reset_or_halt() -> ! {
+    if IN_FAULT_PATH.swap(true, Ordering::SeqCst) {
+        // 已在故障路径中：复位调用又触发了异常。立即停机，不再打印。
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     crate::error!("SYSTEM HALT: 内核故障，尝试复位后停机");
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let fid: u64 = 0x8400_0008; // PSCI SYSTEM_RESET
-        asm!("smc #0", in("x0") fid, options(nostack));
+        // QEMU virt (TCG) 的 PSCI conduit 是 HVC；SMC 会作为未定义异常
+        // 弹回 EL1 自家向量表（实测），故必须用 hvc。
+        asm!("hvc #0", in("x0") fid, options(nostack));
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -364,13 +468,45 @@ fn read_far_el1() -> u64 {
     value
 }
 
+/// 对用户态故障地址做软件走表，打印叶子描述符原始位。
+/// 权限类 bug（AP 编码错、UXN 误置、AF 缺失）一眼可判，不必再猜。
+fn dump_user_pte(far: u64) {
+    let slot = crate::scheduler::current_slot_opt();
+    let Some(space) = slot.and_then(crate::process::address_space) else {
+        return;
+    };
+    match space.walk(far as usize) {
+        crate::mm::table_walk::WalkOutcome::Page { desc, phys } => crate::info!(
+            "[trap] PTE far=0x{:016x} desc=0x{:016x} phys=0x{:x} ap={} uxn={} af={} attridx={}",
+            far,
+            desc,
+            phys,
+            (desc >> 6) & 0b11,
+            (desc >> 54) & 1,
+            (desc >> 10) & 1,
+            (desc >> 2) & 0b111,
+        ),
+        crate::mm::table_walk::WalkOutcome::Block { desc, block_base } => crate::info!(
+            "[trap] BLOCK far=0x{:016x} desc=0x{:016x} base=0x{:x} ap={}",
+            far,
+            desc,
+            block_base,
+            (desc >> 6) & 0b11,
+        ),
+        crate::mm::table_walk::WalkOutcome::Unmapped => {
+            crate::info!("[trap] PTE far=0x{:016x}: unmapped", far)
+        }
+    }
+}
+
 fn capture_trap_context() -> TrapContext {
-    let slot = crate::scheduler::current_slot();
-    let pid = process::pid_at_slot(slot);
+    // 非 panic 版本：异常可能在任何时刻到来（包括尚无当前进程的窗口）。
+    let slot = crate::scheduler::current_slot_opt();
+    let pid = slot.and_then(|slot| process::pid_at_slot(slot));
     TrapContext {
         elr: read_elr_el1(),
         far: read_far_el1(),
-        slot: Some(slot),
+        slot,
         pid,
     }
 }
@@ -402,6 +538,7 @@ fn decode_esr(esr: u64) -> DecodedEsr {
         0x15 => SyncExceptionKind::Svc,
         0x24 | 0x25 => SyncExceptionKind::DataAbort(decode_fault_info(iss)),
         0x20 | 0x21 => SyncExceptionKind::InstructionAbort(decode_fault_info(iss)),
+        0x3c => SyncExceptionKind::Brk,
         _ => SyncExceptionKind::Other,
     };
     DecodedEsr {
@@ -455,6 +592,13 @@ fn format_sync_exception(decoded: &DecodedEsr, ctx: &TrapContext) -> String {
                 msg,
                 "[trap] SVC from {}: iss=0x{:08x} elr=0x{:016x}",
                 origin, decoded.iss, ctx.elr
+            );
+        }
+        SyncExceptionKind::Brk => {
+            let _ = write!(
+                msg,
+                "[trap] BRK (panic/udf) from {}: elr=0x{:016x}",
+                origin, ctx.elr
             );
         }
         SyncExceptionKind::Other => {

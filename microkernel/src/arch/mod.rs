@@ -12,15 +12,15 @@ pub fn init(boot_info: &BootInfo) {
     }
 }
 
-pub unsafe fn context_switch(current: Option<*mut Context>, next: *mut Context) -> ! {
+pub unsafe fn switch_to(next: *mut Context) -> ! {
     #[cfg(target_arch = "aarch64")]
     {
-        aarch64::context_switch(current, next)
+        aarch64::switch_to(next)
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (current, next);
+        let _ = next;
         loop {}
     }
 }

@@ -1,5 +1,9 @@
 #![no_std]
 
+// 主机测试（cargo test）需要 std 链接；裸机构建完全不含。
+#[cfg(test)]
+extern crate std;
+
 extern crate alloc;
 
 pub mod arch;

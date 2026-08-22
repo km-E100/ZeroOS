@@ -134,6 +134,9 @@ if exist fs3:\\EFI\\BOOT\\BOOTAA64.EFI then\r\n  fs3:\\EFI\\BOOT\\BOOTAA64.EFI\r
 fn build_components(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo build -p zero-microkernel").run()?;
     cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
+    // ⚠ user-app（zero-shell）也必须在此构建：否则 sync_userland_blobs 会把
+    // 上次手动构建的陈旧 blob 打进镜像 —— 源码改动“神秘失效”皆源于此。
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
 
     // 在 build-rootfs 打包之前，把刚构建的用户态裸机 ELF 同步进 kernel/rootfs

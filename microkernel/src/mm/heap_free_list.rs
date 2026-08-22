@@ -80,7 +80,7 @@ impl FreeListHeap {
             _iters += 1;
             #[cfg(test)]
             if _iters > 1 << 20 {
-                eprintln!(
+                std::eprintln!(
                     "LOOP! layout={:?} head={:#x} prev={:#x} cur={:#x}",
                     layout, self.head, prev, cur
                 );

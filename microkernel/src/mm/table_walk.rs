@@ -21,9 +21,16 @@ pub const DESC_PXN: u64 = 1 << 53;
 pub const AP_SHIFT: u64 = 6;
 /// AP[2:1]=0b00：EL1 读写、EL0 无权限（内核恒等映射/内核页）。
 pub const AP_EL1_RW_EL0_NONE: u64 = 0b00;
-/// EL0 只读 + 可执行（EL1 恒可读写）。
-pub const USER_AP_RX: u64 = 0b10;
-/// EL0 读写。
+/// AP[2:1] stage-1 编码（ARM ARM DDI 0487）：
+///   0b00 = EL1 RW / EL0 none    0b01 = EL1 RW / EL0 RW
+///   0b10 = EL1 RO / EL0 none    0b11 = EL1 RO / EL0 RO
+/// ⚠ 历史教训：USER_AP_RX 曾误用 0b10（"EL1 只读"想当然），实际语义是
+/// **EL0 完全无访问** —— 用户代码/rodata 页全部对 EL0 关闭数据访问，
+/// 内核代读（copy_from_user 跑在 EL1）掩盖了问题，直到 shell 第一次在
+/// EL0 自行读取 rodata 比较命令才触发 permission fault（2026-08-22）。
+/// 正确编码：用户只读段 = 0b11（EL0+EL1 均只读）。
+pub const USER_AP_RX: u64 = 0b11;
+/// EL0 读写（EL1 亦读写）。
 pub const USER_AP_RW: u64 = 0b01;
 
 /// 与内核共享的 L1 槽位：覆盖 [1GiB,2GiB)，指向内核 L2_1 表本体。

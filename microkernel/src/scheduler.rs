@@ -93,9 +93,11 @@ fn dispatch(pid: ProcessId) -> ! {
     }
 
     let next_ctx = unsafe { process::context_ptr(next_slot) };
-    let current_ctx = current_slot.map(|slot| unsafe { process::context_ptr(slot) });
 
-    unsafe { crate::arch::context_switch(current_ctx, next_ctx) }
+    // ⚠ 单一保存者契约：被打断进程的现场已由 trap_entry 在异常入口保存，
+    // 这里只恢复下一进程，绝不再 save 当前寄存器（双保存曾用内核脏
+    // 寄存器污染用户现场——见 arch::switch_to 文档）。
+    unsafe { crate::arch::switch_to(next_ctx) }
 }
 
 fn idle() -> ! {

@@ -3,46 +3,35 @@
 > 本文件用于"一刀一会话"工作流：新会话先读本文件 + `git log --oneline` 即可接上进度。
 > 更新时机：每刀结束 / 会话中断时。
 
-## 当前里程碑（2026-08-17）
-- **系统已能从 ISO 完整启动到调度器**：rootfs(6 条) / 驱动表(3 个) / launchd 进程 spawn 成功 / `scheduler::run` 主循环启动
-- 修复前：死在 mm::init（恒等映射 PXN + 无 TLB 维护）
-- 全部修复经 QEMU 实机串口验证（target/boot-serial*.log 留存）
+## 当前里程碑（2026-08-22 · 用户态全面打通）
+- **交互式用户 Shell 实机可用**：help / echo / info / whoami 全部工作；launchd 在线
+- 本轮修复（全部经 QEMU 实机验证）：
+  1. **异常入口现场保存缺失**（致命）：WIP 重构删掉了保存动作——trap_entry 的 Rust
+     前奏会踩脏寄存器。现由汇编 SAVE_TRAP_AND_CALL 存根在异常第一瞬间全量保存到
+     TRAP_FRAMES[slot]（TPIDR_EL1 指帧，eret 前由 restore_context/enter_user_mode 设置）
+  2. yield_now 错标 `-> !`：LLVM 在 svc 后放 unreachable brk，yield 返回即踩中 → 改为正常返回
+  3. read_line match 贯穿：WouldBlock 臂缺 continue，缓冲区被 NUL 填满、命令永远匹配不上
+  4. USER_AP_RX=0b10 是 "EL0 无访问"：改 0b11（EL0+EL1 只读）
+  5. 链接脚本无 PHDRS：纯 .bss 段被标只读 → 显式 PHDRS + 内核对 memsz>filesz 段强制可写
+  6. svc 封装改固定寄存器约束（in("x0") 等），杜绝输入寄存器分配彩票
+  7. EL0 BRK(Rust panic) 终止进程而非 HALT 整机；SMC→HVC（PSCI）；故障路径重入保护
+  8. ENOSYS 日志限流（曾 25 秒刷 89 万行）；build-iso 补建 user-app（陈旧 blob 根因）
 
 ## 已知待办（下一刀候选）
-1. **用户态架构死结**（已实测坐实）：dispatch 切 TTBR0=用户表后开 IRQ，
-   异常向量(低地址 0x400d4000)在用户表未映射 → 静默死循环。
-   修复方向（已分析）：
-   - 方案 1（推荐，半天~1天）：用户表共享内核映射——
-     create_user_address_space 里把内核 L1[0]/[1] 的 block 挂进用户表；
-     用户区 0x200000 附近需把 2MiB block 拆成 4K 页表；
-     隔离靠 AP=00（EL1-only）
-   - 方案 2（工程量大，暂缓）：内核迁高半区 TTBR1——需低地址
-     trampoline、物理窗口映射（刚改的 7 处恒等直写全部回炉）、
-     linker AT()、MMIO 高区窗口、5 处页表物理地址计算
-2. zero-launchd 是 stub（loop{}），console shell 1204 行已编译进内核
-3. phys::init 的 memory_bytes=512MiB 是占位（QEMU 实际 1GiB）；
-   bootloader 拿到 memory map 但 KernelBootContext 丢弃了（下划线参数）
-4. virtio-blk/net 未挂盘（QEMU 命令无 -drive），探测优雅失败
+1. `launchd status` → EL1 alignment fault @0x400ac3fc（far=0x40bd0318 堆区）——IPC 消息拷贝非对齐访问
+2. fork 的 clone_space 仍是占位失败；COW 缺失
+3. phys 分配器未消费 bootloader memory map（保留区粒度粗）
+4. virtio-blk 未挂盘；idle 无 WFI
+5. 主机测试仅覆盖纯逻辑层；mm-host-tests 不在 workspace members
 
 ## 构建与实机验证命令
 ```
 cargo run -p xtask -- build-iso          # 全链构建（含 bootloader/kernel/rootfs/ISO）
 qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 \
   -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
-  -serial file:target/boot-serial.log -display none -cdrom target/zero-os.iso
-# 等 ~15 秒后 Ctrl-C，看 target/boot-serial.log
+  -serial mon:stdio -display none -cdrom target/zero-os.iso
+# 等 ~12 秒出现 zero> 提示符即可交互
 ```
-
-## 修复史（9 提交，f093027 存档起）
-1. 6419545  恒等映射去 PXN + TTBR 切换补 tlbi
-2. 3fd463b  TTBR 改指 L0 根表（T0SZ=20 → 起始级 L0，此前错指 L1）
-3. 7ebc933  启用被注释的 rootfs/驱动表（强符号覆盖弱符号）+ read_file 实现 + ABI 空表防御
-4. d795fa9  ELF 程序头解析改逐字段字节拷贝（include_bytes 数据 1 字节对齐的 UB）
-5. 6be6f71  map_temp_page 写穿修复（block 描述符误当表）
-6. cee6a06  map_temp_page 页表级索引错位（l2_idx 误当 L1 索引）
-7. d3a14af  废除 map_temp_page，物理页恒等直写（7 处）
-8. d075827  物理分配器 RAM 基址修正（QEMU virt RAM 在 0x40000000 起）+ 保留区改 __bss_end-RAM_BASE
-9. 6561a87  恢复 spawn_user 实现（引导路径第三颗雷）
 
 ## 省钱工作流（重要）
 - 一刀一会话；每刀结束更新本文件

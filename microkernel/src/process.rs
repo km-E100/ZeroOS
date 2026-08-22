@@ -117,6 +117,7 @@ pub enum ProcessError {
 }
 
 pub fn init() {
+    init_kernel_stack_tops();
     let mut table = PROCESS_TABLE.lock();
     for slot in table.iter_mut() {
         *slot = None;
@@ -196,10 +197,19 @@ pub fn spawn_user_from_bootfs(
         let bootfs_info =
             rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE)
                 .map_err(ProcessError::MapError)?;
+        let root_phys = space.ttbr0_phys();
         configure_user_process(slot, space, elf.entry as usize, USER_STACK_TOP);
         set_initial_user_args(
             slot,
             [bootfs_info.entries_ptr, bootfs_info.entries_len, 0, 0],
+        );
+        crate::debug!(
+            "[aspace] pid={} slot={} path={} root_phys={:#x} entry={:#x}",
+            pid.raw(),
+            slot,
+            path,
+            root_phys,
+            elf.entry as usize
         );
         let tf = TRAP_FRAMES[slot].get();
         (*tf).elr_el1 = elf.entry;
@@ -286,6 +296,34 @@ pub unsafe fn context_ptr(slot: usize) -> *mut Context {
 
 pub unsafe fn kernel_stack_top(slot: usize) -> usize {
     kernel_stack_top_raw(slot)
+}
+
+/// 内核栈顶的**存储位置**（trap_entry 用它一条指令装载 SP）。
+/// 每槽一个 usize 单元，process::init 时写入一次，之后 trap_entry 只读。
+/// 单核 + 初始化后只读 ⇒ 裸 UnsafeCell 的安全性由使用纪律保证
+/// （与 TRAP_FRAMES/KERNEL_STACKS 同一信任级别）。
+pub struct StackTopCell(UnsafeCell<usize>);
+impl StackTopCell {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(0))
+    }
+}
+unsafe impl Sync for StackTopCell {}
+
+static KERNEL_STACK_TOPS: [StackTopCell; MAX_PROCESSES] =
+    [const { StackTopCell::new() }; MAX_PROCESSES];
+
+pub unsafe fn kernel_stack_top_ptr(slot: usize) -> *mut usize {
+    KERNEL_STACK_TOPS[slot].0.get()
+}
+
+/// 在 process::init 里为每槽预计算并缓存栈顶地址。
+fn init_kernel_stack_tops() {
+    for slot in 0..MAX_PROCESSES {
+        unsafe {
+            *KERNEL_STACK_TOPS[slot].0.get() = kernel_stack_top_raw(slot);
+        }
+    }
 }
 
 pub unsafe fn user_stack_top(slot: usize) -> usize {
@@ -452,8 +490,15 @@ fn map_user_elf_segments(
         let seg_end = seg_start + seg.memsz as usize;
         let page_start = seg_start & !(PAGE_SIZE - 1);
         let page_end = align_up(seg_end, PAGE_SIZE);
-        let writable = (seg.flags & PF_W) != 0;
+        let mut writable = (seg.flags & PF_W) != 0;
         let executable = (seg.flags & PF_X) != 0;
+        // 纵深防御：memsz > filesz ⇒ 段内含 .bss（NOLOAD 尾部），运行期
+        // 必然要写。即便链接脚本漏标 PF_W（lld 在无 PHDRS 声明时会把
+        // 纯 .bss 段标成只读，实机已踩），这里也强制补上写权限——
+        // 宁可多给一页 W，也不能让用户进程在清零自己的 bss 时崩死。
+        if seg.memsz > seg.filesz {
+            writable = true;
+        }
         let data_len = seg.filesz as usize;
 
         for page_va in (page_start..page_end).step_by(PAGE_SIZE) {

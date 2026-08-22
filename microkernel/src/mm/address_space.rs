@@ -45,6 +45,11 @@ impl AddressSpace {
     pub fn ttbr0_phys(&self) -> u64 {
         self.inner.root_phys()
     }
+
+    /// 软件走表诊断：解析 VA 在本地址空间中的叶子描述符（trap 路径用）。
+    pub fn walk(&self, va: usize) -> super::table_walk::WalkOutcome {
+        paging::walk_space(&self.inner, va)
+    }
 }
 
 /// 栈底 guard 页设计说明：
