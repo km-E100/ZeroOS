@@ -102,6 +102,13 @@ pub fn image() -> Option<&'static RootFsImage> {
     if ptr.is_null() {
         None
     } else {
+        if (ptr as usize) % core::mem::align_of::<RootFsImage>() != 0 {
+            crate::error!(
+                "rootfs::image: MISALIGNED ptr=0x{:016x} static@0x{:016x}",
+                ptr as usize,
+                &ROOTFS_PTR as *const _ as usize
+            );
+        }
         Some(unsafe { &*ptr })
     }
 }

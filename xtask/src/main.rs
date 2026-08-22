@@ -35,11 +35,17 @@ enum Commands {
         #[arg(long)]
         expect_shell: bool,
     },
+    /// 清除全部可再生构建产物（target/、镜像、临时盘），目录回到源码+依赖基线
+    Purge,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let sh = Shell::new()?;
+    // 体积硬闸：Purge 自身豁免（否则锁死后无法自救）。
+    if !matches!(cli.command, Commands::Purge) {
+        enforce_size_limit(&sh)?;
+    }
     match cli.command {
         Commands::BuildKernel => build_kernel(&sh)?,
         Commands::BuildKernelBare => build_kernel_bare(&sh)?,
@@ -53,7 +59,51 @@ fn main() -> Result<()> {
         }
         Commands::Run { mode } => run(&sh, &mode)?,
         Commands::TestBoot { expect_shell } => test_boot(&sh, expect_shell)?,
+        Commands::Purge => purge(&sh)?,
     }
+    Ok(())
+}
+
+/// 项目目录体积上限（MB）。超过后一切构建命令前置拒绝——
+/// 磁盘写满会产生截断的 ISO 与静默损坏的产物（实机踩坑两次）。
+const SIZE_LIMIT_MB: u64 = 2048;
+
+fn enforce_size_limit(sh: &Shell) -> Result<()> {
+    let out = cmd!(sh, "du -sm .").read()?;
+    let used_mb: u64 = out
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if used_mb > SIZE_LIMIT_MB {
+        bail!(
+            "项目目录已用 {used_mb}MB，超过上限 {SIZE_LIMIT_MB}MB —— 构建锁死。\n运行 `cargo run -p xtask -- purge` 清理可再生产物后再试。"
+        );
+    }
+    Ok(())
+}
+
+fn purge(sh: &Shell) -> Result<()> {
+    let root = sh.current_dir();
+    for rel in [
+        "target/iso",
+        "target/zero-os.iso",
+        "target/zero-rootfs.img",
+        "target/disk.img",
+        "target/debug/incremental",
+        "target/aarch64-unknown-none/debug/incremental",
+        "target/aarch64-unknown-none/release/incremental",
+        "target/aarch64-unknown-uefi/debug/incremental",
+        "target/aarch64-unknown-uefi/release/incremental",
+    ] {
+        let p = root.join(rel);
+        if p.exists() {
+            println!("purge: removing {rel}");
+            fs::remove_dir_all(&p).or_else(|_| fs::remove_file(&p))?;
+        }
+    }
+    let out = cmd!(sh, "du -sm .").read()?;
+    println!("purge: done, current size {}", out.trim());
     Ok(())
 }
 

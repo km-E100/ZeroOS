@@ -112,7 +112,30 @@ pub fn log_panic(info: &PanicInfo) {
     if let Some(s) = msg.as_str() {
         let _ = sink.write_str(s);
     } else {
-        let _ = sink.write_str("<non-string panic payload>");
+        // 动态格式化载荷（assert_eq!/format_args! 的 String 路径）：
+        // as_str() 在 no_std 下拿不到，退回 Display 渲染到栈缓冲。
+        // 此前直接打 "<non-string panic payload>"，把真实故障文本
+        // （如越界 index）整个吞掉，实机排障时误导性极强。
+        use core::fmt::Write as _;
+        let mut buf = [0u8; 256];
+        let mut len = 0usize;
+        struct Buf<'a> { buf: &'a mut [u8], len: &'a mut usize }
+        impl Write for Buf<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let remain = self.buf.len() - *self.len;
+                let n = s.as_bytes().len().min(remain);
+                self.buf[*self.len..*self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+                *self.len += n;
+                Ok(())
+            }
+        }
+        {
+            let mut w = Buf { buf: &mut buf, len: &mut len };
+            let _ = write!(w, "{}", msg);
+        }
+        if let Ok(text) = core::str::from_utf8(&buf[..len]) {
+            let _ = sink.write_str(text);
+        }
     }
     let _ = sink.write_str("\n");
 }
