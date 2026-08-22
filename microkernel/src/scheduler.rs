@@ -101,9 +101,27 @@ fn dispatch(pid: ProcessId) -> ! {
 }
 
 fn idle() -> ! {
-    // TODO: 低功耗等待中断 (WFI)
+    // 无可运行进程：WFI 休眠等待中断（对照 Linux do_idle 的 default_idle）。
+    // 唤醒源：定时器 tick（idle 循环里必须持续重编程，否则睡死）。
+    //
+    // ⚠ 此处运行于 EL1、IRQ 屏蔽状态 —— WFI 在 IRQ 屏蔽时不休眠！
+    // 因此先解除 IRQ 屏蔽再 WFI，唤醒后立即重新屏蔽（与内核全程屏蔽
+    // IRQ 的锁纪律兼容：屏蔽恢复后才可能触碰任何共享结构）。
     loop {
-        core::hint::spin_loop();
+        unsafe {
+            crate::arch::program_next_tick();
+            core::arch::asm!(
+                "msr daifclr, #2", // 解除 IRQ 屏蔽（bit1 = I）
+                "wfi",
+                "msr daifset, #2", // 立即重新屏蔽，之后才安全触碰共享态
+                options(nostack)
+            );
+        }
+        // 被唤醒：可能有进程入队。重新调度。
+        let next = { RUNQUEUE.lock().pop() };
+        if let Some(pid) = next {
+            dispatch(pid)
+        }
     }
 }
 
