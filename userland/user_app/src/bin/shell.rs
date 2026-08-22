@@ -47,6 +47,12 @@ pub unsafe extern "C" fn _start(a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
     exit(0);
 }
 
+/// 命令历史：内存态最近 8 条（环形）。单核 shell 独占执行，静态可变安全。
+static mut HISTORY: [[u8; 128]; 8] = [[0; 128]; 8];
+static mut HIST_LEN: [usize; 8] = [0; 8];
+static mut HIST_HEAD: usize = 0;
+static mut HIST_TOTAL: usize = 0;
+
 /// 主循环：回显键盘输入，支持内建命令。
 pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
     println("\r\nZero OS console (user shell)");
@@ -65,16 +71,35 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             end -= 1;
         }
         let cmd = &line[..end];
+        record_history(cmd);
 
         if cmd == b"exit" {
             println("bye");
             break;
         } else if cmd == b"help" || cmd == b"?" {
-            println("commands: help info echo whoami launchd exit");
+            println("commands: help info echo whoami pid clear history launchd exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
             println("console");
+        } else if cmd == b"pid" {
+            match userlib::getpid() {
+                Ok(p) => {
+                    print("pid=");
+                    print_u64(p);
+                    println("");
+                }
+                Err(e) => {
+                    print("pid: syscall failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"clear" {
+            // ANSI：清屏 + 光标归位
+            let _ = console_write(b"\x1b[2J\x1b[H");
+        } else if cmd == b"history" {
+            print_history();
         } else if cmd == b"info" {
             // 打印启动参数（bootfs 表地址/条目数 + 预留位）
             print("bootfs_ptr=0x");
@@ -92,6 +117,40 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         }
     }
     0
+}
+
+/// 记录一条命令进历史（单核 shell：静态可变安全由独占执行保证）。
+fn record_history(cmd: &[u8]) {
+    if cmd.is_empty() {
+        return;
+    }
+    unsafe {
+        let head = HIST_HEAD;
+        let slot = &mut HISTORY[head];
+        let n = cmd.len().min(slot.len());
+        slot[..n].copy_from_slice(&cmd[..n]);
+        HIST_LEN[head] = n;
+        HIST_HEAD = (head + 1) % HISTORY.len();
+        HIST_TOTAL = (HIST_TOTAL + 1).min(HISTORY.len());
+    }
+}
+
+fn print_history() {
+    unsafe {
+        let total = HIST_TOTAL;
+        let head = HIST_HEAD;
+        let start = (head + HISTORY.len() - total) % HISTORY.len();
+        for k in 0..total {
+            let idx = (start + k) % HISTORY.len();
+            let len = HIST_LEN[idx];
+            print_u64((k + 1) as u64);
+            print(": ");
+            println_bytes(&HISTORY[idx][..len]);
+        }
+        if total == 0 {
+            println("(empty)");
+        }
+    }
 }
 
 /// `launchd list` / `launchd status` / `launchd spawn <服务名>`。
