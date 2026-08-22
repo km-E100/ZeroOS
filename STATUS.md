@@ -1,35 +1,31 @@
 # Zero OS 复兴状态（断点存档）
 
-> 本文件用于"一刀一会话"工作流：新会话先读本文件 + `git log --oneline` 即可接上进度。
+> 新会话先读本文件 + `git log --oneline` 接上进度。
 
-## 当前里程碑（2026-08-22 · 第四刀：阻塞 IPC + 工程卫生）
-- **阻塞式 IPC**：ReceiveMessage 空队列时挂起进程（等待者槽×4/通道），send 成功
-  释放锁后唤醒；continuation 语义在 dispatch 重入用户态前完成挂起调用
-  （对照 Mach mach_msg / XNU continuation）。实机 shell↔launchd 全命令验证通过。
-- **工程卫生归零警告**：死代码清除（context_switch/save_trap_frame/仪表残留）、
-  串口写加有界 FIFO 等待+使能 FIFO（不再丢日志字节）、rootfs 校验器接入 init、
-  内核栈 16K→64K（无独立中断栈，取 Linux THREAD_SIZE 的余量策略）
-- **shell 新命令**：pid（GetPid 端到端）/clear/history
+## 当前里程碑（2026-08-22 · 第五刀：三线并行交付）
+- **fork 端到端打通**（实机）：clone_user_address_space eager-copy 零缺陷；
+  shell `forktest` 命令父子双行验证；子进程回收链路完整
+- **virtio-blk 上线**（实机自检通过）：IRQ 槽位修正 48/49、EL1 轮询完成路径、
+  开机 LBA2048 写读自检；run-qemu.sh / xtask run 挂盘固化；专用 disk.img
+- **内核故障符号化回溯**（实机）：bootloader 灌符号进 .data 汇槽
+  （192KiB，.data 而非 .bss——zero_bss 会清掉后者）；trap 输出 elr=__symbol+off；
+  8 项单测。注意：汇槽容量截断保低址段
+- **体积硬闸**：xtask 所有命令前置 du 检查，超 2048MB 锁死构建；`purge` 自救
+- **诊断增强**：显式 alloc_error_handler（OOM 打印 Layout+phys 余量）；
+  logger 支持动态格式化 panic 载荷（曾吞掉 assert_eq! 真实文本）
 
-## 全会话修复史（本四刀）
-1. 异常入口现场保存缺失（汇编 SAVE_TRAP_AND_CALL 存根，TPIDR_EL1 定位帧）——致命
-2. yield_now 错标 ->!（LLVM 在 svc 后放 brk）；read_line 贯穿缺 continue
-3. USER_AP_RX=0b10 实为 EL0 无访问 → 0b11
-4. 链接脚本 PHDRS 缺失致 .bss 只读；内核对 memsz>filesz 段强制可写
-5. svc 封装固定寄存器约束；EL0 BRK 终止进程不 HALT；PSCI 改 HVC；故障重入保护
-6. 内核栈 16 字节对齐缺失（AAPCS64 违例，launchd status 必崩根因）
-7. WFI idle；ENOSYS 限流；build-iso 补建 user-app；no_std 测试 std 链接
+## 实机验收清单（全部 ✓）
+symbol sink / launchd online / shell 交互 / forktest 父子 / 服务注册表视图 /
+pid / 无 MISALIGNED / 无 panic
 
-## 已知待办（下一刀候选）
-1. fork 端到端验证（clone_space eager-copy 已实现但无实机触发路径）
-2. 物理分配器消费 bootloader EFI memory map（当前仅总量）
-3. virtio-blk 挂盘 → ZFS/fsd/blkdrv 用户态服务真实上线
-4. 内核故障符号化回溯（bootloader 已加载 7974 个符号可利用）
-5. mm-host-tests 回归进 CI；userland 命令主机测试
-6. 时间片/优先级调度（当前纯 RR）
+## 已知待办（第六刀候选）
+1. wait/waitpid/zombie 回收（fork 已通，POSIX 进程族谱缺一半）
+2. userland block_write/read 端到端命令（驱动已就绪，缺 shell 集成）
+3. ZFS/fsd/blkdrv 用户态服务真实上线（依赖块设备，现已具备）
+4. EFI memory map 精细消费；时间片/优先级调度；符号化栈回溯（FP 链）
+5. virtio-net 槽位空置 warn 噪音；短读语义；真机 DMA cache 一致性
 
 ## 构建与实机验证
-cargo run -p xtask -- build-iso
-qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 \
-  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
-  -serial mon:stdio -display none -cdrom target/zero-os.iso
+cargo run -p xtask -- build-iso          # 超 2048MB 会锁死，purge 自救
+./run-qemu.sh                            # 交互串口 + 自动挂盘
+# 或 cargo run -p xtask -- run normal
