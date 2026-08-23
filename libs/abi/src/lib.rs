@@ -485,6 +485,49 @@ pub mod protocol {
     }
 }
 
+/// 进程能力位图（capability bitmask；第八刀自布尔特权位升格）。
+///
+/// 每个进程在内核 `ProcessRecord.capabilities: u32` 中持有一份位图，
+/// 内核在敏感系统调用入口按位校验（缺位一律 `PermissionDenied`）：
+/// - 号位 7/8 `BlockRead`/`BlockWrite` → [`CAP_BLOCK_DEV`]（另受 1 MiB
+///   单次长度上限约束，见内核 syscalls.rs）；
+/// - 号位 18/19 `MmioMap`/`MmioUnmap` → [`CAP_MMIO`]；
+/// - 号位 20 `SpawnService` → [`CAP_SPAWN_SVC`]。
+///
+/// 继承规则：fork 原样复制父进程位图。引导路径沿用
+/// `spawn_user_from_bootfs(.., privileged: bool)` 的遗留布尔契约：
+/// true 映射为 [`CAP_ALL`]、false 为空位图；按服务的细粒度配置待
+/// services 注册表升格后接入。
+pub mod cap {
+    /// MMIO 租约申请/释放（号位 18/19，设备寄存器窗口）。
+    pub const CAP_MMIO: u32 = 1 << 0;
+    /// 块设备直通 IO（号位 7/8 BlockRead/BlockWrite）。
+    pub const CAP_BLOCK_DEV: u32 = 1 << 1;
+    /// 按名启动内核登记的服务（号位 20 SpawnService）。
+    pub const CAP_SPAWN_SVC: u32 = 1 << 2;
+    /// 全部已定义能力的组合（引导期 privileged 服务的缺省位图）。
+    pub const CAP_ALL: u32 = CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bits_are_distinct_and_all_composes() {
+            // 位值即 ABI 契约：bit0/bit1/bit2，冻结后只能追加不能改义。
+            assert_eq!(CAP_MMIO, 0b0001);
+            assert_eq!(CAP_BLOCK_DEV, 0b0010);
+            assert_eq!(CAP_SPAWN_SVC, 0b0100);
+            assert_eq!(CAP_ALL, 0b0111);
+            // 两两不相交：任何能力都不能被其余能力组合伪造出来。
+            assert_eq!(CAP_MMIO & CAP_BLOCK_DEV, 0);
+            assert_eq!(CAP_MMIO & CAP_SPAWN_SVC, 0);
+            assert_eq!(CAP_BLOCK_DEV & CAP_SPAWN_SVC, 0);
+            assert_eq!(CAP_ALL & !(CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC), 0);
+        }
+    }
+}
+
 /// IPC 消息结构（**冻结布局**）。
 ///
 /// 内存布局（`#[repr(C)]`，大小 132 字节，无 padding）：
@@ -577,12 +620,19 @@ pub mod syscall {
             len: usize,
         },
         /// (7) 块设备读（LBA 对齐 512B）：`x1`=lba，`x2`=&buf，`x3`=len。
+        ///
+        /// 第八刀能力门控：需 [`super::cap::CAP_BLOCK_DEV`]（无位返回
+        /// `PermissionDenied`）；len 另受 1 MiB 上限（2048 扇区），超出
+        /// 返回 `InvalidArgument`——内核中转缓冲按 len 分配，无上限即
+        /// 用户可控的巨分配 DoS。
         BlockRead {
             lba: u64,
             user_buffer: usize,
             len: usize,
         },
-        /// (8) 块设备写：`x1`=lba，`x2`=&buf，`x3`=len。
+        /// (8) 块设备写：`x1`=lba，`x2`=&buf，`x3`=len。门控同
+        /// [`Syscall::BlockRead`]：需 [`super::cap::CAP_BLOCK_DEV`] 且
+        /// len ≤ 1 MiB。
         BlockWrite {
             lba: u64,
             user_buffer: usize,
@@ -594,23 +644,33 @@ pub mod syscall {
             len: usize,
         },
         /// (10) 创建共享内存：`x1`=size，`x2`=&[handle, ptr, len]。
+        ///
+        /// ⚠ 第八刀下线：号位 10-14/17 恒返回 [`SysError::NotSupported`]。
+        /// 现实现把内核恒等映射区的指针直接交给 EL0——用户态首次解引用即
+        /// 致命异常（恒等映射对 EL0 无权限），号位 17 更是直接泄漏物理地址；
+        /// 双路封死，止血下线。重设计（Region 表 + map 进请求者地址空间）
+        /// 见 STATUS「第八刀候选」第 3 条。
         ShmCreate {
             size: usize,
             user_result: usize,
         },
-        /// (11) 映射共享内存，返回映射地址。
+        /// (11) 映射共享内存，返回映射地址。⚠ 已下线，恒返回
+        /// [`SysError::NotSupported`]（理由见 [`Syscall::ShmCreate`]）。
         ShmMap {
             handle: u32,
         },
-        /// (12) 查询共享内存长度。
+        /// (12) 查询共享内存长度。⚠ 已下线，恒返回
+        /// [`SysError::NotSupported`]。
         ShmLen {
             handle: u32,
         },
-        /// (13) 增加共享内存引用。
+        /// (13) 增加共享内存引用。⚠ 已下线，恒返回
+        /// [`SysError::NotSupported`]。
         ShmRetain {
             handle: u32,
         },
-        /// (14) 释放共享内存引用。
+        /// (14) 释放共享内存引用。⚠ 已下线，恒返回
+        /// [`SysError::NotSupported`]。
         ShmRelease {
             handle: u32,
         },
@@ -621,20 +681,24 @@ pub mod syscall {
             index: u32,
             user_buffer: usize,
         },
-        /// (17) 查询共享内存物理页地址（返回物理地址）。
+        /// (17) 查询共享内存物理页地址（返回物理地址）。⚠ 已下线，
+        /// 恒返回 [`SysError::NotSupported`]（物理地址泄漏给 EL0，
+        /// 理由见 [`Syscall::ShmCreate`]）。
         ShmPhys {
             handle: u32,
         },
-        /// (18) 申请 MMIO 租约：`x1`=index，`x2`=&[base, len]；仅特权进程。
+        /// (18) 申请 MMIO 租约：`x1`=index，`x2`=&[base, len]；需
+        /// [`super::cap::CAP_MMIO`] 能力（第八刀自布尔特权位升格）。
         MmioMap {
             index: u32,
             user_buffer: usize,
         },
-        /// (19) 释放 MMIO 租约：`x1`=index；仅特权进程。
+        /// (19) 释放 MMIO 租约：`x1`=index；需 [`super::cap::CAP_MMIO`]。
         MmioUnmap {
             index: u32,
         },
-        /// (20) 按名启动内核登记的服务：`x1`=name_ptr，`x2`=len；仅特权进程。
+        /// (20) 按名启动内核登记的服务：`x1`=name_ptr，`x2`=len；需
+        /// [`super::cap::CAP_SPAWN_SVC`] 能力。
         SpawnService {
             name_ptr: usize,
             name_len: usize,
@@ -703,6 +767,9 @@ pub mod syscall {
         DeviceError = 6,
         /// 资源忙。
         Busy = 7,
+        /// 功能未实现/已下线（第八刀新增：SHM 系统调用族止血下线，
+        /// 见 [`Syscall`] 号位 10-14/17 的注释）。
+        NotSupported = 8,
     }
 
     impl SysError {
@@ -717,6 +784,7 @@ pub mod syscall {
                 SysError::WouldBlock => "would block",
                 SysError::DeviceError => "device error",
                 SysError::Busy => "busy",
+                SysError::NotSupported => "not supported",
             }
         }
 
@@ -729,7 +797,8 @@ pub mod syscall {
     /// 把内核返回的 `x0` 解码为 [`SyscallResult`]。
     ///
     /// 规则与内核 `encode_result` 严格镜像：
-    /// `u64::MAX` 及其以下 7 个值为错误，其余为成功数值。
+    /// `u64::MAX` 及其以下 8 个值为错误（k=0..8，k=8 第八刀新增），
+    /// 其余为成功数值。
     #[inline]
     pub const fn decode(value: u64) -> Result<u64, SysError> {
         match value {
@@ -741,7 +810,43 @@ pub mod syscall {
             val if val == SysError::WouldBlock.code() => Err(SysError::WouldBlock),
             val if val == SysError::DeviceError.code() => Err(SysError::DeviceError),
             val if val == SysError::Busy.code() => Err(SysError::Busy),
+            val if val == SysError::NotSupported.code() => Err(SysError::NotSupported),
             other => Ok(other),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn not_supported_error_contract() {
+            // 判别值冻结：k=8（第八刀新增，SHM 系统调用族下线止血）。
+            assert_eq!(SysError::NotSupported as u64, 8);
+            assert_eq!(SysError::NotSupported.code(), u64::MAX - 8);
+            assert_eq!(decode(u64::MAX - 8), Err(SysError::NotSupported));
+            assert_eq!(SysError::NotSupported.as_str(), "not supported");
+            // 错误区间下界随之外移一格：k≥9 的值仍是合法成功数值。
+            assert_eq!(decode(u64::MAX - 9), Ok(u64::MAX - 9));
+        }
+
+        #[test]
+        fn all_error_codes_decode_roundtrip() {
+            for (k, err) in [
+                (0u64, SysError::InvalidArgument),
+                (1, SysError::PermissionDenied),
+                (2, SysError::ChannelUnavailable),
+                (3, SysError::NotFound),
+                (4, SysError::NoMemory),
+                (5, SysError::WouldBlock),
+                (6, SysError::DeviceError),
+                (7, SysError::Busy),
+                (8, SysError::NotSupported),
+            ] {
+                assert_eq!(err as u64, k);
+                assert_eq!(err.code(), u64::MAX - k);
+                assert_eq!(decode(u64::MAX - k), Err(err));
+            }
         }
     }
 }

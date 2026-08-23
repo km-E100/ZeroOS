@@ -393,8 +393,9 @@ mod tests {
     fn decode_ok_values_pass_through() {
         assert_eq!(decode_result(0).unwrap(), 0);
         assert_eq!(decode_result(42).unwrap(), 42);
-        // 错误区间下界（u64::MAX - 7）之外的值一律视为成功
-        assert_eq!(decode_result(u64::MAX - 8).unwrap(), u64::MAX - 8);
+        // 错误区间下界（u64::MAX - 8 已被 NotSupported 占用，第八刀）
+        // 之外的值一律视为成功。
+        assert_eq!(decode_result(u64::MAX - 9).unwrap(), u64::MAX - 9);
     }
 
     #[test]
@@ -407,6 +408,8 @@ mod tests {
         assert_eq!(decode_result(u64::MAX - 5), Err(SysError::WouldBlock));
         assert_eq!(decode_result(u64::MAX - 6), Err(SysError::DeviceError));
         assert_eq!(decode_result(u64::MAX - 7), Err(SysError::Busy));
+        // 第八刀新增：SHM 族下线的 NotSupported（k=8）。
+        assert_eq!(decode_result(u64::MAX - 8), Err(SysError::NotSupported));
     }
 
     #[test]
@@ -423,6 +426,7 @@ mod tests {
             SysError::WouldBlock,
             SysError::DeviceError,
             SysError::Busy,
+            SysError::NotSupported,
         ] {
             assert_eq!(decode(err.code()), Err(err));
         }

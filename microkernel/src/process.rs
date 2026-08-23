@@ -87,7 +87,12 @@ struct ProcessRecord {
     state: ProcessState,
     slot: usize,
     addr_space: Option<AddressSpace>,
-    privileged: bool,
+    /// 进程能力位图（位定义见 `zero_abi::cap`；第八刀自布尔特权位
+    /// `privileged: bool` 升格）：bit0=CAP_MMIO、bit1=CAP_BLOCK_DEV、
+    /// bit2=CAP_SPAWN_SVC。fork 原样继承；引导路径由
+    /// spawn_user_from_bootfs 按遗留布尔参数映射（true=CAP_ALL /
+    /// false=0，见 capabilities_from_flag）。
+    capabilities: u32,
     entry_point: Option<usize>,
     user_stack_top: Option<usize>,
     started: bool,
@@ -201,7 +206,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         state: ProcessState::Runnable,
         slot: slot_index,
         addr_space: None,
-        privileged: false,
+        // 内核直生进程：默认无能力（fail-closed；能力只经显式授予或 fork 继承）。
+        capabilities: 0,
         entry_point: None,
         user_stack_top: None,
         started: true,
@@ -271,30 +277,52 @@ pub fn spawn_user_from_bootfs(
         return Err(err);
     }
 
-    if privileged {
-        set_privileged(pid, true);
-    }
+    // 遗留布尔契约 → 能力位图映射（true = CAP_ALL 全位，false = 空）：
+    // services 注册表仍以 bool 描述服务特权级（本文件不越界改动），
+    // 细粒度按服务配置待其升格为 u32 位图后接入。
+    set_privileged(pid, privileged);
     Ok(pid)
 }
 
+/// 遗留布尔特权接口（services 注册表与 spawn_user_from_bootfs 的
+/// 布尔契约保持兼容）：true = 全能力位图（`zero_abi::cap::CAP_ALL`），
+/// false = 空。细粒度授予走 [`set_capabilities`]。
 pub fn set_privileged(pid: ProcessId, privileged: bool) {
+    set_capabilities(pid, capabilities_from_flag(privileged));
+}
+
+/// 直接写进程能力位图（capability 升格后的规范入口）。
+pub fn set_capabilities(pid: ProcessId, capabilities: u32) {
     let mut table = PROCESS_TABLE.lock();
     if let Some(record) = table
         .iter_mut()
         .filter_map(|slot| slot.as_mut())
         .find(|record| record.pid == pid)
     {
-        record.privileged = privileged;
+        record.capabilities = capabilities;
     }
 }
 
-pub fn is_slot_privileged(slot: usize) -> bool {
+/// 读槽位进程的能力位图（syscall 门控用）。空槽返回 0（fail-closed：
+/// 查不到就当没有任何能力）。
+pub fn slot_capabilities(slot: usize) -> u32 {
     let table = PROCESS_TABLE.lock();
     table
         .get(slot)
         .and_then(|entry| entry.as_ref())
-        .map(|record| record.privileged)
-        .unwrap_or(false)
+        .map(|record| record.capabilities)
+        .unwrap_or(0)
+}
+
+/// 遗留布尔 → 能力位图映射（纯函数，主机单测钉死）：privileged=true
+/// 即全位（含 CAP_BLOCK_DEV——blkdrv 直通数据面、launchd 服务拉起都
+/// 依赖该映射）；false 为空位图。
+pub(crate) fn capabilities_from_flag(privileged: bool) -> u32 {
+    if privileged {
+        zero_abi::cap::CAP_ALL
+    } else {
+        0
+    }
 }
 
 pub fn slot_for_pid(pid: ProcessId) -> Option<usize> {
@@ -1115,7 +1143,8 @@ pub fn fork(
             state: ProcessState::Runnable,
             slot: child_slot,
             addr_space,
-            privileged: parent_record.privileged,
+            // 能力位图原样继承（对标 POSIX fork 的凭据继承语义）。
+            capabilities: parent_record.capabilities,
             entry_point: parent_record.entry_point,
             user_stack_top: parent_record.user_stack_top,
             started: true,
@@ -1405,7 +1434,7 @@ mod state_machine_tests {
             state: ProcessState::Runnable,
             slot,
             addr_space: None, // 测试绝不触发 AddressSpace::destroy
-            privileged: false,
+            capabilities: 0,
             entry_point: None,
             user_stack_top: None,
             started: true,
@@ -1470,5 +1499,24 @@ mod state_machine_tests {
         drop(table);
         let mut table = PROCESS_TABLE.lock();
         *table = [const { None }; MAX_PROCESSES];
+    }
+
+    // ── 第八刀：capability bitmask 升格 ─────────────────────────────
+
+    #[test]
+    fn capability_flag_mapping_and_abi_bits() {
+        use zero_abi::cap::{CAP_ALL, CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
+        // 位值即 ABI 契约（与 zero-abi::cap 双向钉死，漂移即编译期外红）。
+        assert_eq!(CAP_MMIO, 1 << 0);
+        assert_eq!(CAP_BLOCK_DEV, 1 << 1);
+        assert_eq!(CAP_SPAWN_SVC, 1 << 2);
+        assert_eq!(CAP_ALL, CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC);
+        // 遗留布尔映射：privileged=true ⇒ 全位；false ⇒ 空位图。
+        assert_eq!(capabilities_from_flag(true), CAP_ALL);
+        assert_eq!(capabilities_from_flag(false), 0);
+        // blkdrv 内核直通数据面的依赖：全位必含 CAP_BLOCK_DEV。
+        assert_ne!(capabilities_from_flag(true) & CAP_BLOCK_DEV, 0);
+        // launchd 拉起服务的依赖：全位必含 CAP_SPAWN_SVC。
+        assert_ne!(capabilities_from_flag(true) & CAP_SPAWN_SVC, 0);
     }
 }
