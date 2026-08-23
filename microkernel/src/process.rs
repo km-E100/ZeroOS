@@ -2005,7 +2005,6 @@ mod state_machine_tests {
         assert_ne!(capabilities_from_flag(true) & CAP_SPAWN_SVC, 0);
     }
 
-<<<<<<< HEAD
     // ── 第九刀：WaitSpec 目标集合化（wait 精确匹配 / 误投递回归）────
 
     #[test]
@@ -2145,7 +2144,9 @@ mod state_machine_tests {
         // 匹配层面：等 stale 的人不会被新代同 seq 进程惊醒，反之亦然。
         assert!(!WaitSpec::Pid(ProcessId::new(stale)).matches(ProcessId::new(fresh_same_seq)));
         assert!(!WaitSpec::Pid(ProcessId::new(fresh_same_seq)).matches(ProcessId::new(stale)));
-=======
+    }
+
+    // ── 第九刀：pending_signals 位图（设置/取用）─────────────────
     // ── 第九刀：pending_signals 位图（设置/取用）─────────────────────
 
     #[test]
@@ -2181,6 +2182,5 @@ mod state_machine_tests {
             let mut table = PROCESS_TABLE.lock();
             *table = [const { None }; MAX_PROCESSES];
         }
->>>>>>> ws/signals-minimal
     }
 }
