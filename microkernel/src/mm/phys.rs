@@ -8,6 +8,9 @@
 //!   double-free / 释放保留区 / 越界都会 panic（见 `PhysBitmap::free_page`）。
 //! - 页表页通过 `alloc_page_table` / `free_page_table` 分配回收，
 //!   与普通数据页共用位图，但单独计数（`page_table_pages()`）。
+//! - 第十刀 COW：`free_page` 为**引用减一**语义——refs 减到 0 才真正回收；
+//!   `retain_page` 给共享页 +1。destroy_user_address_space 无需特判，
+//!   共享页由最后一个退出者回收。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
@@ -22,6 +25,9 @@ const MAX_PAGES: usize = 1024 * 1024; // 4 GiB / 4KiB pages (upper bound)
 pub const RAM_BASE: usize = 0x4000_0000;
 
 static BITMAP_WORDS: [u64; MAX_PAGES / 64] = [0; MAX_PAGES / 64];
+/// 每页引用计数（与 BITMAP_WORDS 平行，每物理页一格 u16，2 MiB .bss）。
+/// 上限 65535 份共享/页——COW fork 链远达不到，超出即记账 bug。
+static REF_COUNTS: [u16; MAX_PAGES] = [0; MAX_PAGES];
 static MM: Mutex<PhysBitmap> = Mutex::new(PhysBitmap::empty());
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 
@@ -77,7 +83,15 @@ fn legacy_init(mm: &mut PhysBitmap, memory_bytes: usize, reserved_bytes: usize) 
     // ROOTFS_PTR@__bss_end-0x40 被写成 0x4101e003，launchd spawn 即崩）。
     let reserved = usize::min(reserved_pages_for(reserved_bytes), total).max(1);
     unsafe {
-        mm.init(BITMAP_WORDS.as_ptr() as *mut u64, BITMAP_WORDS.len(), RAM_BASE, total, reserved);
+        mm.init(
+            BITMAP_WORDS.as_ptr() as *mut u64,
+            BITMAP_WORDS.len(),
+            REF_COUNTS.as_ptr() as *mut u16,
+            REF_COUNTS.len(),
+            RAM_BASE,
+            total,
+            reserved,
+        );
     }
 }
 
@@ -101,7 +115,15 @@ fn init_from_regions(
     }
     let total = (top_rel / PAGE_SIZE).max(1);
     unsafe {
-        mm.init(BITMAP_WORDS.as_ptr() as *mut u64, BITMAP_WORDS.len(), RAM_BASE, total, 0);
+        mm.init(
+            BITMAP_WORDS.as_ptr() as *mut u64,
+            BITMAP_WORDS.len(),
+            REF_COUNTS.as_ptr() as *mut u16,
+            REF_COUNTS.len(),
+            RAM_BASE,
+            total,
+            0,
+        );
     }
 
     // 1) 内核镜像保留区（恒等映射起点即 RAM_BASE，天花板取页）。
@@ -154,9 +176,21 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<usize> {
     MM.lock().alloc_contiguous(count)
 }
 
-/// 释放一页物理内存。对称性/越界/double-free 校验见 `PhysBitmap::free_page`。
+/// 释放一页物理内存（**引用减一**语义，第十刀 COW）：refs 减到 0 才真正
+/// 回收；共享页由最后一个退出者归还。校验见 `PhysBitmap::free_page`。
 pub fn free_page(addr: usize) {
     MM.lock().free_page(addr);
+}
+
+/// 给一页增加一个引用（clone 把物理页共享给新地址空间时调用）。
+/// 位图不动——页保持 busy，仅记账 +1。
+pub fn retain_page(addr: usize) {
+    MM.lock().retain_page(addr);
+}
+
+/// 查询某物理地址当前引用数（COW 缺页判定：>1 需复制，==1 原地恢复可写）。
+pub fn ref_count(addr: usize) -> usize {
+    MM.lock().ref_count(addr) as usize
 }
 
 /// 分配一页用作**页表**（计入页表页占用统计）。

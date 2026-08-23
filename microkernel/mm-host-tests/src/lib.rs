@@ -14,6 +14,10 @@ mod heap_free_list;
 #[path = "../../src/mm/table_walk.rs"]
 mod table_walk;
 
+/// 第十刀 COW fork：伪造页表 + 引用计数位图的集成场景（见 cow_tests.rs）。
+#[cfg(test)]
+mod cow_tests;
+
 /// 主 crate 未能 host 化的集成场景，放在这里补测：
 /// - PhysBitmap 与 FreeListHeap 的协同（物理页表自举场景简化版）。
 #[cfg(test)]
@@ -40,9 +44,12 @@ mod integration {
             let nwords = 16;
             // 命名数组持活位图存储（临时数组会被立即 drop，指针悬垂）
             let mut bitmap_words = [0u64; 16];
+            let mut ref_counts = [0u16; 1024];
             bitmap.init(
                 bitmap_words.as_mut_ptr(),
                 nwords,
+                ref_counts.as_mut_ptr(),
+                ref_counts.len(),
                 0x4000_0000,
                 nwords * 64,
                 2,
@@ -83,11 +90,20 @@ mod integration {
     #[test]
     fn allocator_serves_all_zero_words() {
         let mut words = [0u64; 4096];
+        let mut ref_counts = [0u16; 4096 * 64];
         let mut bitmap = PhysBitmap::empty();
         let total = 213_008;
         let reserved = 4096;
         unsafe {
-            bitmap.init(words.as_mut_ptr(), words.len(), 0x4000_0000, total, reserved);
+            bitmap.init(
+                words.as_mut_ptr(),
+                words.len(),
+                ref_counts.as_mut_ptr(),
+                ref_counts.len(),
+                0x4000_0000,
+                total,
+                reserved,
+            );
         }
 
         // 能连续分配多页，且永不返回保留区/越界地址。

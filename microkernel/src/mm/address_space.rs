@@ -117,6 +117,13 @@ impl AddressSpace {
     pub fn walk(&self, va: usize) -> super::table_walk::WalkOutcome {
         paging::walk_space(&self.inner, va)
     }
+
+    /// 第十刀 COW：写权限故障的写时复制断链。
+    /// 返回 true = 已按 COW 处理（调用方应恢复现场重放指令）；
+    /// false = 与 COW 无关（真非法访问）或资源不足。
+    pub fn handle_cow_fault(&self, va: usize) -> bool {
+        unsafe { paging::handle_cow_fault(&self.inner, va) }
+    }
 }
 
 /// 栈底 guard 页设计说明：

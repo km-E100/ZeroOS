@@ -16,6 +16,9 @@ pub const PAGE_SIZE: usize = 4096;
 pub struct PhysBitmap {
     words: *mut u64,
     nwords: usize,
+    /// 每页引用计数数组（与位图平行，长度 >= total；COW 共享记账）。
+    refs: *mut u16,
+    nrefs: usize,
     base: usize,
     total: usize,
     reserved: usize,
@@ -31,6 +34,8 @@ impl PhysBitmap {
         Self {
             words: core::ptr::null_mut(),
             nwords: 0,
+            refs: core::ptr::null_mut(),
+            nrefs: 0,
             base: 0,
             total: 0,
             reserved: 0,
@@ -42,16 +47,33 @@ impl PhysBitmap {
     ///
     /// # 参数
     /// - `words`: 位图存储，长度必须 >= `total / 64`（向上取整）；
+    /// - `refs`: 引用计数存储，长度必须 >= `total`（每页一格 u16）；
     /// - `base`: 页 0 的物理地址；
     /// - `total`: 总页数；
     /// - `reserved`: 起始保留页数（至少 1：页 0 永不分配）。
     ///
     /// # Safety
-    /// `words` 必须指向 `nwords * 8` 字节的可写内存，且在实例存活期间有效。
-    pub unsafe fn init(&mut self, words: *mut u64, nwords: usize, base: usize, total: usize, reserved: usize) {
+    /// `words` 必须指向 `nwords * 8` 字节、`refs` 必须指向 `nrefs * 2`
+    /// 字节的可写内存，且在实例存活期间有效。
+    pub unsafe fn init(
+        &mut self,
+        words: *mut u64,
+        nwords: usize,
+        refs: *mut u16,
+        nrefs: usize,
+        base: usize,
+        total: usize,
+        reserved: usize,
+    ) {
         assert!(total <= nwords * 64, "PhysBitmap: total exceeds bitmap capacity");
+        assert!(total <= nrefs, "PhysBitmap: total exceeds refcount capacity");
         self.words = words;
         self.nwords = nwords;
+        self.refs = refs;
+        self.nrefs = nrefs;
+        for i in 0..total {
+            *refs.add(i) = 0;
+        }
         self.base = base;
         self.total = total;
         for i in 0..nwords {
@@ -84,6 +106,7 @@ impl PhysBitmap {
                 }
                 if slot & (1u64 << bit) == 0 {
                     unsafe { *self.words.add(index) |= 1u64 << bit; }
+                    self.set_refs(page, 1);
                     self.free -= 1;
                     return Some(self.base + page * PAGE_SIZE);
                 }
@@ -113,6 +136,7 @@ impl PhysBitmap {
             if run == count {
                 for p in run_start..=page {
                     self.set_bit(p);
+                    self.set_refs(p, 1);
                 }
                 self.free -= count;
                 return Some(self.base + run_start * PAGE_SIZE);
@@ -121,12 +145,77 @@ impl PhysBitmap {
         None
     }
 
-    /// 释放一页。对称性校验：越界、落在保留区（含页 0）、double-free 一律 panic。
+    /// 引用计数减一释放一页（第十刀 COW 语义）：refs 减到 0 才真正回收；
+    /// 减不到 0 时页保持 busy——COW fork 的父/子任一方先退出时，
+    /// 绝不能回收仍被对方映射的物理页（refcount_lifecycle 用例钉死）。
+    /// 对称性校验不变：越界、保留区、double-free（refs 已尽再 free）一律 panic。
     pub fn free_page(&mut self, addr: usize) {
         self.assert_ready();
+        let page = self.locate_page(addr);
+        // locate_page：基址/对齐/范围/保留区校验收口一处（retain 共用）。
+        assert!(
+            self.page_busy(page),
+            "PhysBitmap::free_page: double free of page {} (0x{:x})",
+            page,
+            addr
+        );
+        let old = self.refs_of(page);
+        assert!(
+            old >= 1,
+            "PhysBitmap::free_page: refcount underflow on page {} (0x{:x})",
+            page,
+            addr
+        );
+        if old == 1 {
+            // 最后一个引用消失：真正回收。
+            self.set_refs(page, 0);
+            self.clear_bit(page);
+            self.free += 1;
+        } else {
+            // 仍有共享方（COW fork 对端）：保持 busy，只记账减一。
+            self.set_refs(page, old - 1);
+        }
+    }
+
+    /// 给一页增加一个引用（clone 把物理页共享给新地址空间时调用）。
+    /// 不触碰位图——页保持 busy，仅记账 +1；未分配页 panic（不能共享
+    /// 不属于分配器的页）。
+    pub fn retain_page(&mut self, addr: usize) {
+        self.assert_ready();
+        let page = self.locate_page(addr);
+        assert!(
+            self.page_busy(page),
+            "PhysBitmap::retain_page: page {} (0x{:x}) is not allocated",
+            page,
+            addr
+        );
+        let old = self.refs_of(page);
+        // u16 上限 65535 份共享；超出即记账 bug，响亮失败。
+        let inc = old.checked_add(1).expect("PhysBitmap::retain_page: refcount overflow");
+        self.set_refs(page, inc);
+    }
+
+    /// 查询某物理地址当前引用数（诊断/COW 判定用）；未分配或越界返回 0。
+    pub fn ref_count(&self, addr: usize) -> u16 {
+        if !self.initialised() || addr < self.base {
+            return 0;
+        }
+        let offset = addr - self.base;
+        if offset % PAGE_SIZE != 0 {
+            return 0;
+        }
+        let page = offset / PAGE_SIZE;
+        if page >= self.total {
+            return 0;
+        }
+        self.refs_of(page)
+    }
+
+    /// 把 addr 解析成页号并做全部位置校验（基址/对齐/范围/保留区）。
+    fn locate_page(&self, addr: usize) -> usize {
         assert!(
             addr >= self.base,
-            "PhysBitmap::free_page: address 0x{:x} below RAM base 0x{:x}",
+            "PhysBitmap: address 0x{:x} below RAM base 0x{:x}",
             addr,
             self.base
         );
@@ -134,30 +223,35 @@ impl PhysBitmap {
         assert_eq!(
             offset % PAGE_SIZE,
             0,
-            "PhysBitmap::free_page: address 0x{:x} not page aligned",
+            "PhysBitmap: address 0x{:x} not page aligned",
             addr
         );
         let page = offset / PAGE_SIZE;
         assert!(
             page < self.total,
-            "PhysBitmap::free_page: page {} out of range (total {})",
+            "PhysBitmap: page {} out of range (total {})",
             page,
             self.total
         );
         assert!(
             page >= self.reserved,
-            "PhysBitmap::free_page: page {} is reserved [0,{}), cannot free",
+            "PhysBitmap: page {} is reserved [0,{}) cannot be used",
             page,
             self.reserved
         );
-        assert!(
-            self.page_busy(page),
-            "PhysBitmap::free_page: double free of page {} (0x{:x})",
-            page,
-            addr
-        );
-        self.clear_bit(page);
-        self.free += 1;
+        page
+    }
+
+    fn initialised(&self) -> bool {
+        !self.refs.is_null() && !self.words.is_null() && self.total > 0
+    }
+
+    fn refs_of(&self, page: usize) -> u16 {
+        unsafe { *self.refs.add(page) }
+    }
+
+    fn set_refs(&mut self, page: usize, value: u16) {
+        unsafe { *self.refs.add(page) = value; }
     }
 
     /// 查询该物理地址的页是否空闲（测试/诊断用）。
@@ -193,6 +287,7 @@ impl PhysBitmap {
             return false;
         }
         self.set_bit(page);
+        self.set_refs(page, 0); // 保留页无引用（防御：init 已清零）
         self.free -= 1;
         true
     }
@@ -223,12 +318,13 @@ mod tests {
     const WORDS: usize = 8; // 512 页
 
     struct Harness {
-        // Box：保证 words 数组**地址稳定**。
+        // Box：保证 words/refs 数组**地址稳定**。
         // 若直接 `[u64; WORDS]`，Harness::new 返回时结构体会被整体搬移，
         // PhysBitmap.words 里保存的指针会指向已失效的旧栈位置（debug 构建
         // 下表现为隐蔽的写后丢失）。内核侧 PhysBitmap.words 指向 static，
         // 永不搬移，不受此问题影响。
         _words: Box<[u64; WORDS]>,
+        _refs: Box<[u16; WORDS * 64]>,
         mm: PhysBitmap,
     }
 
@@ -236,10 +332,19 @@ mod tests {
         fn new(total: usize, reserved: usize) -> Self {
             let mut h = Self {
                 _words: Box::new([0; WORDS]),
+                _refs: Box::new([0; WORDS * 64]),
                 mm: PhysBitmap::empty(),
             };
             unsafe {
-                h.mm.init(h._words.as_mut_ptr(), WORDS, 0x4000_0000, total, reserved);
+                h.mm.init(
+                    h._words.as_mut_ptr(),
+                    WORDS,
+                    h._refs.as_mut_ptr(),
+                    h._refs.len(),
+                    0x4000_0000,
+                    total,
+                    reserved,
+                );
             }
             h
         }
@@ -355,6 +460,102 @@ mod tests {
             h.mm.free_page(seg5 + i * PAGE_SIZE);
         }
         assert_eq!(h.mm.free_count(), 128 - 3);
+    }
+
+    // ── 第十刀 COW：引用计数生命周期 ─────────────────────────
+
+    /// 任务书钉死序列：alloc → retain×2 → free×3。
+    /// 关键回归点：第一次 free 后页**必须仍然 busy**（旧 eager 语义在这里
+    /// 就真回收了，共享对端会被砸；这正是 destroy_user_address_space
+    /// 改减一语义要防的事故）。
+    #[test]
+    fn refcount_lifecycle_alloc_retain2_free3() {
+        let mut h = Harness::new(64, 4);
+        let base_free = h.mm.free_count();
+        let a = h.mm.alloc_page().unwrap();
+        assert_eq!(h.mm.ref_count(a), 1, "分配即持有一个引用");
+
+        h.mm.retain_page(a);
+        h.mm.retain_page(a);
+        assert_eq!(h.mm.ref_count(a), 3, "retain×2 → 引用=3");
+        assert!(!h.mm.page_is_free(a));
+        assert_eq!(h.mm.free_count(), base_free - 1, "共享期间空闲数不变");
+
+        // 第 1 次 free：3→2，仍 busy（子地址空间先退出的模拟）。
+        h.mm.free_page(a);
+        assert_eq!(h.mm.ref_count(a), 2);
+        assert!(!h.mm.page_is_free(a), "⚠ 共享页一方退出后绝不能被回收");
+        assert_eq!(h.mm.free_count(), base_free - 1);
+
+        // 第 2 次 free：2→1，仍 busy（对端还活着）。
+        h.mm.free_page(a);
+        assert_eq!(h.mm.ref_count(a), 1);
+        assert!(!h.mm.page_is_free(a));
+
+        // 第 3 次 free：1→0，此刻才真正回到分配器。
+        h.mm.free_page(a);
+        assert_eq!(h.mm.ref_count(a), 0);
+        assert!(h.mm.page_is_free(a));
+        assert_eq!(h.mm.free_count(), base_free, "引用归零后空闲数恢复");
+
+        // 回收后可立即再分配（且新分配从 refs=1 起步）。
+        let b = h.mm.alloc_page().unwrap();
+        assert_eq!(b, a, "first-fit 应复用刚归还的页");
+        assert_eq!(h.mm.ref_count(b), 1);
+    }
+
+    /// COW fork 全景（纯位图层）：父 alloc(1) → clone retain(2) →
+    /// 子断链 free(1) → 父退出 free(0)。任何一步多释放都 panic。
+    #[test]
+    fn cow_fork_teardown_order_independent() {
+        let mut h = Harness::new(64, 4);
+        let page = h.mm.alloc_page().unwrap();      // 父映射，rc=1
+        h.mm.retain_page(page);                     // clone 共享给子，rc=2
+
+        // 子写触发断链：老页引用减一（rc 2→1），页保持 busy 归父所有。
+        h.mm.free_page(page);
+        assert_eq!(h.mm.ref_count(page), 1);
+        assert!(!h.mm.page_is_free(page));
+
+        // 子随后退出再销毁自己的其余映射不会碰这页；父最后退出：rc 1→0。
+        h.mm.free_page(page);
+        assert!(h.mm.page_is_free(page));
+    }
+
+    #[test]
+    #[should_panic(expected = "is not allocated")]
+    fn retain_unallocated_panics() {
+        let mut h = Harness::new(64, 4);
+        let never = 0x4000_0000 + 8 * PAGE_SIZE; // 空闲区里的页
+        h.mm.retain_page(never);
+    }
+
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn over_release_after_exhausted_refs_panics() {
+        let mut h = Harness::new(64, 4);
+        let a = h.mm.alloc_page().unwrap();
+        h.mm.free_page(a); // rc 1→0 已回收
+        h.mm.free_page(a); // 再 free = double-free panic
+    }
+
+    /// 连续分配的每一页各自持有独立 refcount=1，可单独释放。
+    #[test]
+    fn contiguous_pages_get_individual_refcounts() {
+        let mut h = Harness::new(256, 2);
+        let seg = h.mm.alloc_contiguous(4).unwrap();
+        for i in 0..4 {
+            let p = seg + i * PAGE_SIZE;
+            assert_eq!(h.mm.ref_count(p), 1);
+        }
+        // 只释放第 2 页（挖洞），其余保持 busy。
+        h.mm.free_page(seg + PAGE_SIZE);
+        assert!(h.mm.page_is_free(seg + PAGE_SIZE));
+        for i in [0usize, 2, 3] {
+            assert!(!h.mm.page_is_free(seg + i * PAGE_SIZE));
+            h.mm.free_page(seg + i * PAGE_SIZE);
+        }
+        assert_eq!(h.mm.free_count(), 256 - 2);
     }
 
     #[test]

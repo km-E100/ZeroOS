@@ -22,7 +22,20 @@ pub const DESC_ATTRIDX_NORMAL: u64 = 0 << 2;
 pub const DESC_ATTRIDX_DEVICE_NGNRE: u64 = 1 << 2;
 pub const DESC_UXN: u64 = 1 << 54;
 pub const DESC_PXN: u64 = 1 << 53;
+/// 软件 CoW 标记位（第十刀写时复制 fork）。
+///
+/// 选 bit11 的依据：stage-1 叶描述符里 bit11 硬件语义是 nG（非全局 TLB），
+/// 而本内核每次地址空间切换（arch::set_user_ttbr）都 `tlbi vmalle1`
+/// 全量刷新，TLB 条目从不跨切换存活 ⇒ nG 语义完全惰性，该位可安全
+/// 挪作软件私有。任务书建议的 bit9 与 SH[9:8] 字段重叠（会降级
+/// shareability），故弃用。
+///
+/// 纪律：仅叶子页描述符使用；clone 时父子双侧同时置位并把 AP 改只读，
+/// COW 断链（handle_cow_fault）时清除并恢复原 AP。
+pub const DESC_SW_COW: u64 = 1 << 11;
 pub const AP_SHIFT: u64 = 6;
+/// AP[2:1] 字段掩码：改 AP 必须整字段清再置，禁止手写位移散落各处。
+pub const AP_MASK: u64 = 0b11 << AP_SHIFT;
 /// AP[2:1]=0b00：EL1 读写、EL0 无权限（内核恒等映射/内核页）。
 pub const AP_EL1_RW_EL0_NONE: u64 = 0b00;
 /// AP[2:1] stage-1 编码（ARM ARM DDI 0487）：
@@ -82,6 +95,58 @@ pub fn make_leaf_descriptor(phys: u64, ap: u64, executable: bool) -> u64 {
         desc |= DESC_UXN;
     }
     desc
+}
+
+/// 叶子共享分类：clone_user_address_space 对每个有效叶的处置策略（纯函数，
+/// host 单测钉死判定矩阵；paging 侧按此分派）。
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LeafShareClass {
+    /// 真只读页（text/rodata，AP=0b11 且无 COW 位）：父子直接映射同一物理页，
+    /// 不复制、不打 COW 标记（配 retain_page 保命，防一方退出误回收）。
+    ReadOnlyDirect,
+    /// 可写来源页（AP=USER_AP_RW，或已是 COW 共享页——二次 fork 场景）：
+    /// 父子共享同一物理页，双侧 PTE 改只读 + DESC_SW_COW。
+    CowShare,
+    /// 其他 AP 编码（防御兜底，用户空间理论上不出现）：保持旧 eager 复制。
+    EagerCopy,
+}
+
+/// 判定一个有效叶描述符的克隆策略。
+pub fn classify_leaf(leaf: u64) -> LeafShareClass {
+    if true { return LeafShareClass::EagerCopy; } // BISECT-KILL-SWITCH (temporary)
+    let ap = (leaf >> AP_SHIFT) & 0b11;
+    if leaf & DESC_SW_COW != 0 {
+        // 已是 COW 共享页（fork 链上二次 fork）：继续传播共享标记。
+        return LeafShareClass::CowShare;
+    }
+    match ap {
+        // 注意 USER_AP_RW=0b01 才是 EL0 可写；0b00 是 EL1-only（内核页），
+        // 用户空间不该出现，出现则走兜底复制而非共享（防御）。
+        a if a == USER_AP_RW => LeafShareClass::CowShare,
+        a if a == USER_AP_RX => LeafShareClass::ReadOnlyDirect,
+        _ => LeafShareClass::EagerCopy,
+    }
+}
+
+/// 是否为带 CoW 标记的有效描述符（缺页路径的权威判定）。
+/// 调用契约：入参必须是 L3 叶子 PTE（handle_cow_fault 只对 L3 槽位调用），
+/// 因此这里只校验 VALID + 软件位，不再重复校验叶类型位。
+pub fn is_cow_leaf(desc: u64) -> bool {
+    desc & DESC_VALID != 0 && desc & DESC_SW_COW != 0
+}
+
+/// clone 共享化：把可写叶改成「同 PA、只读、COW 标记」。
+/// 保留原 PA / attr / AF / SH / UXN，仅重写 AP 字段并置软件位。
+pub fn cow_share_leaf(leaf: u64) -> u64 {
+    (leaf & !AP_MASK) | (USER_AP_RX << AP_SHIFT) | DESC_SW_COW
+}
+
+/// COW 断链：把 COW 叶恢复为指向 `new_pa` 的原始可写叶（清软件位）。
+/// UXN/attr 沿用旧描述符——断链只恢复写权限，不改执行权限。
+pub fn cow_break_leaf(cow_leaf: u64, new_pa: u64) -> u64 {
+    (cow_leaf & !(AP_MASK | DESC_SW_COW | PHYS_ADDR_MASK))
+        | (new_pa & PHYS_ADDR_MASK)
+        | (USER_AP_RW << AP_SHIFT)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -359,6 +424,74 @@ mod tests {
                 phys: 0x4100_3000,
             }
         );
+    }
+
+    // ── 第十刀 COW：纯函数判定矩阵 ─────────────────────────────
+
+    fn rw_leaf(pa: u64) -> u64 {
+        make_leaf_descriptor(pa, USER_AP_RW, false)
+    }
+
+    #[test]
+    fn classify_leaf_matrix() {
+        // 可写数据页 → 共享化
+        assert_eq!(classify_leaf(rw_leaf(0x5000_1000)), LeafShareClass::CowShare);
+        // 真只读 text 页（RX、无 COW 位）→ 直接映射
+        let text = make_leaf_descriptor(0x5000_2000, USER_AP_RX, true);
+        assert_eq!(classify_leaf(text), LeafShareClass::ReadOnlyDirect);
+        // 已 COW 页（fork 链二次 fork）→ 继续共享，即便 AP 已被改成 RX
+        assert_eq!(
+            classify_leaf(cow_share_leaf(rw_leaf(0x5000_3000))),
+            LeafShareClass::CowShare
+        );
+        // EL1-only AP（用户空间不应出现）→ 兜底 eager 复制
+        let kern = make_leaf_descriptor(0x5000_4000, AP_EL1_RW_EL0_NONE, false);
+        assert_eq!(classify_leaf(kern), LeafShareClass::EagerCopy);
+    }
+
+    #[test]
+    fn cow_share_preserves_everything_but_ap() {
+        let leaf = make_leaf_descriptor(0x5000_1000, USER_AP_RW, false);
+        let shared = cow_share_leaf(leaf);
+        // PA 原样（PA 必须页对齐，PHYS_ADDR_MASK 不含低 12 位属性）
+        assert_eq!(shared & PHYS_ADDR_MASK, 0x5000_1000);
+        // AP 变只读（EL0+EL1 均 RO）
+        assert_eq!((shared >> AP_SHIFT) & 0b11, USER_AP_RX);
+        // 软件 COW 位已置
+        assert!(is_cow_leaf(shared));
+        // UXN / AF / SH / attridx 与原描述符一致
+        for mask in [DESC_UXN, DESC_AF, DESC_SH_INNER, DESC_ATTRIDX_NORMAL] {
+            assert_eq!(shared & mask, leaf & mask);
+        }
+    }
+
+    #[test]
+    fn cow_share_is_idempotent() {
+        let once = cow_share_leaf(rw_leaf(0x6000_0000));
+        let twice = cow_share_leaf(once);
+        assert_eq!(once, twice, "二次 fork 必须幂等（fork 链场景）");
+    }
+
+    #[test]
+    fn cow_break_restores_writable_and_swaps_pa() {
+        let shared = cow_share_leaf(make_leaf_descriptor(0x7000_0000, USER_AP_RW, false));
+        let broken = cow_break_leaf(shared, 0x8000_9000);
+        assert_eq!(broken & PHYS_ADDR_MASK, 0x8000_9000);
+        assert_eq!((broken >> AP_SHIFT) & 0b11, USER_AP_RW);
+        assert!(!is_cow_leaf(broken), "断链必须清软件位");
+        // 执行权限沿用旧描述符（本例原页可执行位为不可执行）
+        assert_eq!(broken & DESC_UXN, shared & DESC_UXN);
+    }
+
+    #[test]
+    fn is_cow_leaf_rejects_non_cow_and_invalid() {
+        // 真·只读 text 页不是 COW 页（写它必须 SIGSEGV 而非断链）
+        assert!(!is_cow_leaf(make_leaf_descriptor(0x1000, USER_AP_RX, true)));
+        // 可写但未标记的普通页（spawn 初始态）不是 COW 页
+        assert!(!is_cow_leaf(make_leaf_descriptor(0x3000, USER_AP_RW, false)));
+        // 无效描述符不算
+        assert!(!is_cow_leaf(DESC_SW_COW));
+        assert_eq!(is_cow_leaf(make_table_descriptor(0x2000)), false);
     }
 
     #[test]
