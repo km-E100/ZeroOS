@@ -603,7 +603,21 @@ pub mod syscall {
         },
         /// (2) 派生子进程（返回子进程 PID）。
         Fork,
-        /// (3) 替换当前进程映像：`x1`=entry，`x2`=arg。
+        /// (3) 替换当前进程映像（第九刀 execve 最小完备版，**破坏性升级**，
+        /// 2026-08 冻结）：`x1`=name_ptr（rootfs 内路径），`x2`=name_len
+        /// （>0 且 ≤256），`x3`=arg（透传给新映像的 x2）。成功后控制流转向
+        /// 新 ELF 入口——本调用对调用方不再"返回"；失败返回错误码且旧映像
+        /// 完好（原子性）。新映像起步现场：x0/x1=bootfs 表首址/条目数、
+        /// x2=arg、x30=thread_exit（main 返回即 exit(0)，退出码可被父收集）；
+        /// 进程 pid / 族谱 / capabilities 保留——exec 换映像不换进程。
+        ///
+        /// 【语义冻结说明】旧「`x1`=entry 函数指针，`x2`=arg」伪 exec 语义
+        /// 废除：全仓库无调用方；双语义同号位存在编码歧义；且该语义不换
+        /// 地址空间、不加载 ELF（完整理由见内核 microkernel/src/syscalls.rs
+        /// 号位 3 臂）。内核行为：销毁旧地址空间 → map_user_elf_segments
+        /// 装载 → 切 TTBR0 → 重置 TrapFrame 跳 ELF 入口。下方字段名
+        /// `entry`/`arg` 为历史遗留命名（源兼容保留），现语义分别为
+        /// name_ptr / name_len。
         Exec {
             entry: ThreadEntry,
             arg: u64,

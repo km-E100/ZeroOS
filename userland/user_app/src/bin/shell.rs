@@ -1,9 +1,15 @@
 //! zero-shell —— 交互式用户态控制台（ELF 基址 0x200000，见 link-user.ld）。
 //!
-//! 全部 syscall 均在 0-20 号位内：`ConsoleWrite`(9)、`ConsoleRead`(6)、
+//! 全部 syscall 均在 0-22 号位内：`ConsoleWrite`(9)、`ConsoleRead`(6)、
 //! `Yield`(svc #1 快捷入口)、`Exit`(svc #2 快捷入口)、`SendMessage`(0)、
 //! `ReceiveMessage`(1)、`BlockRead`(7)/`BlockWrite`(8，仅 blktest
-//! 的 raw 扇区回环验证使用)。禁止 MMIO（用户态无 MMIO 权限）。
+//! 的 raw 扇区回环验证使用)、`Exec`(3，execdemo 经 fork 子进程使用)。
+//! 禁止 MMIO（用户态无 MMIO 权限）。
+//!
+//! 【exec 自检协议】本二进制同时是 execdemo 的重载目标：内核 exec 把调用方
+//! 透传值放在 x2——非 0 即"被 exec 启动的演示实例"，打印新地址空间证据行
+//! 后以该值作为退出码结束进程；x2=0 走正常交互主循环。详见 _start 与
+//! execdemo_command 注释。
 //!
 //! 入口参数（由内核 `set_initial_user_args` 提供）：
 //! - `x0` = bootfs 文件表首地址（`UserBootFs.entries_ptr`）
@@ -15,7 +21,7 @@
 
 use core::panic::PanicInfo;
 use userlib::{
-    console_read, console_write, encode_message, exit, extract_payload_text, wait_pid,
+    console_read, console_write, encode_message, exec, exit, extract_payload_text, wait_pid,
     wait_pid_flags, WAIT_NOHANG,
 };
 use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP};
@@ -45,6 +51,22 @@ pub unsafe extern "C" fn _start(a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
     while p < end {
         core::ptr::write_volatile(p, 0);
         p = p.add(1);
+    }
+
+    // ── exec 自检协议（execdemo 配套，见 execdemo_command 注释）──
+    // 内核 exec 把调用方透传值放在 x2：非 0 即"被 exec 启动的演示实例"
+    // ——打印新地址空间证据行后以该值为退出码结束，绝不进入交互主循环
+    // （否则 exec 出的子 shell 会与父 shell 抢终端）。正常引导与普通
+    // 重载 x2=0，走主循环。此分支运行在 exec 刚换上的全新地址空间里
+    // （全新页表 + 全新用户栈 + 重新映射的 bootfs），能打印即证明
+    // 地址空间更换成功。
+    if a2 != 0 {
+        print("[C] exec-image: fresh AS! bootfs=0x");
+        print_hex(a0);
+        print(" marker=");
+        print_u64(a2);
+        println("");
+        exit(a2 as i32);
     }
 
     // 内核以 x0-x3 传入启动参数（x0/x1 = bootfs 表地址/条目数）
@@ -85,7 +107,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"help" || cmd == b"?" {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
-            println("  process: forktest/waittest/nohangtest/orphantest/waitspec/pid");
+            println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/pid");
             println("  storage: fstest/blktest");
             println("  system: launchd/pid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
@@ -422,11 +444,14 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                     }
                 },
                 Err(e) => {
-                    print("[P] waitspec: fork A failed (");
+                    print("[P] waitspec: fork failed (");
                     print_hex(e.code());
                     println(")");
                 }
             }
+        } else if cmd == b"execdemo" {
+            // execve 端到端验证（第九刀）：真换地址空间。见 execdemo_command。
+            execdemo_command();
         } else if cmd == b"fstest" {
             // 端到端文件语义验证（第七刀）：经 launchd list 预检 fsd/
             // blkdrv 在线后，向 FS_REQ 发 open/create → write("ZERO-FSD")
@@ -470,6 +495,79 @@ fn delay_cycles(mut spin: u64) {
         }
         if spin % (1 << 22) == 0 {
             userlib::yield_now();
+        }
+    }
+}
+
+/// execdemo —— execve 端到端验证（第九刀）：证明号位 3 是**真换地址空间**
+/// 的 exec，而非旧版"重置帧跳函数指针"的伪 exec。
+///
+/// 流程：fork 出子进程 → 子进程打印旧映像证据行 → 子调
+/// exec("/Applications/Shell", 77)（内核销毁子进程旧地址空间、重新装载
+/// Shell ELF、切换 TTBR0、重置 TrapFrame）→ 新映像经 _start 的 exec 自检
+/// 协议（x2=77≠0）打印特征 banner 并 exit(77) → 父进程 wait_pid 收集退出码。
+///
+/// 三行证据链（缺一不可）：
+/// 1. "[C] execdemo: OLD image ..." —— 来自旧地址空间（exec 之前的代码）；
+/// 2. "[C] exec-image: fresh AS! ..." —— 只能来自新装入的 ELF 映射：
+///    这是全新页表 + 全新用户栈上的新实例；其 bootfs 映射地址必然不同于
+///    本命令运行前的 bootfs 地址（exec 构建新空间时旧空间尚未销毁，
+///    物理页不可能重叠）；
+/// 3. "[P] execdemo: collected ... code=77" —— pid 未变而映像已换，
+///    且 zombie/waitpid 状态机跨 exec 继续成立。
+fn execdemo_command() {
+    match userlib::fork() {
+        Ok(0) => {
+            // —— 子进程：旧映像内的最后遗言，随后彻底换血 ——
+            print("[C] execdemo: OLD image alive (pid=");
+            match userlib::getpid() {
+                Ok(p) => print_u64(p),
+                Err(e) => {
+                    print("syscall failed (");
+                    print_hex(e.code());
+                    print(")");
+                }
+            }
+            println("), execing /Applications/Shell");
+            // 成功即不返回：控制流已转向新映像入口。Err 分支里旧映像仍在，
+            // 报错后带码退出供父收集；若 exec 谎报成功返回（内核 bug），
+            // 兜底 exit(70) 防止跌回主循环造成双 shell 抢终端。
+            if let Err(e) = exec("/Applications/Shell", 77) {
+                print("[C] execdemo: exec failed (");
+                print_hex(e.code());
+                println(")");
+                exit(1);
+            }
+            exit(70);
+        }
+        Ok(child_pid) => {
+            print("[P] execdemo: forked child ");
+            print_u64(child_pid);
+            println("");
+            match wait_pid(child_pid) {
+                Ok((pid, code)) => {
+                    print("[P] execdemo: collected pid=");
+                    print_u64(pid);
+                    print(" code=");
+                    print_i32(code);
+                    println("");
+                    if pid == child_pid && code == 77 {
+                        println("[P] execdemo: PASS - address space truly replaced");
+                    } else {
+                        println("[P] execdemo: FAIL (unexpected pid/code)");
+                    }
+                }
+                Err(e) => {
+                    print("[P] execdemo: wait failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        }
+        Err(e) => {
+            print("[P] execdemo: fork failed (");
+            print_hex(e.code());
+            println(")");
         }
     }
 }

@@ -159,6 +159,19 @@ pub fn fork() -> Result<u64, SysError> {
     decode_result(ret)
 }
 
+/// 替换当前进程映像为 rootfs 内 `path` 指向的 ELF（号位 3，POSIX exec 最小集）。
+///
+/// - **成功不返回**：内核销毁当前地址空间、装入新 ELF 并把控制流转向其
+///   入口；新映像以 `x0`=bootfs 表首址、`x1`=条目数、`x2`=`arg` 起步。
+///   配合 [`fork`] 即可实现"换程序不换 pid"（execdemo 模式）。
+/// - 失败返回 `Err`：旧映像完好无损，调用方可原地继续（原子性）。
+/// - `path` 必须是 rootfs 已登记文件：未登记返回 `NotFound`；已登记但
+///   非合法 ELF 返回 `InvalidArgument`。
+pub fn exec(path: &str, arg: u64) -> Result<(), SysError> {
+    let ret = svc_call(3, [path.as_ptr() as u64, path.len() as u64, arg, 0]);
+    decode_result(ret).map(|_| ())
+}
+
 /// 从控制台读取最多 `buffer.len()` 字节（号位 6）。
 ///
 /// - 成功返回**实际读取的字节数**（可能小于 `len`）。
