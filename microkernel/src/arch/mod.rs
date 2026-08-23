@@ -118,6 +118,17 @@ pub unsafe fn install_kernel_page_table(l1_phys: u64) {
     }
 }
 
+pub unsafe fn set_tpidr_el1(addr: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::set_tpidr_el1(addr);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = addr;
+    }
+}
+
 pub unsafe fn enable_interrupts() {
     #[cfg(target_arch = "aarch64")]
     {
@@ -150,5 +161,39 @@ pub unsafe fn enter_user_mode(
     {
         let _ = (aspace, tf);
         loop {}
+    }
+}
+
+/// 第十一刀 FPU 惰性保存：EC=0x07 断链装载 + eret 重放（仅 aarch64）。
+pub unsafe fn fpu_trap_replay(frame: *mut TrapFrame) -> ! {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fpu_trap_replay(frame)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = frame;
+        loop {}
+    }
+}
+
+/// 第十一刀 FPU 惰性保存：上下文切换点把 EL0 FP 访问压回陷阱门。
+pub fn fpu_set_lazy_gate() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fpu_set_lazy_gate();
+    }
+}
+
+/// 第十一刀 FPU 惰性保存：帧内 fpu 区作废前的活寄存器落账（execve）。
+pub fn fpu_discard_live(frame: *mut TrapFrame) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fpu_discard_live(frame);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = frame;
     }
 }

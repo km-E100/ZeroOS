@@ -859,6 +859,17 @@ pub mod syscall {
             /// 请求的新 break 虚拟地址；0 表示查询当前值。
             new_break: usize,
         },
+        /// 号位 25：Sleepticks——当前进程睡眠指定 timer tick 数（第十一刀）。
+        ///
+        /// - `x1` = 睡眠时长（tick 数，0 等价于让出一次调度）；
+        /// - 返回值 = 实际流逝的 tick 快照差（≥ 请求值；供实机断言
+        ///   "真睡眠不忙等"），失败返回 [`SysError`]；
+        /// - 睡眠期间进程 Blocked、不参与调度（对照 nanosleep 语义）；
+        /// - 定时器轮到期由 tick 中断唤醒，无忙等循环。
+        Sleepticks {
+            /// 睡眠时长（timer tick 数）。
+            ticks: u64,
+        },
     }
 
     /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。

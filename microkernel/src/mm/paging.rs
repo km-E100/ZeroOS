@@ -729,6 +729,12 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                         copied += 1;
                     }
                 }
+                // ⚠ 第十一刀锁域审计结论（并集保留）：本循环**不得**放行
+                // 中断——fork 的 syscall 路径依赖「内核全程屏蔽 IRQ ⇒
+                // syscall 原子」这一根基不变量；中途让出会被 tick 打断并
+                // 触发调度重入（实机抓获：子进程以未初始化现场启动）。
+                // 分块让出基础设施保留（SCHED_STARTED 安全闸 +
+                // chunk_yield_point），待未来引入内核抢占框架后重启。
             }
         }
     }

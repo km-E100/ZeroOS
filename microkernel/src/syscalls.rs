@@ -406,6 +406,21 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let caller_slot = crate::scheduler::current_slot();
             sys_brk(caller_slot, new_break as u64)
         }
+        // ═══ 号位 25：Sleepticks（第十一刀）═════════════════════════
+        // ticks==0 同步返回 0（纯查询语义，不进睡眠队列）；否则注册
+        // 睡眠项并 block（noreturn），唤醒侧回写 elapsed 到陷阱帧 x0。
+        Syscall::Sleepticks { ticks } => {
+            if ticks == 0 {
+                Ok(0)
+            } else {
+                // 上限防御：单次睡眠 ≤ 2^32 tick，防 u64 溢出与
+                // 「永久睡死」类滥用；超限拒绝而非截断（语义诚实）。
+                if ticks > (1u64 << 32) {
+                    return Err(SysError::InvalidArgument);
+                }
+                crate::scheduler::sleep_current(ticks)
+            }
+        }
         // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
         // 有活子未退则挂起（登记精确等待目标 wait_target + block_current，
         // 仅匹配目标的子退出才由其 Exit 路径写父 TrapFrame 并 wake——

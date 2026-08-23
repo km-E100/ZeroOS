@@ -90,6 +90,16 @@ __vector_table:\n\
          // EL1 访问 TPIDR_EL0 无条件允许。\n\
          mrs x17, tpidr_el0\n\
          str x17, [x16, #280]\n\
+         // FPU/NEON 惰性保存门控（第十一刀）：仅当活寄存器归属本帧用户\n\
+         // （FPU_DIRTY == frame.owner_slot）才急切保存——同进程 syscall\n\
+         // 往返的现场保全；否则跳过（非 FP 用户零开销；他人现场由断链\n\
+         // 路径 fpu_trap_replay 落账）。FPEN=0b01 下 EL1 的 stp/mrs 不陷阱。\n\
+         // ⚠ 二分排查 C：完整门控复现（读+比较+b.ne 跳过保存）。
+         ldr x17, =FPU_DIRTY\n\
+         ldr x15, [x16, #816]\n\
+         ldr x17, [x17]\n\
+         cmp x15, x17\n\
+         b.ne 90\\@f\n\
          // FPU/NEON 全量急切保存：#288..#799 = v0-v31，#800/#804 = FPSR/\n\
          // FPCR。v 寄存器独立于 x16/x17 暂存方案，零冲突；内核不使用 FP\n\
          // => 存根此刻的 v 寄存器仍是用户现场原值（约定见 process::FpuState）。\n\
@@ -116,6 +126,7 @@ __vector_table:\n\
          str w17, [x16, #800]\n\
          mrs x17, fpcr\n\
          str w17, [x16, #804]\n\
+         90\\@:\n\
          mov x0, x16\n\
          mov x1, #\\kind\n\
          bl __zero_trap_handler\n\
@@ -162,24 +173,27 @@ pub fn init(_boot_info: &BootInfo) {
             ttbr1
         );
 
-        // ── FPU/NEON 使能（第八刀：执行域状态保存补全）──────────────
-        // CPACR_EL1.FPEN[21:20] = 0b11：EL0/EL1 的 FP/SIMD 访问不再陷阱。
-        // 必须先于 VBAR 安装执行：此后每次异常入口存根都会 stp q*/mrs
-        // fpsr/fpcr，若 FPEN=00 这些指令自身同步异常、直接打穿内核。
-        // 此前 FPEN 保持复位值 0b00 ⇒ 用户态碰 FP 要么 EC=0x07 同步异常，
-        // 要么（即便使能了）现场不保存而互踩——本处 + TrapFrame 扩展 +
-        // 存根急切保存三件套一并闭环。
+        // ── FPU/NEON 使能（第八刀引入；第十一刀升级为惰性保存）──────
+        // CPACR_EL1.FPEN[21:20] = 0b01：EL0 的 FP/SIMD 访问陷阱
+        // （EC=0x07 → fpu_trap_replay 断链装载后重放），EL1 内核访问
+        // 不陷阱——入口存根/断链路径的 stp q*/ldp q* 因此可自由执行。
+        // 必须先于 VBAR 安装执行。
         //
-        // 内核态浮点使用约定：内核代码不持有跨调度点的 FP/SIMD 状态
-        // （core/alloc 无浮点；softfloat 目标不向量化），故无需内核侧
-        // 保存/惰性切换。未来优化路径（lazy save）：FPEN=0b01 令 EL0 首
-        // 次访问 FP 时陷阱，此时才把 v 区换入帧并置 FPEN=0b11 —— 见
-        // process::FpuState 头注。
+        // 惰性协议（对照 Linux switch_to_fpu）：
+        // * FPU_DIRTY = 活寄存器当前归属的用户槽位（u64::MAX = 无主）；
+        // * 异常入口：FPU_DIRTY == frame.owner_slot 才急切保存（同进程
+        //   syscall 往返的现场保全），否则跳过——非 FP 用户零开销；
+        // * eret 前（restore_context）：**从不**主动装载 frame.fpu，仅
+        //   保持 FPEN=0b01，用户首条 FP/SIMD 指令经陷阱断链装载；
+        // * 断链（fpu_trap_replay）：旧属主现场落回其帧 → 装载本人帧 →
+        //   记 FPU_DIRTY → eret 重放；活寄存器本属本人则直接重放。
+        // * execve/init_user 等重置帧内 fpu 区的路径必须同时 fpu_disown，
+        //   防止「帧已新、寄存器还旧」被 dirty==owner 误判为新鲜。
         let mut cpacr: u64;
         asm!("mrs {}, cpacr_el1", out(reg) cpacr);
-        cpacr |= 0b11 << 20;
+        cpacr = (cpacr & !(0b11u64 << 20)) | (0b01u64 << 20);
         asm!("msr cpacr_el1, {}", in(reg) cpacr);
-        crate::info!("arch/aarch64: CPACR_EL1.FPEN=0b11 (EL0 FP/SIMD enabled)");
+        crate::info!("arch/aarch64: CPACR_EL1.FPEN=0b01 (EL0 FP lazy-trap enabled)");
 
         asm!("msr SPSel, #1", options(nostack, preserves_flags));
         set_vector_base(&__vector_table as *const _ as usize);
@@ -218,6 +232,151 @@ pub fn init(_boot_info: &BootInfo) {
 #[inline(always)]
 pub unsafe fn switch_to(next: *mut Context) -> ! {
     restore_context(next)
+}
+
+// ═══ 第十一刀：FPU/NEON 惰性保存 ═══════════════════════════════════
+//
+// 协议总纲见 arch::init 的 FPEN 注释。本模块职责：
+// * FPU_DIRTY——活寄存器属主记账（入口存根与 restore_context 以
+//   adrp 直达该符号做门控判定，故必须 #[no_mangle] 平铺 u64）；
+// * fpu_trap_replay——EC=0x07 断链：偷取链落账 + 本人装载 + 重放；
+// * fpu_disown——帧内 fpu 区被重置（execve/init_user）时切断
+//   「寄存器=帧」的等式，防止陈旧寄存器被误认为新鲜现场。
+
+/// 活 FP 寄存器当前归属的槽位号；`FPU_OWNER_NONE` 表示无主/内核。
+#[no_mangle]
+pub static FPU_DIRTY: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(FPU_OWNER_NONE);
+pub const FPU_OWNER_NONE: u64 = u64::MAX;
+
+use core::sync::atomic::Ordering::Relaxed;
+
+/// 帧内 fpu 区被整体重置前调用（execve 换映像）：若活寄存器尚押着
+/// 本进程现场则先落回帧内（随后被调用方覆写为干净初值），并切断
+/// 「活寄存器=帧」归属等式。⚠ 只允许对当前进程自己的帧调用——
+/// 全局 dirty 记账描述的是活寄存器，动他人帧不得碰它。
+pub fn fpu_discard_live(frame: *mut Context) {
+    if let Some(slot) = crate::scheduler::current_slot_opt() {
+        unsafe {
+            if FPU_DIRTY.load(Relaxed) == slot as u64
+                && (*frame).owner_slot == slot as u64
+            {
+                // 先落账再作废：保证「dirty==owner ⇒ 帧=寄存器快照」
+                // 不变式在任何观察点成立。
+                asm_save_fpu_into(frame as *const u8);
+            }
+        }
+    }
+    FPU_DIRTY.store(FPU_OWNER_NONE, Relaxed);
+}
+
+/// EC=0x07（EL0 首用 FP/SIMD 或被偷取后的再次首用）断链入口：
+/// 装载本人帧内现场到活寄存器并 eret 重放同一条指令。noreturn。
+///
+/// # 安全契约
+/// * frame 必须是当前进程的陷阱帧（owner_slot 已由 restore_context 武装）；
+/// * 仅允许 EL0 发起（trap.rs 已校验 SPSR.M）；
+/// * FPEN=0b01 保证 EL1 侧 stp q*/mrs fpsr 自由执行、EL0 触发陷阱。
+pub unsafe fn fpu_trap_replay(frame: *mut Context) -> ! {
+    let slot = crate::scheduler::current_slot_opt()
+        .expect("fpu trap outside any process context");
+    let owner = (*frame).owner_slot;
+    debug_assert_eq!(owner, slot as u64, "fpu trap on un-armed frame");
+    if FPU_DIRTY.load(Relaxed) != slot as u64 {
+        // 偷取链收尾：若活寄存器还押着旧属主的现场，先替它落回其帧，
+        // 再装载本人现场（对照 Linux fpsimd_thread_switch 的 save 链）。
+        let dirty = FPU_DIRTY.load(Relaxed);
+        if dirty != FPU_OWNER_NONE && (dirty as usize) < crate::process::MAX_PROCESSES {
+            let old = crate::process::trap_frame(dirty as usize);
+            asm_save_fpu_into(old as *const u8);
+        }
+        asm_load_fpu_from(frame as *const u8);
+        FPU_DIRTY.store(slot as u64, Relaxed);
+    } else {
+        // 活寄存器本就是本人现场（dirty==owner）：无需搬运。
+    }
+    fpu_arm_full_access();
+    // 活寄存器已确保为本人现场且 EL0 FP 已放行，eret 重放同一条指令。
+    crate::arch::restore_frame(frame)
+}
+
+/// FPEN ← 0b11（EL0/EL1 全放行）：断链装载完成后调用——否则重放的
+/// 用户 FP 指令在 0b01 门下永远再陷阱（实机：launchd 静默卡死）。
+pub fn fpu_arm_full_access() {
+    unsafe {
+        let mut cpacr: u64;
+        asm!("mrs {}, cpacr_el1", out(reg) cpacr);
+        cpacr = (cpacr & !(0b11u64 << 20)) | (0b11u64 << 20);
+        asm!("msr cpacr_el1, {}", in(reg) cpacr);
+    }
+}
+
+/// FPEN ← 0b01（EL1 自由、EL0 陷阱）：eret 进用户态前的门位。
+pub fn fpu_set_lazy_gate() {
+    unsafe {
+        let mut cpacr: u64;
+        asm!("mrs {}, cpacr_el1", out(reg) cpacr);
+        cpacr = (cpacr & !(0b11u64 << 20)) | (0b01u64 << 20);
+        asm!("msr cpacr_el1, {}", in(reg) cpacr);
+    }
+}
+
+/// 把活寄存器 v0-v31/FPSR/FPCR 写入 `base` 帧的 fpu 区（#288 偏移）。
+/// 仅在断链路径调用：FPEN=0b01 下 EL1 执行不受限。
+unsafe fn asm_save_fpu_into(base: *const u8) {
+    asm!(
+        "stp q0, q1, [{0}, #288]",
+        "stp q2, q3, [{0}, #320]",
+        "stp q4, q5, [{0}, #352]",
+        "stp q6, q7, [{0}, #384]",
+        "stp q8, q9, [{0}, #416]",
+        "stp q10, q11, [{0}, #448]",
+        "stp q12, q13, [{0}, #480]",
+        "stp q14, q15, [{0}, #512]",
+        "stp q16, q17, [{0}, #544]",
+        "stp q18, q19, [{0}, #576]",
+        "stp q20, q21, [{0}, #608]",
+        "stp q22, q23, [{0}, #640]",
+        "stp q24, q25, [{0}, #672]",
+        "stp q26, q27, [{0}, #704]",
+        "stp q28, q29, [{0}, #736]",
+        "stp q30, q31, [{0}, #768]",
+        "mrs {1}, fpsr",
+        "str {1:w}, [{0}, #800]",
+        "mrs {1}, fpcr",
+        "str {1:w}, [{0}, #804]",
+        in(reg) base,
+        out(reg) _,
+        options(nostack)
+    );
+}
+
+/// 从 `base` 帧的 fpu 区（#288 偏移）装载 v0-v31/FPSR/FPCR 到活寄存器。
+unsafe fn asm_load_fpu_from(base: *const u8) {
+    asm!(
+        "ldp q0, q1, [{0}, #288]",
+        "ldp q2, q3, [{0}, #320]",
+        "ldp q4, q5, [{0}, #352]",
+        "ldp q6, q7, [{0}, #384]",
+        "ldp q8, q9, [{0}, #416]",
+        "ldp q10, q11, [{0}, #448]",
+        "ldp q12, q13, [{0}, #480]",
+        "ldp q14, q15, [{0}, #512]",
+        "ldp q16, q17, [{0}, #544]",
+        "ldp q18, q19, [{0}, #576]",
+        "ldp q20, q21, [{0}, #608]",
+        "ldp q22, q23, [{0}, #640]",
+        "ldp q24, q25, [{0}, #672]",
+        "ldp q26, q27, [{0}, #704]",
+        "ldp q28, q29, [{0}, #736]",
+        "ldp q30, q31, [{0}, #768]",
+        "ldr w16, [{0}, #800]",
+        "msr fpsr, x16",
+        "ldr w16, [{0}, #804]",
+        "msr fpcr, x16",
+        in(reg) base,
+        options(nostack)
+    );
 }
 
 #[inline(always)]
@@ -283,6 +442,12 @@ unsafe fn set_vector_base(vbar: usize) {
     );
 }
 
+/// 直接改写 TPIDR_EL1（第十一刀：idle 切到 scratch 帧）。
+#[inline(always)]
+pub unsafe fn set_tpidr_el1(addr: usize) {
+    asm!("msr tpidr_el1, {0}", in(reg) addr, options(nostack));
+}
+
 pub unsafe fn enable_interrupts() {
     asm!("msr daifclr, #0xf", options(nostack));
 }
@@ -314,6 +479,19 @@ pub unsafe fn enter_user_mode(_aspace: &AddressSpace, tf: *const Context) -> ! {
 }
 
 pub unsafe fn restore_context(frame: *mut Context) -> ! {
+    let rc_slot = crate::scheduler::current_slot_opt();
+    // 第十一刀：武装帧属主——入口存根的惰性保存门控以
+    // 「FPU_DIRTY == frame.owner_slot」判定，本函数是唯一 eret 进
+    // 用户态的必经之路（enter_user_mode / switch_to 均汇聚于此），
+    // 故属主写入点单点闭环。current_slot 此刻已指向目标进程。
+    (*frame).owner_slot = rc_slot
+        .map(|s| s as u64)
+        .unwrap_or(FPU_OWNER_NONE);
+    // ⚠ 惰性门位不在本函数调整（第十一刀排障结论）：restore_context
+    // 同时服务「切换入」与「断链重放」两条路——此处若压回 01 门，
+    // 重放的正是那条用户 FP 指令，会立刻再陷阱成死循环。门位由
+    // 调度器在真正的上下文切换点（dispatch）统一下调，见
+    // scheduler::dispatch → fpu_set_lazy_gate。
     asm!(
         // TPIDR_EL1 := 帧指针 —— 异常入口存根靠它零成本定位保存目标。
         // 必须在任何 eret 前生效；x21 此刻仍持有 frame。
@@ -326,31 +504,15 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
          msr elr_el1, x16
          ldr x16, [x20, #264]
          msr spsr_el1, x16
-         // 用户 TLS（TPIDR_EL0）与 FPU 全量恢复 —— 与入口存根严格对称：
-         // 存根保存什么，这里就装回什么，否则跨切换的执行域状态静默漂移。
+         // 用户 TLS（TPIDR_EL0）—— 与入口存根对称保存。
          // x16 作暂存（随后被 ldp x16, x17 从帧内覆盖，无副作用）。
          ldr x16, [x20, #280]
          msr tpidr_el0, x16
-         ldp q0, q1, [x20, #288]
-         ldp q2, q3, [x20, #320]
-         ldp q4, q5, [x20, #352]
-         ldp q6, q7, [x20, #384]
-         ldp q8, q9, [x20, #416]
-         ldp q10, q11, [x20, #448]
-         ldp q12, q13, [x20, #480]
-         ldp q14, q15, [x20, #512]
-         ldp q16, q17, [x20, #544]
-         ldp q18, q19, [x20, #576]
-         ldp q20, q21, [x20, #608]
-         ldp q22, q23, [x20, #640]
-         ldp q24, q25, [x20, #672]
-         ldp q26, q27, [x20, #704]
-         ldp q28, q29, [x20, #736]
-         ldp q30, q31, [x20, #768]
-         ldr w16, [x20, #800]
-         msr fpsr, x16
-         ldr w16, [x20, #804]
-         msr fpcr, x16
+         // ── FPU 惰性恢复（第十一刀）：eret 前从不主动装载 frame.fpu，
+         // 也不改写 FPU_DIRTY——活寄存器保持旧属主状态，用户首条
+         // FP/SIMD 指令触发 EC=0x07 → fpu_trap_replay 断链装载后重放。
+         // 非 FP 用户从此彻底零 FPU 开销；FP 用户跨切换只付一次陷阱。
+         // （FPEN=0b01 由 arch::init 置定：EL1 自由、EL0 陷阱。）
          ldp x0, x1, [x20, #0]
          ldp x2, x3, [x20, #16]
          ldp x4, x5, [x20, #32]
