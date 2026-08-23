@@ -56,7 +56,10 @@ cargo test --manifest-path microkernel/mm-host-tests/Cargo.toml   # MM 算法 26
 # 槽位约定：virtio-mmio-bus.0 @0x0A000000 = virtio-blk0，GIC INTID 48。
 
 # a) 一键脚本：交互串口 mon:stdio，可直接操作 shell（Ctrl-A X 退出）
-./run-qemu.sh
+./run-qemu.sh              # 正常模式
+./run-qemu.sh recovery     # 恢复模式（-boot d，与 xtask run recovery 同参）
+# 挂盘固定 cache=writethrough：writeback 下宿主 QEMU 被 SIGKILL 会整批丢失
+# 未落盘的 guest 写入，fstest「跨重启再读仍 MATCH」的持久化判定就不可信了。
 
 # b) xtask run：串口写入 target/qemu-run.log，适合脚本化验收
 cargo run -p xtask -- run              # 正常模式（自动建盘+挂盘）
@@ -69,13 +72,13 @@ qemu-system-aarch64 \
   -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
   -serial mon:stdio -display none \
   -cdrom target/zero-os.iso \
-  -drive if=none,file=target/disk.img,format=raw,id=zdisk \
+  -drive if=none,file=target/disk.img,format=raw,id=zdisk,cache=writethrough \
   -device virtio-blk-device,drive=zdisk,bus=virtio-mmio-bus.0
 
 # ── 5. 实机验收清单（启动约 12 秒出 zero> 提示符）──────────────────
 # 开机自动拉起四个 EL0 服务：launchd / fsd / blkdrv / securityd。
 # 逐项在 shell 里验证：
-help                # 命令总览（含 forktest/waittest/nohangtest/orphantest/fstest）
+help                # 命令总览（分组输出：process / storage / system 三组）
 pid                 # GetPid 系统调用（应返回当前 shell pid）
 forktest            # fork 端到端：父子双行 [P]/[C]，子 getpid 与父打印一致
 waittest            # zombie→waitpid 收集：collected pid=N code=42
@@ -84,14 +87,16 @@ orphantest          # 四代孤儿链：收尸→AdoptToInit→防御回收，�
 launchd list        # fsd/blkdrv/securityd 应为 [running] pid=N
 fstest              # 文件服务端到端：open→write→close→reopen→read 比对 MATCH
                     #   （跨重启再跑一次仍 MATCH = 卷持久化生效）
+blktest             # raw 块直通验证：号位 7/8 写 LBA 60000 特征图案→读回比对 PASS
+                    #   （绕过 fsd；<40000 的 LBA 会拒绝执行以保护 fsd 卷保留区）
 launchd status      # launchd up; services registered=N
 
-# 脚本化冒烟（串口注入，~30 秒出全部结果）：
-( sleep 16; printf 'launchd list\r'; sleep 2; printf 'forktest\r'; sleep 2; \
-  printf 'fstest\r'; sleep 4 ) \
-  | qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 \
-    -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
-    -serial mon:stdio -display none -cdrom target/zero-os.iso > /tmp/smoke.log 2>&1 &
+# 脚本化验收（固化序列，CI 与人工回归共用）：
+#   scripts/acceptance.sh              # 全链：build-iso → 启动 → 串口注入
+#                                      #   launchd list/forktest/blktest/fstest
+#                                      #   → grep 判定 → 摘要 + 退出码
+#   scripts/acceptance.sh --no-build   # 复用现有 ISO 的快速回归（实机段 ~50 秒）
+# 日志落在 target/acceptance-serial.log；任一项失败会回放日志末尾辅助定位。
 
 # ── 6. 关键机制备忘 ─────────────────────────────────────────────
 # * UEFI Loader：默认 0 秒直进系统；连续失败 3 次自动切恢复模式。

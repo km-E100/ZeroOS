@@ -2,7 +2,8 @@
 //!
 //! 全部 syscall 均在 0-20 号位内：`ConsoleWrite`(9)、`ConsoleRead`(6)、
 //! `Yield`(svc #1 快捷入口)、`Exit`(svc #2 快捷入口)、`SendMessage`(0)、
-//! `ReceiveMessage`(1)。禁止 MMIO（用户态无 MMIO 权限）。
+//! `ReceiveMessage`(1)、`BlockRead`(7)/`BlockWrite`(8，仅 blktest
+//! 的 raw 扇区回环验证使用)。禁止 MMIO（用户态无 MMIO 权限）。
 //!
 //! 入口参数（由内核 `set_initial_user_args` 提供）：
 //! - `x0` = bootfs 文件表首地址（`UserBootFs.entries_ptr`）
@@ -82,7 +83,11 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("bye");
             break;
         } else if cmd == b"help" || cmd == b"?" {
-            println("commands: help info echo whoami pid forktest waittest nohangtest orphantest fstest clear history launchd exit");
+            // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
+            println("commands:");
+            println("  process: forktest/waittest/nohangtest/orphantest/pid");
+            println("  storage: fstest/blktest");
+            println("  system: launchd/pid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
@@ -339,6 +344,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             // blkdrv 在线后，向 FS_REQ 发 open/create → write("ZERO-FSD")
             // → read 回读比对 → close 序列，逐步打印结果。
             fstest_command();
+        } else if cmd == b"blktest" || cmd.starts_with(b"blktest ") {
+            // raw 块设备端到端验证：号位 7/8 内核直通（绕过 fsd 卷语义）。
+            blktest_command(cmd);
         } else if cmd == b"clear" {
             // ANSI：清屏 + 光标归位
             let _ = console_write(b"\x1b[2J\x1b[H");
@@ -674,6 +682,123 @@ fn print_fs_fail(step: &str, code: u32) {
     print(reason);
     println(")");
     println("fstest: FAIL");
+}
+
+/// blktest —— raw 块设备读写端到端验证（号位 7/8 内核直通，**绕过 fsd**）。
+///
+/// 序列：构造 512 字节特征图案 → block_write 写入 → block_read 读回 →
+/// 逐字节比对 → 打印 PASS / MISMATCH。每一步失败都友好打印后返回，
+/// 绝不 panic（panic_handler 只是最后防线）。
+///
+/// 选址纪律：默认 LBA 60000。测试盘 32MiB = 65536 扇区，尾段 5500+ 扇区
+/// 是天然安全带；而低地址区域住着内核自检(@2048)、userdb(@4096)、fsd
+/// 超级块(@8192)与数据区(@16384 起)。`blktest <lba>` 允许指定其他扇区，
+/// 但低于 40000 的一律拒绝执行——raw 写入毁掉 fsd 卷可就不好玩了。
+fn blktest_command(cmd: &[u8]) {
+    const SECTOR: usize = 512;
+    /// fsd 卷保留区安全上界（《编译打包命令.txt》LBA 保留地图 + 裕量）。
+    const MIN_SAFE_LBA: u64 = 40_000;
+    /// 默认扇区：32MiB 测试盘尾段安全带。
+    const DEFAULT_LBA: u64 = 60_000;
+
+    // ---- 参数解析：blktest [lba]（十进制）----
+    let lba = if cmd == b"blktest" {
+        DEFAULT_LBA
+    } else {
+        match parse_u64(&cmd[8..]) {
+            Some(v) if v >= MIN_SAFE_LBA => v,
+            Some(_) => {
+                println("blktest: refused: LBA < 40000 overlaps the fsd volume region");
+                return;
+            }
+            None => {
+                println("usage: blktest [lba]   (decimal; default 60000; must be >= 40000)");
+                return;
+            }
+        }
+    };
+
+    print("blktest: raw sector round-trip at LBA=");
+    print_u64(lba);
+    println(" (direct syscall 7/8, bypasses fsd)");
+
+    // ---- 1) 构造特征图案并写入 ----
+    let mut wbuf = [0u8; SECTOR];
+    fill_block_pattern(&mut wbuf, lba);
+    print("[1/3] write 512-byte signature pattern: ");
+    if let Err(e) = userlib::block_write(lba, &wbuf) {
+        print_block_fail("write", e);
+        return;
+    }
+
+    // ---- 2) 读回 ----
+    let mut rbuf = [0u8; SECTOR];
+    print("[2/3] read back: ");
+    if let Err(e) = userlib::block_read(lba, &mut rbuf) {
+        print_block_fail("read", e);
+        return;
+    }
+
+    // ---- 3) 逐字节比对 ----
+    print("[3/3] compare: ");
+    match (0..SECTOR).find(|&i| rbuf[i] != wbuf[i]) {
+        None => {
+            println("identical");
+            println("blktest: PASS - raw block write/read round-trip verified");
+        }
+        Some(off) => {
+            print("MISMATCH at offset ");
+            print_u64(off as u64);
+            print(" (expected 0x");
+            print_hex(wbuf[off] as u64);
+            print(", got 0x");
+            print_hex(rbuf[off] as u64);
+            println(")");
+            println("blktest: FAIL - data did not survive the round trip");
+        }
+    }
+}
+
+/// blktest 单步失败统一打印：错误名 + 编码 + 排查提示，然后返回。
+fn print_block_fail(step: &str, e: SysError) {
+    print("failed (");
+    print(e.as_str());
+    print(" code=0x");
+    print_hex(e.code());
+    println(")");
+    if e == SysError::DeviceError {
+        println("blktest: hint: is the virtio-blk test disk attached? (./run-qemu.sh mounts target/disk.img)");
+    }
+    print("blktest: FAIL at ");
+    print(step);
+    println(" step");
+}
+
+/// 生成确定性特征图案：8 字节魔数 "ZEROBLK1" + 小端 LBA +
+/// 位置相关伪随机体（比对时以同一函数重算期望值，不依赖读缓冲自身）。
+fn fill_block_pattern(buf: &mut [u8], lba: u64) {
+    buf[..8].copy_from_slice(b"ZEROBLK1");
+    buf[8..16].copy_from_slice(&lba.to_le_bytes());
+    let mut acc = (lba as u32) ^ 0xDEAD_BEEF;
+    for byte in buf.iter_mut().skip(16) {
+        acc = acc.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (acc >> 24) as u8;
+    }
+}
+
+/// 十进制无符号解析（blktest 参数用；空串/非数字/溢出返回 None）。
+fn parse_u64(text: &[u8]) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &b in text {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(value)
 }
 
 fn read_line(buf: &mut [u8]) -> usize {
