@@ -124,6 +124,10 @@ fn build_kernel_bare(sh: &Shell) -> Result<()> {
 /// 产物，缺了这步会用仓库里的陈旧 blob（或缺失时回退旧文件），源码
 /// 改动就会"神秘失效"。
 fn build_baremetal_blobs(sh: &Shell) -> Result<()> {
+    // 第十~十三刀集成修复：zero-shell 纳入自动构建。此前 sync 在
+    // debug/zero-shell 缺失时静默回退仓库旧 blob——shell 源码改动
+    // "神秘失效"（本刀 sleepdemo/secdemo 联调时实机踩坑）。
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
     // 第七刀：fsd（块后端卷文件服务）与 blkdrv（直通块设备服务）。

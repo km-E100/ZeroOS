@@ -78,12 +78,14 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
   printf 'guest\r';        sleep 3
   printf 'whoami\r';       sleep 2
   printf 'sessions\r';     sleep 2
+  printf 'sleepdemo\r';    sleep 8
   printf 'forktest\r';     sleep 5
   # ⚠ blktest 暂缓注入：第八刀 bef2ce9 对号位 7/8 收权（需
   #   CAP_BLOCK_DEV）后，无位 shell 的 raw 直通被正确拒绝——这是收权的
   #   预期效果而非缺陷；blktest 需要持位进程或专用授权路径，留待后续
   #   刀次决策后恢复。fstest 不受影响（fsd/blkdrv 静态持有该位）。
   printf 'fstest\r';       sleep 14
+  printf 'fsdemo\r';       sleep 14
 } | qemu-system-aarch64 \
     -machine virt \
     -cpu cortex-a72 \
@@ -128,6 +130,8 @@ check "sessions"         "sid=2 leader="
 check "forktest"         "forktest: collected pid="
 check "blktest"          "blktest: PASS"
 check "fstest"           "fstest: PASS"
+check "sleepdemo"        "sleepdemo: PASS (sleep/wake + frame writeback)"
+check "fsdemo"           "fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)"
 echo "--------------------------"
 total=$((pass + fail))
 if [[ $fail -eq 0 ]]; then
