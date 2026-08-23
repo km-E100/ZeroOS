@@ -71,9 +71,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 项目目录体积上限（MB）。超过后一切构建命令前置拒绝——
-/// 磁盘写满会产生截断的 ISO 与静默损坏的产物（实机踩坑两次）。
-const SIZE_LIMIT_MB: u64 = 2048;
+/// 项目目录体积上限（MB）。用户设定 2GB±1GB：峰值构建需要 ~2.3GB，
+/// 取 3072MB（3GB）为硬闸。超限后一切构建命令前置拒绝。
+const SIZE_LIMIT_MB: u64 = 3072;
 
 fn enforce_size_limit(sh: &Shell) -> Result<()> {
     let out = cmd!(sh, "du -sm .").read()?;
@@ -92,21 +92,14 @@ fn enforce_size_limit(sh: &Shell) -> Result<()> {
 
 fn purge(sh: &Shell) -> Result<()> {
     let root = sh.current_dir();
-    for rel in [
-        "target/iso",
-        "target/zero-os.iso",
-        "target/zero-rootfs.img",
-        "target/disk.img",
-        "target/debug/incremental",
-        "target/aarch64-unknown-none/debug/incremental",
-        "target/aarch64-unknown-none/release/incremental",
-        "target/aarch64-unknown-uefi/debug/incremental",
-        "target/aarch64-unknown-uefi/release/incremental",
-    ] {
-        let p = root.join(rel);
+    // 深度清理：除 target 整树外，连带各 worktree 的构建目录（它们共享
+    // 磁盘预算；worktree 本体与分支保留）。
+    let _ = cmd!(sh, "rm -rf target/iso target/zero-os.iso target/zero-rootfs.img target/disk.img target/rootfs.bundle target/rootfs-recovery.bundle target/release target/aarch64-unknown-uefi target/aarch64-unknown-none/debug/incremental target/aarch64-unknown-none/release/incremental target/aarch64-unknown-uefi/debug/incremental target/aarch64-unknown-uefi/release/incremental").run();
+    for wt in ["cow-fork-wip", "pstore-wip", "user-heap", "oom-graceful"] {
+        let p = root.parent().unwrap().join(format!("Zero OS.worktrees/{wt}/target"));
         if p.exists() {
-            println!("purge: removing {rel}");
-            fs::remove_dir_all(&p).or_else(|_| fs::remove_file(&p))?;
+            println!("purge: removing worktree target ({wt})");
+            fs::remove_dir_all(&p)?;
         }
     }
     let out = cmd!(sh, "du -sm .").read()?;

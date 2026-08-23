@@ -346,6 +346,11 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         // handle/ABI 三处一致，且无此臂则号位 23 永远 ENOSYS、端到端
         // 验收不可能达成；插入点与其余改动区域零重叠（模式照抄号位 21）。
         23 => Some(Syscall::GetPpid),
+        // 号位 24（Brk，用户堆增长/收缩，第十刀 WS-B 移交的精确补丁）：
+        // x1=新 break（0=查询）。ABI 冻结于 zero-abi（Syscall::Brk）。
+        24 => Some(Syscall::Brk {
+            new_break: regs[1] as usize,
+        }),
         _ => None,
     }
 }
