@@ -23,13 +23,31 @@
 memory-map path 10 regions free=248K / symbol sink / 四服务在线 / fstest 跨重启
 MATCH / forktest / waittest / nohangtest / orphantest / blktest LBA 纪律 / 无 panic
 
-## 已知待办（第九刀候选）
-1. pending_wait 目标集合化；getppid/进程组；pid generation 防复用误配
-2. execve 最小版（换地址空间）；信号位图（SIGSEGV 投递默认动作）
-3. SHM 重设计（Region 表 + map 进请求者 AS + refcount）
-4. COW fork（PTE 只读 + Permission-abort 翻页）；pstore 故障落盘
-5. Sleep(ticks) 接 timer 前瞻 API；长拷贝 syscall 分块让出
-6. securityd 权限精化路线：capability 由内核签发而非描述符静态声明
+## 后续刀次路线图（已立项待指挥，2026-08-23 定稿）
+
+> 批评代理基线 4.2/10 → 第八刀后预计 ~5.5。下表为到"准生产级"的分刀计划；
+> 每刀完成后按实机验收清单判定，未达标不进入下一刀。
+
+| 刀 | 主题 | 内容 | 完成标志 |
+|----|------|------|---------|
+| 第九刀 | 进程模型收尾 | pending_wait 目标集合化、pid generation、execve 最小版（真换地址空间）、信号位图最小版 | waittest+execdemo 全通；SIGSEGV 可观测 |
+| 第十刀 | 内存现代化 | COW fork（挂载点已留）、brk 用户堆、pstore 故障落盘 | fork 写时复制；崩溃后可取回现场 |
+| 第十一刀 | 调度与时钟 | 内核长操作分块让出、Sleep(ticks)、多级反馈队列、FPU 惰性保存 | 延迟上界可控；用户程序能 sleep |
+| 第十二刀 | 文件系统成体系 | fsd 目录树/多文件扩容、cat/ls 用户态命令、ZFS 落地选型 | 重启后目录结构完整保留 |
+| 第十三刀 | 安全模型成型 | securityd 动态签发 capability、通道 RX/TX 权限分离、登录会话 | 无凭据进程摸不到块设备 |
+| 第十四刀 | 可靠性冲刺 | fuzz/压力进 CI、百次 fork/wait 压测、watchdog、性能基线 | 24h 无泄漏无 panic |
+
+### 结构性天花板（架构级决策，单独立项，不在常规刀次内）
+- SMP 多核：需重做调度器锁模型与 per-CPU 结构
+- 线程模型：一进程一帧是 ABI 级约定，牵动整个进程模型
+- KASLR / 64→动态进程槽
+
+### 细粒度待办池（各刀领取）
+- pending_wait 目标集合化；getppid/进程组；pid generation 防复用误配
+- SHM 重设计（Region 表 + map 进请求者 AS + refcount）
+- Sleep(ticks) 接 timer 前瞻 API；长拷贝 syscall 分块让出
+- securityd 权限精化：capability 由内核签发而非描述符静态声明
+- 符号化回溯接入用户态故障路径；FPU 惰性保存优化
 
 ## 构建与实机验证
 cargo run -p xtask -- build-iso          # 超 2048MB 锁死，purge 自救
