@@ -95,6 +95,30 @@ pub fn exit(code: i32) -> ! {
     }
 }
 
+/// 故意触发一次 EL0 数据 abort：对地址 0 写 1 字节（segvdemo 用）。
+///
+/// 内核 EL0 故障路径会把该页故障按默认动作投递 SIGSEGV（登记
+/// zero_abi::signals 的 pending 位图），进程以退出码 -11 终止，父进程经
+/// [wait_pid] 收集——本函数永不返回。
+///
+/// 为什么用内联汇编而不是 unsafe 空指针 write_volatile：LLVM 有权把
+/// “必然 UB”的 Rust 级空指针写直接折叠成 UDF/brk 指令——那会走 SIGTRAP
+/// 而非 SIGSEGV 路径。asm 里写死 mov x0, xzr + sturb wzr, [x0]：保证生成
+/// 的就是对地址 0 的一条普通 store 字节（AArch64 的访存基址寄存器槽位
+/// 与 SP 复用，XZR 不可作基址，故必须先落一个真寄存器），页表翻译必然
+/// 失败、必然落入 abort 投递路径。
+#[inline(never)]
+pub fn cause_segv() -> ! {
+    unsafe {
+        // noreturn asm 不能声明输出；x0 被改写无所谓（进程即将消亡）。
+        core::arch::asm!(
+            "mov x0, xzr",
+            "sturb wzr, [x0]",
+            options(noreturn)
+        );
+    }
+}
+
 /// 等待子进程退出并收集其退出码（号位 22，POSIX wait4 最小集；阻塞版）。
 ///
 /// - `pid = 0`：等待**任意**子进程；否则只等指定 pid 的子进程。

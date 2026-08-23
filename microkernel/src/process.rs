@@ -177,6 +177,11 @@ struct ProcessRecord {
     /// 挂起的阻塞接收（通道号）：进程在阻塞中被唤醒后，由 dispatch 在
     /// 重入用户态前完成该系统调用的收尾（continuation 语义，对照 XNU）。
     pending_recv: Option<u32>,
+    /// 挂起信号位图：`bit(sig - 1)`，位值见 `zero_abi::signals`（第九刀
+    /// 信号位图最小版）。EL0 故障路径投递默认动作前在此登记死因；当前
+    /// 无 kill/sigreturn 消费方，父经 WaitPid 收到的 `-(sig)` 退出码即
+    /// 可观测出口。POSIX fork 不继承挂起信号 ⇒ 子恒从空位图起步。
+    pending_signals: u16,
     /// 父进程 pid：仅 Fork 出的子进程持有（内核直接 spawn 的根进程为
     /// None）。父死后孤儿被收养：parent 重定向为 INIT_PID（见文件头部
     /// 【孤儿策略】）。
@@ -290,6 +295,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         user_stack_top: None,
         started: true,
         pending_recv: None,
+        pending_signals: 0,
         parent: None, // 内核直生的根进程：无父，退出即完全回收
         adopted: false,
         exit_code: None,
@@ -442,6 +448,27 @@ pub fn set_pending_recv(slot: usize, chan: u32) {
 pub fn take_pending_recv(slot: usize) -> Option<u32> {
     let mut table = PROCESS_TABLE.lock();
     table.get_mut(slot).and_then(|record| record.as_mut()).and_then(|record| record.pending_recv.take())
+}
+
+/// EL0 同步故障 → 默认动作投递辅助（第九刀信号位图最小版）。
+///
+/// 对标 Linux `force_sig(sig)` + 默认 fatal 行为：先在表锁内把故障信号
+/// 置入 pending_signals 位图（死因登记），再返回 POSIX 信号退出码
+/// `-(sig)`。调用方（trap.rs 的 terminate_faulting_process）以该码走与
+/// Exit 系统调用完全相同的 Dying→Zombie→WaitPid 状态机——父 waitpid
+/// 收到的 code 即区分死因（SIGSEGV → -11）。位可叠加：多次投递 OR 累积，
+/// 取用方按 `zero_abi::signals::signal_bit` 探测。
+///
+/// 锁纪律照旧：语句级 Guard，锁内零分配零打印；Guard 绝不跨 noreturn。
+pub(crate) fn deliver_fatal_signal(slot: usize, sig: u8) -> i32 {
+    let code = zero_abi::signals::fatal_exit_code(sig);
+    {
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(record) = &mut table[slot] {
+            record.pending_signals |= zero_abi::signals::signal_bit(sig);
+        }
+    } // 表锁已释放（Guard 不跨后续 noreturn 调用，锁纪律第 1 条）
+    code
 }
 
 /// 按槽位读状态（scheduler 的 dispatch 状态保护用）。
@@ -1227,6 +1254,8 @@ pub fn fork(
             user_stack_top: parent_record.user_stack_top,
             started: true,
             pending_recv: None,
+            // POSIX fork 语义：子进程不继承父的挂起信号 ⇒ 空位图起步。
+            pending_signals: 0,
             // 族谱：Fork 是唯一产生父子关系的入口（POSIX fork 对齐）。
             parent: Some(parent_record.pid),
             // 收养标记不随 Fork 遗传：被收养孤儿 fork 出的孙辈是“收养者
@@ -1517,6 +1546,7 @@ mod state_machine_tests {
             user_stack_top: None,
             started: true,
             pending_recv: None,
+            pending_signals: 0,
             parent: parent.map(ProcessId::new),
             adopted: false,
             exit_code: None,
@@ -1596,5 +1626,42 @@ mod state_machine_tests {
         assert_ne!(capabilities_from_flag(true) & CAP_BLOCK_DEV, 0);
         // launchd 拉起服务的依赖：全位必含 CAP_SPAWN_SVC。
         assert_ne!(capabilities_from_flag(true) & CAP_SPAWN_SVC, 0);
+    }
+
+    // ── 第九刀：pending_signals 位图（设置/取用）─────────────────────
+
+    #[test]
+    fn fault_signal_delivery_sets_bitmap_and_exit_code() {
+        use zero_abi::signals::{fatal_exit_code, signal_bit, SIGBUS, SIGSEGV};
+        let _g = TABLE_GUARD.lock().unwrap();
+        {
+            let mut table = PROCESS_TABLE.lock();
+            *table = [const { None }; MAX_PROCESSES];
+            table[9] = Some(make_record(30, 9, Some(P)));
+        }
+        // SIGSEGV 投递：返回 POSIX 死因编码 -11，位图置 bit(11-1)=bit10
+        assert_eq!(deliver_fatal_signal(9, SIGSEGV), fatal_exit_code(SIGSEGV));
+        assert_eq!(deliver_fatal_signal(9, SIGSEGV), -11);
+        {
+            let table = PROCESS_TABLE.lock();
+            let rec = table[9].as_ref().expect("record kept for audit");
+            assert_eq!(rec.pending_signals, signal_bit(SIGSEGV));
+        }
+        // 另一信号叠加为 OR 累积，不覆盖既有位
+        deliver_fatal_signal(9, SIGBUS);
+        {
+            let table = PROCESS_TABLE.lock();
+            let rec = table[9].as_ref().expect("record kept");
+            assert_eq!(
+                rec.pending_signals,
+                signal_bit(SIGSEGV) | signal_bit(SIGBUS)
+            );
+            assert_eq!(rec.exit_code, None, "投递只登记位图；exit_code 由 exit 路径写入");
+        }
+        // 清场（仍持 _g）：还原空表，避免影响其他测试对表状态的假设
+        {
+            let mut table = PROCESS_TABLE.lock();
+            *table = [const { None }; MAX_PROCESSES];
+        }
     }
 }

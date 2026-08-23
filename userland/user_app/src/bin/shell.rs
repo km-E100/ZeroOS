@@ -15,8 +15,8 @@
 
 use core::panic::PanicInfo;
 use userlib::{
-    console_read, console_write, encode_message, exit, extract_payload_text, wait_pid,
-    wait_pid_flags, WAIT_NOHANG,
+    cause_segv, console_read, console_write, encode_message, exit, extract_payload_text,
+    wait_pid, wait_pid_flags, WAIT_NOHANG,
 };
 use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP};
 use zero_abi::ipc::Message;
@@ -85,7 +85,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"help" || cmd == b"?" {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
-            println("  process: forktest/waittest/nohangtest/orphantest/pid");
+            println("  process: forktest/waittest/nohangtest/orphantest/segvdemo/pid");
             println("  storage: fstest/blktest");
             println("  system: launchd/pid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
@@ -255,6 +255,46 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                 }
                 Err(e) => {
                     print("[P] nohangtest: fork failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"segvdemo" {
+            // 信号位图最小版端到端（第九刀）：fork 出的子进程故意解引用
+            // 空指针 → EL0 数据 abort → 内核投递默认动作 SIGSEGV（登记
+            // pending_signals 位图）并以 code=-11 走既有 zombie→waitpid
+            // 状态机；父进程收集后打印死因。子分支经 cause_segv() 永不
+            // 返回，绝不回到主循环（同 forktest：防双 shell 抢终端）。
+            match userlib::fork() {
+                Ok(0) => {
+                    println("[C] segvdemo: child alive, dereferencing NULL");
+                    cause_segv(); // -> ! ：地址 0 写入 → SIGSEGV 默认动作终止
+                }
+                Ok(child_pid) => {
+                    print("[P] segvdemo: forked child ");
+                    print_u64(child_pid);
+                    println("");
+                    match userlib::wait_pid(child_pid) {
+                        Ok((pid, code)) => {
+                            print("collected pid=");
+                            print_u64(pid);
+                            print(" code=");
+                            print_i32(code);
+                            if code == -11 {
+                                println(" (SIGSEGV)");
+                            } else {
+                                println("");
+                            }
+                        }
+                        Err(e) => {
+                            print("[P] segvdemo: wait failed (");
+                            print_hex(e.code());
+                            println(")");
+                        }
+                    }
+                }
+                Err(e) => {
+                    print("[P] segvdemo: fork failed (");
                     print_hex(e.code());
                     println(")");
                 }
