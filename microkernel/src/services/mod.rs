@@ -29,8 +29,10 @@ pub fn launch_core(_info: &BootInfo) {
             // KNOWN_SERVICES 启动对账），否则 launchd 拿不到真实 pid。
             essential: false,
             privileged: false,
-            // userdb 持久化经号位 7/8 写盘 ⇒ 需要 CAP_BLOCK_DEV。
-            capabilities: zero_abi::cap::CAP_BLOCK_DEV,
+            // userdb 持久化经号位 7/8 写盘 ⇒ 需要 CAP_BLOCK_DEV；
+            // 第十三刀：CAP_ISSUER 是全系统唯一的静态签发权——securityd
+            // 凭此调号位 40/41 CapGrant/CapRevoke 动态签发能力令牌。
+            capabilities: zero_abi::cap::CAP_BLOCK_DEV | zero_abi::cap::CAP_ISSUER,
         },
         ServiceDescriptor {
             name: "blkdrv",
@@ -72,59 +74,23 @@ pub fn launch_core(_info: &BootInfo) {
 }
 
 fn init_channels() {
+    // 第十三刀：引导期预建通道一律 ChannelDesc::open（tx/rx_groups=0，
+    // 全通）——向后兼容不变量：既有收发路径零感知。受保护通道由
+    // 号位 42 CreateChannel 运行时按需创建（需 CAP_CHANNEL_CREATE）。
     let channels_to_create = [
-        ChannelDesc {
-            id: channels::IPC_ROUTER_BUS,
-            capacity: 16,
-        },
-        ChannelDesc {
-            id: channels::SECURITY_USER_REQ,
-            capacity: 4,
-        },
-        ChannelDesc {
-            id: channels::SECURITY_USER_RESP,
-            capacity: 4,
-        },
-        ChannelDesc {
-            id: channels::LAUNCHD_CMD_REQ,
-            capacity: 4,
-        },
-        ChannelDesc {
-            id: channels::LAUNCHD_CMD_RESP,
-            capacity: 4,
-        },
-        ChannelDesc {
-            id: channels::SERVICE_CONTROL_BUS,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::SERVICE_CONTROL_RESP,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::SERVICE_CONTROL_EVENT,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::FS_REQ,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::FS_RESP,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::BLKDRV_REQ,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::BLKDRV_RESP,
-            capacity: 8,
-        },
-        ChannelDesc {
-            id: channels::BLKDRV_EVENT,
-            capacity: 4,
-        },
+        ChannelDesc::open(channels::IPC_ROUTER_BUS, 16),
+        ChannelDesc::open(channels::SECURITY_USER_REQ, 4),
+        ChannelDesc::open(channels::SECURITY_USER_RESP, 4),
+        ChannelDesc::open(channels::LAUNCHD_CMD_REQ, 4),
+        ChannelDesc::open(channels::LAUNCHD_CMD_RESP, 4),
+        ChannelDesc::open(channels::SERVICE_CONTROL_BUS, 8),
+        ChannelDesc::open(channels::SERVICE_CONTROL_RESP, 8),
+        ChannelDesc::open(channels::SERVICE_CONTROL_EVENT, 8),
+        ChannelDesc::open(channels::FS_REQ, 8),
+        ChannelDesc::open(channels::FS_RESP, 8),
+        ChannelDesc::open(channels::BLKDRV_REQ, 8),
+        ChannelDesc::open(channels::BLKDRV_RESP, 8),
+        ChannelDesc::open(channels::BLKDRV_EVENT, 4),
     ];
 
     for desc in channels_to_create {

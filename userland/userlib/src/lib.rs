@@ -446,6 +446,58 @@ fn sbrk_next(cur: usize, delta: i64) -> Option<usize> {
     }
 }
 
+// ═══ 第十三刀：capability 动态签发 / 会话（号位 40-45）════════════
+
+/// 动态签发能力授予（号位 40）。**仅 securityd（CAP_ISSUER 持有者）
+/// 可调**；普通进程返回 `Err(PermissionDenied)`。
+///
+/// - `target_pid`：被授予进程；`caps`：[`zero_abi::cap`] 位或组合；
+/// - `ttl`：有效期（逻辑 tick，见 zero-abi 号位 40 文档；0=不过期）。
+/// - 成功返回内核分配的令牌编号 token（撤销/校验凭据）。
+pub fn cap_grant(target_pid: u64, caps: u32, ttl: u64) -> Result<u64, SysError> {
+    let ret = svc_call(40, [target_pid, caps as u64, ttl, 0]);
+    decode_result(ret)
+}
+
+/// 撤销能力授予（号位 41）。仅 CAP_ISSUER 持有者可调；未知令牌返回
+/// `Err(NotFound)`。撤销即时生效（活算模型，无需回写目标进程）。
+pub fn cap_revoke(token: u64) -> Result<(), SysError> {
+    let ret = svc_call(41, [token, 0, 0, 0]);
+    decode_result(ret).map(|_| ())
+}
+
+/// 创建 IPC 通道（号位 42）：`desc` 的 tx/rx_groups 任一非 0（受保护
+/// 通道）需要 CAP_CHANNEL_CREATE 能力。id 冲突返回
+/// `Err(ChannelUnavailable)`。
+pub fn create_channel(desc: &zero_abi::ipc::ChannelDesc) -> Result<(), SysError> {
+    let ret = svc_call(
+        42,
+        [desc as *const zero_abi::ipc::ChannelDesc as u64, 0, 0, 0],
+    );
+    decode_result(ret).map(|_| ())
+}
+
+/// 建立登录会话（号位 43）：消费本进程名下一枚含 CAP_SESSION 的登录
+/// 令牌，返回新会话 id（≥1）。su 场景下旧会话整体注销（绑定旧会话的
+/// 授予一并失效——跨会话重放防线）。
+pub fn session_begin(login_token: u64) -> Result<u64, SysError> {
+    let ret = svc_call(43, [login_token, 0, 0, 0]);
+    decode_result(ret)
+}
+
+/// 查询当前进程会话 id（号位 44）；无会话返回 0。
+pub fn get_session() -> Result<u64, SysError> {
+    let ret = svc_call(44, [0, 0, 0, 0]);
+    decode_result(ret)
+}
+
+/// 列出全部存活会话（号位 45）：行集 `sid=N leader=P\n` 写入 buffer
+/// （截断到容量），返回实际写入字节数。
+pub fn session_list(buffer: &mut [u8]) -> Result<usize, SysError> {
+    let ret = svc_call(45, [buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0]);
+    decode_result(ret).map(|v| v as usize)
+}
+
 /// 把 `code` 与文本载荷编码为一条 IPC `Message`。
 ///
 /// `text` 最多 127 字节（payload 128 字节，末字节保持 0，

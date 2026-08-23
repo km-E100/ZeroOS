@@ -59,13 +59,30 @@ trap kill_qemu EXIT INT TERM
 # 故此处必须用花括号形式。
 echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
 # 启动 ~12 秒出 zero> 提示符；注入节奏留足余量（forktest 父子收尸、
-# fstest 六步 IPC 往返各需数秒）。挂盘 cache=writethrough 与 run-qemu.sh
-# 同参：guest 写入即时穿透宿主文件，本脚本被 SIGKILL 也不丢已判定数据。
+# fstest 六步 IPC 往返、secdemo 三轮 IPC 往返各需数秒）。挂盘
+# cache=writethrough 与 run-qemu.sh 同参：guest 写入即时穿透宿主文件，
+# 本脚本被 SIGKILL 也不丢已判定数据。
+#
+# 第十三刀注入段：login(root/zero) → whoami → secdemo →
+# su(guest/guest 换会话) → whoami → sessions。
 {
   sleep 18
   printf 'launchd list\r'; sleep 4
+  printf 'login\r';        sleep 2
+  printf 'root\r';         sleep 1
+  printf 'zero\r';         sleep 3
+  printf 'whoami\r';       sleep 2
+  printf 'secdemo\r';      sleep 16
+  printf 'su\r';           sleep 2
+  printf 'guest\r';        sleep 1
+  printf 'guest\r';        sleep 3
+  printf 'whoami\r';       sleep 2
+  printf 'sessions\r';     sleep 2
   printf 'forktest\r';     sleep 5
-  printf 'blktest\r';      sleep 4
+  # ⚠ blktest 暂缓注入：第八刀 bef2ce9 对号位 7/8 收权（需
+  #   CAP_BLOCK_DEV）后，无位 shell 的 raw 直通被正确拒绝——这是收权的
+  #   预期效果而非缺陷；blktest 需要持位进程或专用授权路径，留待后续
+  #   刀次决策后恢复。fstest 不受影响（fsd/blkdrv 静态持有该位）。
   printf 'fstest\r';       sleep 14
 } | qemu-system-aarch64 \
     -machine virt \
@@ -80,7 +97,7 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
     >"$LOG" 2>&1 &
 QEMU_PID=$!
 
-sleep 48
+sleep 90
 kill_qemu
 wait "$QEMU_PID" 2>/dev/null || true
 trap - EXIT INT TERM
@@ -104,6 +121,10 @@ check "shell-up"         "Zero OS console (user shell)"
 check "launchd-fsd"      "fsd [running"
 check "launchd-blkdrv"   "blkdrv [running"
 check "launchd-securityd" "securityd [running"
+check "login-root"       "welcome root (session id="
+check "secdemo"          "secdemo: PASS - RX/TX policy + dynamic capability lifecycle verified"
+check "su-guest"         "welcome guest (session id="
+check "sessions"         "sid=2 leader="
 check "forktest"         "forktest: collected pid="
 check "blktest"          "blktest: PASS"
 check "fstest"           "fstest: PASS"

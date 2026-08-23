@@ -34,12 +34,17 @@ use userlib;
 use zero_abi::bootfs::UserBootFile;
 use zero_abi::channels;
 use zero_abi::ipc::Message;
-use zero_abi::protocol::security;
+use zero_abi::protocol::security::{
+    self, parse_cap_issue, parse_token, encode_token, CapIssueRequest,
+};
 
 const USERNAME_MAX: usize = 16;
 const PASSWORD_MAX: usize = 32;
 const USER_CAPACITY: usize = 8;
 const LIST_BUFFER: usize = 256;
+
+/// 能力令牌台账容量（与内核 MAX_GRANTS 同量级；heapless 定长无堆）。
+const CAP_LEDGER_CAP: usize = 16;
 
 // ── userdb 磁盘布局（第七刀，编解码契约在 zero_abi::userdb）────────
 //   LBA 4096      头部扇区：magic "SUD1" | version | 记录区扇区数
@@ -143,6 +148,20 @@ impl UserStore {
 
 static USERS: Mutex<UserStore> = Mutex::new(UserStore::new());
 
+/// 能力令牌台账行（securityd 侧镜像）：内核台账（号位 40/41 落账）
+/// 是唯一权威，本表只服务 `CMD_CAP_LIST`/`CMD_CAP_VERIFY` 的可观测性
+/// 与审计——两侧一致性由"签发即落账、撤销即标废"的操作顺序保证。
+#[derive(Copy, Clone)]
+struct CapLedgerEntry {
+    token: u64,
+    target_pid: u64,
+    caps: u32,
+    /// 已撤销（CMD_CAP_REVOKE 成功后置位；不删行保留审计痕迹）。
+    revoked: bool,
+}
+
+static CAP_LEDGER: Mutex<Vec<CapLedgerEntry, CAP_LEDGER_CAP>> = Mutex::new(Vec::new());
+
 /// 控制台横幅/告警（log crate 无 logger 后端时是静默 no-op，
 /// 生命周期关键行必须走 console_write 才能上串口）。
 fn println(text: &str) {
@@ -153,7 +172,7 @@ fn println(text: &str) {
 pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
     init_user_store(bootfs_ptr, bootfs_len);
     println("Zero OS securityd (EL0 service) online");
-    println("  channel req=0x230 resp=0x231; auth/userdb ready");
+    println("  channel req=0x230 resp=0x231; auth/userdb/cap-issuance ready");
     loop {
         let mut message = Message::empty();
         match userlib::ipc_receive(channels::SECURITY_USER_REQ, &mut message) {
@@ -313,6 +332,11 @@ fn process_command(msg: &mut Message) {
         security::CMD_USER_DELETE => handle_delete(msg),
         security::CMD_USER_PASSWD => handle_passwd(msg),
         security::CMD_USER_VERIFY => handle_verify(msg),
+        // ── 第十三刀：capability 动态签发协议 ──────────────────────
+        security::CMD_CAP_ISSUE => handle_cap_issue(msg),
+        security::CMD_CAP_REVOKE => handle_cap_revoke(msg),
+        security::CMD_CAP_LIST => handle_cap_list(msg),
+        security::CMD_CAP_VERIFY => handle_cap_verify(msg),
         _ => {
             msg.code = 2;
         }
@@ -433,6 +457,125 @@ fn handle_verify(msg: &mut Message) {
     }
 }
 
+/// CMD_CAP_ISSUE：解析请求 → 内核号位 40 落账 → 台账镜像 + 回令牌。
+///
+/// 响应：code=0 且 payload=`token\0`；code=1 参数解析失败；
+/// code=2 内核拒绝（非 ISSUER / scope 非法 / 台账满）。
+///
+/// 【信任模型披露】target_pid 由请求方自报（Message 无发送者身份，
+/// 见 zero_abi::protocol::security::CapIssueRequest 注释）；签发策略
+/// 本轮为"按请求放行"的参考实现——真正的防线在内核侧：CAP_ISSUER
+/// 仅本服务持有、CAP_ISSUER 不可转授、授予绑定会话且可即时撤销。
+fn handle_cap_issue(msg: &mut Message) {
+    let Some(req) = parse_cap_issue(&msg.payload) else {
+        msg.code = 1;
+        return;
+    };
+    let CapIssueRequest {
+        target_pid,
+        caps,
+        ttl,
+    } = req;
+    match userlib::cap_grant(target_pid, caps, ttl) {
+        Ok(token) => {
+            // 台账镜像满：内核授予已生效，仅审计缺行——如实告警但不
+            // 回滚（内核台账是权威，撤销仍可用 token 操作）。
+            let mut ledger = CAP_LEDGER.lock();
+            if ledger.len() < ledger.capacity() {
+                let _ = ledger.push(CapLedgerEntry {
+                    token,
+                    target_pid,
+                    caps,
+                    revoked: false,
+                });
+            } else {
+                println("securityd: warning: cap ledger mirror full");
+            }
+            drop(ledger);
+            if encode_token(&mut msg.payload, token) {
+                msg.code = 0;
+            } else {
+                msg.code = 2;
+            }
+        }
+        Err(_) => msg.code = 2,
+    }
+}
+
+/// CMD_CAP_REVOKE：payload `token\0`。先内核撤销（权威），成功后标废
+/// 台账行。code=0 成功；1=未知令牌；2=payload 解析失败。
+fn handle_cap_revoke(msg: &mut Message) {
+    let Some(token) = parse_token(&msg.payload) else {
+        msg.code = 2;
+        return;
+    };
+    match userlib::cap_revoke(token) {
+        Ok(()) => {
+            let mut ledger = CAP_LEDGER.lock();
+            if let Some(entry) = ledger.iter_mut().find(|e| e.token == token) {
+                entry.revoked = true;
+            }
+            drop(ledger);
+            msg.payload.fill(0);
+            msg.code = 0;
+        }
+        Err(zero_abi::syscall::SysError::NotFound) => msg.code = 1,
+        Err(_) => msg.code = 2,
+    }
+}
+
+/// CMD_CAP_LIST：台账文本（`token=T pid=P caps=0x.. [active|revoked]\n`
+/// 行集，截断到缓冲容量）。
+fn handle_cap_list(msg: &mut Message) {
+    use core::fmt::Write as _;
+    let ledger = CAP_LEDGER.lock();
+    let mut text = String::<LIST_BUFFER>::new();
+    for entry in ledger.iter() {
+        let mut line = String::<64>::new();
+        if write!(
+            line,
+            "token={} pid={} caps=0x{:x} {}",
+            entry.token,
+            entry.target_pid,
+            entry.caps,
+            if entry.revoked { "[revoked]" } else { "[active]" }
+        )
+        .is_err()
+        {
+            break;
+        }
+        if !text.is_empty() {
+            let _ = text.push('\n');
+        }
+        if text.push_str(line.as_str()).is_err() {
+            break;
+        }
+    }
+    drop(ledger);
+    if text.is_empty() {
+        let _ = text.push_str("(no capability tokens issued)");
+    }
+    msg.payload.fill(0);
+    let bytes = text.as_bytes();
+    let len = min(bytes.len(), msg.payload.len().saturating_sub(1));
+    msg.payload[..len].copy_from_slice(&bytes[..len]);
+    msg.code = 0;
+}
+
+/// CMD_CAP_VERIFY：payload `token\0`；code=0 在账未撤销、1 不在账/
+/// 已撤销、2 解析失败。（只查本地镜像；权威状态以内核活算为准。）
+fn handle_cap_verify(msg: &mut Message) {
+    let Some(token) = parse_token(&msg.payload) else {
+        msg.code = 2;
+        return;
+    };
+    let ledger = CAP_LEDGER.lock();
+    match ledger.iter().find(|e| e.token == token) {
+        Some(entry) if !entry.revoked => msg.code = 0,
+        _ => msg.code = 1,
+    }
+}
+
 fn parse_fields(payload: &[u8]) -> Vec<&str, 4> {
     let mut fields = Vec::<&str, 4>::new();
     let mut start = 0;
@@ -524,4 +667,73 @@ fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<usize, ()
         return Err(());
     }
     Ok(write_len)
+}
+
+// ═══ 主机单测（第十三刀）════════════════════════════════════════════
+// 台账镜像与协议编解码的纯逻辑面：内核权威状态不可在宿主复现，
+// 这里钉住 securityd 侧自己的决策与簿记行为。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_ledger_upsert_and_revoke_marking() {
+        let mut ledger: Vec<CapLedgerEntry, CAP_LEDGER_CAP> = Vec::new();
+        let _ = ledger.push(CapLedgerEntry {
+            token: 7,
+            target_pid: 42,
+            caps: 0x50,
+            revoked: false,
+        });
+        // 在账未撤销 → 有效
+        assert!(ledger.iter().find(|e| e.token == 7).map(|e| !e.revoked).unwrap_or(false));
+        // 撤销标废（保留行，不删——审计痕迹）
+        if let Some(entry) = ledger.iter_mut().find(|e| e.token == 7) {
+            entry.revoked = true;
+        }
+        assert!(ledger.iter().find(|e| e.token == 7).map(|e| e.revoked).unwrap_or(false));
+        // 未知 token 查无此行
+        assert!(ledger.iter().find(|e| e.token == 8).is_none());
+    }
+
+    #[test]
+    fn cap_ledger_mirror_full_keeps_kernel_authoritative() {
+        // 镜像满时的策略：不再 push（缺行告警），但绝不妨碍已生效授予。
+        let mut ledger: Vec<CapLedgerEntry, CAP_LEDGER_CAP> = Vec::new();
+        for token in 0..CAP_LEDGER_CAP as u64 {
+            assert!(ledger
+                .push(CapLedgerEntry {
+                    token,
+                    target_pid: 1,
+                    caps: 1,
+                    revoked: false,
+                })
+                .is_ok());
+        }
+        assert_eq!(ledger.len(), ledger.capacity());
+        // 第 CAP_LEDGER_CAP+1 枚令牌：push 失败即跳过（handle_cap_issue
+        // 的 else 分支语义），台账仍完整可读。
+        assert!(ledger
+            .push(CapLedgerEntry {
+                token: 999,
+                target_pid: 1,
+                caps: 1,
+                revoked: false,
+            })
+            .is_err());
+        assert_eq!(ledger.len(), CAP_LEDGER_CAP);
+    }
+
+    #[test]
+    fn issue_request_roundtrip_via_abi_codec() {
+        // securityd 与 shell 共用 zero_abi 编解码——同一测试双端对齐。
+        let req = CapIssueRequest {
+            target_pid: 1234,
+            caps: 0x50,
+            ttl: 500_000,
+        };
+        let mut payload = [0u8; 128];
+        assert!(security::encode_cap_issue(&mut payload, &req));
+        assert_eq!(parse_cap_issue(&payload), Some(req));
+    }
 }

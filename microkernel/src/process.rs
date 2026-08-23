@@ -210,6 +210,12 @@ struct ProcessRecord {
     /// 堆物理页由 eager-copy 克隆（clone_space）自然带上，无需额外搬运。
     /// 读写只经本文件底部 heap_view / store_brk 助手（表锁纪律同源）。
     brk: usize,
+    /// 登录会话 id（第十三刀；0 = 无会话）：登录成功经号位 43
+    /// SessionBegin 建立并由 security 模块台账持有会话记录。fork 子进程
+    /// 继承、exec 保持（exec 换映像不换进程身份）、registry spawn 继承
+    /// 发起者。动态能力授予绑定签发时的会话，跨会话即失效（防重放）。
+    /// 读写只经 set_session / session_of_pid / clear_session_members。
+    session: u64,
 }
 
 /// 挂起 WaitPid 的等待目标（目标集合化的集合元素），对标 POSIX wait4
@@ -408,6 +414,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
         wait_target: None,
         // 新进程 0 字节堆（号位 24）：break 固定从 USER_HEAP_BASE 起步。
         brk: USER_HEAP_BASE,
+        // 内核直生根进程无登录会话（第十三刀；launchd 引导期同此）。
+        session: 0,
     });
 
     Ok(pid)
@@ -515,6 +523,70 @@ pub(crate) fn capabilities_from_flag(privileged: bool) -> u32 {
     } else {
         0
     }
+}
+
+/// 读进程的静态能力位图（按 pid；无记录返回 0）。security 模块活算
+/// 有效能力时的基线来源（动态授予不改写本值，见 security.rs 文档）。
+pub fn capabilities_of_pid(pid: ProcessId) -> u32 {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .flatten()
+        .find(|record| record.pid == pid)
+        .map(|record| record.capabilities)
+        .unwrap_or(0)
+}
+
+/// 读进程的登录会话 id（0 = 无会话；无记录同样返回 0）。
+pub fn session_of_pid(pid: ProcessId) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .flatten()
+        .find(|record| record.pid == pid)
+        .map(|record| record.session)
+        .unwrap_or(0)
+}
+
+/// 按槽位读登录会话 id（号位 44 GetSession / SpawnService 会话记账用）。
+pub fn session_of_slot(slot: usize) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table
+        .get(slot)
+        .and_then(|entry| entry.as_ref())
+        .map(|record| record.session)
+        .unwrap_or(0)
+}
+
+/// 设置进程的登录会话 id（号位 43 SessionBegin 成功后由 security 模块
+/// 调用；pid 不存在则静默跳过——与 set_capabilities 同一防御风格）。
+pub fn set_session(pid: ProcessId, session: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(record) = table
+        .iter_mut()
+        .filter_map(|slot| slot.as_mut())
+        .find(|record| record.pid == pid)
+    {
+        record.session = session;
+    }
+}
+
+/// 会话注销清场（第十三刀）：把旧会话 `sid` 名下**除 `keep` 外**的全部
+/// 进程会话字段清零。`keep` 是换新会话的原领袖（su 场景：它即将领到
+/// 新 sid，不能被误清）。返回受影响的成员数（审计用）。
+pub fn clear_session_members(sid: u64, keep: ProcessId) -> usize {
+    if sid == 0 {
+        return 0;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let mut purged = 0usize;
+    for record in table.iter_mut().flatten() {
+        if record.session == sid && record.pid != keep {
+            record.session = 0;
+            purged += 1;
+        }
+    }
+    purged
 }
 
 pub fn slot_for_pid(pid: ProcessId) -> Option<usize> {
@@ -936,6 +1008,10 @@ fn full_reap(seed: usize) {
         let Some((record, casc_pids, casc_slots, casc_spaces, n)) = grabbed else {
             continue;
         };
+        // 安全台账钩子（第十三刀，表锁已释放）：清死者名下的动态能力
+        // 授予；若死者是会话领袖则注销其会话并清场其余成员（锁纪律：
+        // 台账锁在外层、本处已不持表锁，无反转）。
+        crate::security::on_process_gone(record.pid);
         if let Some(space) = record.addr_space {
             // 锁外销毁：避免持进程表锁进入物理页分配器
             //（表锁→分配器锁反转风险，scheduler.rs 锁纪律第 3 条）。
@@ -1219,6 +1295,11 @@ pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
                     space.destroy(); // 锁外（纪律第 3 条）
                 }
             }
+            // 安全台账钩子（第十三刀）：尸体被父收走即记录消亡——
+            // 与 full_reap 同一钩子，保证"记录摘除 ⇒ 台账清理"不变量
+            // 在两条回收路径上同时成立。pid 从 pack_wait_result 编码
+            // 高 32 位还原（与 unpack_wait_result 同一布局）。
+            crate::security::on_process_gone(ProcessId::new(packed >> 32));
             crate::info!("waitpid: collected & fully reaped -> {:#x}", packed);
             Ok(WaitStep::Completed(packed))
         }
@@ -1427,6 +1508,10 @@ pub fn fork(
             // 已由上方 clone_space eager-copy 复制进子地址空间，值与页
             // 天然一致，无需额外同步。
             brk: parent_record.brk,
+            // 会话随 fork 继承（第十三刀）：登录 shell 的子进程留在同一
+            // 会话内。动态能力授予不随之继承（活算台账只认 pid，子 pid
+            // 名下无授予记录）——最小授权不随血脉扩散。
+            session: parent_record.session,
         });
     }
 
@@ -1979,6 +2064,9 @@ mod state_machine_tests {
             exit_code: None,
             wait_target: None,
             brk: USER_HEAP_BASE,
+            // 表级测试不触会话（第十三刀字段；会话语义由 security 模块
+            // 单测覆盖）。
+            session: 0,
         }
     }
 

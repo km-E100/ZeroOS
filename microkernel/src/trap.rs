@@ -351,6 +351,29 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         24 => Some(Syscall::Brk {
             new_break: regs[1] as usize,
         }),
+        // ═══ 号位 40-45：安全模型成型（第十三刀，本刀领地）═════════
+        // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展自 40 起。
+        // ABI 契约见 zero-abi Syscall::CapGrant..SessionList 文档；
+        // 内核臂见 syscalls.rs 同号位段；登记于 docs/abi_syscall_reference.md。
+        //
+        // 【边界披露】CapGrant/CapRevoke 的 caps/ttl 参数走 x2/x3 直读
+        // （syscalls::handle 从帧取），此处只解 x1——与号位 22 flags 的
+        // "冻结解码面 + handle 补取"先例同一模式。
+        40 => Some(Syscall::CapGrant {
+            target_pid: regs[1],
+        }),
+        41 => Some(Syscall::CapRevoke { token: regs[1] }),
+        42 => Some(Syscall::CreateChannel {
+            user_desc: regs[1] as usize,
+        }),
+        43 => Some(Syscall::SessionBegin {
+            login_token: regs[1],
+        }),
+        44 => Some(Syscall::GetSession),
+        45 => Some(Syscall::SessionList {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
         _ => None,
     }
 }
@@ -910,6 +933,37 @@ mod tests {
         assert!(matches!(
             decode_syscall(&regs(23, [0, 0, 0, 0])),
             Some(Syscall::GetPpid)
+        ));
+        // 号位 40-45（第十三刀）：解码面冻结断言（x2/x3 参数由
+        // handle 从帧直读，此处只验 x1 映射）。
+        assert!(matches!(
+            decode_syscall(&regs(40, [9, 0, 0, 0])),
+            Some(Syscall::CapGrant { target_pid: 9 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(41, [5, 0, 0, 0])),
+            Some(Syscall::CapRevoke { token: 5 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(42, [0x8000_0000, 0, 0, 0])),
+            Some(Syscall::CreateChannel { user_desc: 0x8000_0000 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(43, [3, 0, 0, 0])),
+            Some(Syscall::SessionBegin { login_token: 3 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(44, [0, 0, 0, 0])),
+            Some(Syscall::GetSession)
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(45, [0x8000_0000, 64, 0, 0])),
+            Some(
+                Syscall::SessionList {
+                    user_buffer: 0x8000_0000,
+                    len: 64
+                }
+            )
         ));
         assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
     }
