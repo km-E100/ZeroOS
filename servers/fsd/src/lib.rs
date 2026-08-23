@@ -31,6 +31,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::cmp::min;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -83,8 +86,23 @@ impl Slot {
         size: 0,
     };
 
+    /// 精确匹配一个文件记录（不含目录标记）。
     fn matches(&self, path: &[u8]) -> bool {
-        self.used && self.name[..path.len()] == *path && self.name[path.len()] == 0
+        self.used && !self.is_dir_marker() && self.name[..path.len()] == *path
+            && self.name[path.len()] == 0
+    }
+
+    /// 精确匹配一个目录标记（第十二刀：name 以 '/' 结尾）。
+    fn matches_dir(&self, path: &[u8]) -> bool {
+        self.used && self.is_dir_marker() && self.name[..path.len()] == *path
+            && self.name[path.len()] == b'/'
+            && path.len() + 1 <= NAME_MAX
+    }
+
+    /// 目录标记判据：存储名以 '/' 结尾（文件名按协议不允许以 '/' 结尾）。
+    fn is_dir_marker(&self) -> bool {
+        self.name.iter().position(|&b| b == 0)
+            .map_or(false, |end| end > 0 && self.name[end - 1] == b'/')
     }
 
     fn set_name(&mut self, path: &[u8]) -> bool {
@@ -96,9 +114,73 @@ impl Slot {
         true
     }
 
+    /// 目录标记专用：存 `path/`（尾斜杠吃 1 字节预算）。
+    fn set_dir_name(&mut self, path: &[u8]) -> bool {
+        if path.is_empty() || path.len() + 1 >= NAME_MAX {
+            return false;
+        }
+        self.name = [0; NAME_MAX];
+        let end = path.len();
+        self.name[..end].copy_from_slice(path);
+        self.name[end] = b'/';
+        true
+    }
+
     fn lba(&self, index: usize) -> u64 {
         DATA_LBA + (index as u64) * FILE_SECTORS as u64
     }
+}
+
+// ---------------------------------------------------------------------------
+// 路径语义（第十二刀：目录树）
+//
+// 选型决策（详见 docs/zero_file_system_spec.md「第十二刀选型结论」）：
+// 槽位表仍是扁平“全路径→LBA”映射，目录由**显式标记槽**（存储名带尾
+// '/'，size 恒 0）表达——不引入独立目录元数据块，超级块布局 v1 不变，
+// 旧卷免迁移。路径规整规则：
+//   * 至多剥一个前导 '/'；拒绝空段、`..`/`.`、双斜杠、尾部斜杠；
+//   * 全路径（含目录部分）≤ NAME_MAX-1 字节（NUL 由表占位）。
+// ---------------------------------------------------------------------------
+
+/// 规整用户态传入的路径：返回规范形式（无前导 '/'、无冗余段）。
+/// 非法输入返回 None（ERR_INVALID）。
+fn normalize_path(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.is_empty() || raw.len() >= NAME_MAX {
+        return None;
+    }
+    let body = if raw[0] == b'/' { &raw[1..] } else { raw };
+    if body.is_empty() {
+        return None;
+    }
+    for seg in body.split(|&b| b == b'/') {
+        match seg {
+            b"" => return None,                      // 双斜杠 / 尾部斜杠
+            b"." | b".." => return None,             // 本里程碑不做点段解析
+            _ => {}
+        }
+    }
+    Some(body.to_vec())
+}
+
+/// 切分 (父目录, 基名)。根下条目的父目录为空切片（= 根）。
+fn split_parent(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (&[], path),
+    }
+}
+
+/// 路径的直接父目录是否已存在（根恒存在；否则要求精确目录标记）。
+fn parent_exists(volume: &Volume, dir: &[u8]) -> bool {
+    dir.is_empty() || volume.slots.iter().any(|s| s.matches_dir(dir))
+}
+
+/// 目标路径已被占用（同名文件或同名目录标记）？
+fn path_taken(volume: &Volume, path: &[u8]) -> bool {
+    volume
+        .slots
+        .iter()
+        .any(|s| s.used && (s.matches(path) || s.matches_dir(path)))
 }
 
 struct Volume {
@@ -158,12 +240,16 @@ fn handle_request(message: &Message) {
         vt::CMD_WRITE => cmd_write(&message.payload),
         vt::CMD_READ => cmd_read(&message.payload),
         vt::CMD_CLOSE => cmd_close(&message.payload),
-        vt::CMD_LIST => cmd_list(),
+        vt::CMD_LIST => cmd_list(&message.payload),
+        // 第十二刀：目录树语义
+        vt::CMD_MKDIR => cmd_mkdir(&message.payload),
+        vt::CMD_RMDIR => cmd_rmdir(&message.payload),
+        vt::CMD_UNLINK | fs_proto::CMD_DELETE_FILE => cmd_unlink(&message.payload),
         // 旧码兼容映射（ABI 冻结值，见 protocol::fs 注释）：
         fs_proto::CMD_OPEN => cmd_open(&message.payload), // 无 mode 字节 → EXISTING
         fs_proto::CMD_READ => cmd_read(&message.payload),
         fs_proto::CMD_CLOSE => cmd_close(&message.payload),
-        fs_proto::CMD_LIST => cmd_list(),
+        fs_proto::CMD_LIST => cmd_list(&message.payload),
         _ => respond(fs_proto::ERR_INVALID, &[]),
     }
 }
@@ -277,7 +363,7 @@ fn cmd_open(payload: &[u8]) {
         return;
     }
 
-    let existing = volume.slots.iter().position(|slot| slot.matches(path));
+    let existing = volume.slots.iter().position(|slot| slot.matches(&path));
 
     let slot_index = match existing {
         Some(index) => index,
@@ -286,11 +372,17 @@ fn cmd_open(payload: &[u8]) {
                 respond(fs_proto::ERR_NOT_FOUND, &[]);
                 return;
             }
+            // 第十二刀：创建要求父目录存在，且目标路径未被文件/目录占用
+            let (parent, _) = split_parent(&path);
+            if !parent_exists(&volume, parent) || path_taken(&volume, &path) {
+                respond(fs_proto::ERR_NOT_FOUND, &[]);
+                return;
+            }
             match volume.slots.iter().position(|slot| !slot.used) {
                 Some(index) => {
                     volume.slots[index] = Slot::EMPTY;
                     volume.slots[index].used = true;
-                    volume.slots[index].set_name(path);
+                    volume.slots[index].set_name(&path);
                     persist_super_locked(&mut volume);
                     index
                 }
@@ -457,48 +549,195 @@ fn cmd_close(payload: &[u8]) {
     }
 }
 
-/// LIST：响应 payload 为 name+LF 串（NUL 收尾）。
-fn cmd_list() {
+/// LIST（第十二刀路径版）：payload 可为空（=根目录）或 [path NUL]。
+/// 响应 payload = 条目串 `name\n`；子目录条目带尾斜杠 `sub/\n`。
+/// 目标目录不存在 → ERR_NOT_FOUND（根目录恒存在）。
+fn cmd_list(payload: &[u8]) {
     if !MOUNT_OK.load(Ordering::SeqCst) {
         respond(fs_proto::ERR_DEVICE, &[]);
         return;
     }
+    // 解析可选路径参数：空 payload 或立即 NUL 都视为根目录。
+    let dir: Vec<u8> = match payload.iter().position(|&b| b == 0) {
+        Some(end) => match normalize_path(&payload[..end]) {
+            Some(path) => path,
+            None => {
+                respond(fs_proto::ERR_INVALID, &[]);
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+
     let volume = VOLUME.lock();
     if volume.degraded {
         respond(fs_proto::ERR_DEVICE, &[]);
         return;
     }
+    if !dir.is_empty() && !volume.slots.iter().any(|s| s.matches_dir(&dir)) {
+        respond(fs_proto::ERR_NOT_FOUND, &[]);
+        return;
+    }
+
     let mut response = Message::empty();
     response.code = 0;
     let mut offset = 0usize;
+    let put = |response: &mut Message, offset: &mut usize, entry: &[u8]| {
+        if *offset + entry.len() + 2 < response.payload.len() {
+            response.payload[*offset..*offset + entry.len()].copy_from_slice(entry);
+            *offset += entry.len();
+            response.payload[*offset] = b'\n';
+            *offset += 1;
+        }
+    };
     for slot in volume.slots.iter().filter(|s| s.used) {
         let end = slot.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
-        if offset + end + 2 >= response.payload.len() {
-            break;
+        let full = &slot.name[..end];
+        if slot.is_dir_marker() {
+            // 目录标记：父目录==目标 ⇒ 输出 basename+'/'
+            let (parent, base) = split_parent(&full[..end - 1]);
+            if parent == &dir[..] && !base.is_empty() {
+                let mut entry = [0u8; NAME_MAX + 1];
+                entry[..base.len()].copy_from_slice(base);
+                entry[base.len()] = b'/';
+                put(&mut response, &mut offset, &entry[..base.len() + 1]);
+            }
+        } else {
+            // 文件：dirname==目标 ⇒ 输出 basename
+            let (parent, base) = split_parent(full);
+            if parent == &dir[..] && !base.is_empty() {
+                put(&mut response, &mut offset, base);
+            }
         }
-        response.payload[offset..offset + end].copy_from_slice(&slot.name[..end]);
-        offset += end;
-        response.payload[offset] = b'\n';
-        offset += 1;
     }
     let _ = ipc_send(channels::FS_RESP, &response);
+}
+
+/// MKDIR（第十二刀）：payload [path NUL]。父目录必须已存在，目标不得
+/// 与任何文件/目录同名。成功创建目录标记槽（存储名 = path+'/'）。
+fn cmd_mkdir(payload: &[u8]) {
+    let Some(end) = payload.iter().position(|&b| b == 0) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = normalize_path(&payload[..end]) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    if !MOUNT_OK.load(Ordering::SeqCst) {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let mut volume = VOLUME.lock();
+    if volume.degraded {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let (parent, base) = split_parent(&path);
+    if !parent_exists(&volume, parent) || path_taken(&volume, &path) {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    let Some(index) = volume.slots.iter().position(|slot| !slot.used) else {
+        respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
+        return;
+    };
+    volume.slots[index] = Slot::EMPTY;
+    volume.slots[index].used = true;
+    if !volume.slots[index].set_dir_name(&path) {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    persist_super_locked(&mut volume);
+    let _ = base;
+    respond(0, &[]);
+}
+
+/// RMDIR（第十二刀）：payload [path NUL]。仅允许删除**空**目录
+/// （无任何文件/子目录以它为前缀）；根目录不可删。
+fn cmd_rmdir(payload: &[u8]) {
+    let Some(end) = payload.iter().position(|&b| b == 0) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = normalize_path(&payload[..end]) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    if !MOUNT_OK.load(Ordering::SeqCst) {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let mut volume = VOLUME.lock();
+    if volume.degraded {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let marker = volume.slots.iter().position(|s| s.matches_dir(&path));
+    let Some(index) = marker else {
+        respond(fs_proto::ERR_NOT_FOUND, &[]);
+        return;
+    };
+    // 子项检查：任一记录的规范名以 "path/" 为前缀即非空。
+    let mut prefix = path.clone();
+    prefix.push(b'/');
+    let has_children = volume.slots.iter().any(|s| {
+        if !s.used || s.matches_dir(&path) {
+            return false;
+        }
+        let end = s.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
+        end >= prefix.len() && s.name[..prefix.len()] == prefix[..]
+    });
+    if has_children {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    volume.slots[index] = Slot::EMPTY;
+    persist_super_locked(&mut volume);
+    respond(0, &[]);
+}
+
+/// UNLINK（第十二刀）：payload [path NUL]。删除一个文件（数据区槽位
+/// 就地回收复用）；目录必须走 RMDIR，不存在 → ERR_NOT_FOUND。
+fn cmd_unlink(payload: &[u8]) {
+    let Some(end) = payload.iter().position(|&b| b == 0) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = normalize_path(&payload[..end]) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    if !MOUNT_OK.load(Ordering::SeqCst) {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let mut volume = VOLUME.lock();
+    if volume.degraded {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let Some(index) = volume.slots.iter().position(|s| s.matches(&path)) else {
+        respond(fs_proto::ERR_NOT_FOUND, &[]);
+        return;
+    };
+    volume.slots[index] = Slot::EMPTY;
+    persist_super_locked(&mut volume);
+    respond(0, &[]);
 }
 
 // ---------------------------------------------------------------------------
 // open 解析与块 IO
 // ---------------------------------------------------------------------------
 
-/// 解析 [path NUL][mode u8?]；路径规整：剥一个前导 '/'，拒绝内嵌
-/// '/'，长度 <NAME_MAX。返回 (path 字节, mode)。
-fn parse_open(payload: &[u8]) -> Option<(&[u8], u8)> {
+/// 解析 [path NUL][mode u8?]；路径规整见 normalize_path（第十二刀起
+/// 允许嵌套路径，拒绝目录标记式尾斜杠）。返回 (规范路径, mode)。
+fn parse_open(payload: &[u8]) -> Option<(Vec<u8>, u8)> {
     let end = payload.iter().position(|&b| b == 0)?;
     let raw = &payload[..end];
     let rest = &payload[end + 1..];
     let mode = if rest.is_empty() { vt::OPEN_EXISTING } else { rest[0] };
-    let path = if raw.first() == Some(&b'/') { &raw[1..] } else { raw };
-    if path.is_empty() || path.len() >= NAME_MAX || path.contains(&b'/') {
-        return None;
-    }
+    let path = normalize_path(raw)?;
     Some((path, mode))
 }
 
@@ -593,4 +832,68 @@ fn log_status(prefix: &str, status: u32) {
     let _ = userlib::console_write(b"  status=0x");
     let _ = userlib::console_write(&buf);
     let _ = userlib::console_write(b"\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// 主机测试（第十二刀）：路径语义纯函数判定矩阵
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn n(bytes: &[u8]) -> Option<Vec<u8>> {
+        normalize_path(bytes)
+    }
+
+    #[test]
+    fn normalize_accepts_relative_and_absolute() {
+        assert_eq!(n(b"a.txt"), Some(b"a.txt".to_vec()));
+        assert_eq!(n(b"/a.txt"), Some(b"a.txt".to_vec()));
+        assert_eq!(n(b"d/sub/b.txt"), Some(b"d/sub/b.txt".to_vec()));
+        assert_eq!(n(b"/d/sub"), Some(b"d/sub".to_vec()));
+    }
+
+    #[test]
+    fn normalize_rejects_garbage() {
+        assert_eq!(n(b""), None);
+        assert_eq!(n(b"/"), None);
+        assert_eq!(n(b"a/"), None); // 尾斜杠 = 目录标记语法，客户端禁用
+        assert_eq!(n(b"a//b"), None); // 空段
+        assert_eq!(n(b".."), None);
+        assert_eq!(n(b"a/../b"), None);
+        let long = [b'x'; NAME_MAX];
+        assert_eq!(n(&long), None); // 超长
+    }
+
+    #[test]
+    fn split_parent_root_and_nested() {
+        assert_eq!(split_parent(b"a.txt"), (&[][..], &b"a.txt"[..]));
+        assert_eq!(split_parent(b"d/a.txt"), (&b"d"[..], &b"a.txt"[..]));
+        assert_eq!(
+            split_parent(b"d/sub/b.txt"),
+            (&b"d/sub"[..], &b"b.txt"[..])
+        );
+    }
+
+    #[test]
+    fn dir_marker_roundtrip() {
+        let mut slot = Slot::EMPTY;
+        slot.used = true;
+        assert!(slot.set_dir_name(b"docs"));
+        assert!(slot.is_dir_marker());
+        assert!(slot.matches_dir(b"docs"));
+        assert!(!slot.matches_dir(b"docsx")); // 前缀不得误配
+        assert!(!slot.matches(b"docs")); // 标记不是文件
+    }
+
+    #[test]
+    fn file_slot_is_not_marker() {
+        let mut slot = Slot::EMPTY;
+        slot.used = true;
+        assert!(slot.set_name(b"docs/readme.txt"));
+        assert!(!slot.is_dir_marker());
+        assert!(slot.matches(b"docs/readme.txt"));
+        assert!(!slot.matches(b"docs/readme.tx"));
+    }
 }
