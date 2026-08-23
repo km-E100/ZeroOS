@@ -20,19 +20,25 @@ struct MmioLease {
 
 static MMIO_LEASES: Mutex<Vec<MmioLease>> = Mutex::new(Vec::new());
 
-/// 用户地址空间布局（与 mm/paging.rs 一致）：
+/// 用户地址空间布局（与 mm/paging.rs 一致）。冻结值自工程化第八刀起
+/// 单源于 `zero_abi::validate`（宿主可测纯函数层，见 tools/fuzz-syscall）；
+/// 内核侧仅保留 usize 镜像常量供既有单测对照（非测试构建不编译）：
 /// - [USER_VA_LO, 1GiB)：用户代码/数据（L1[0] 私有副本，可映射）
 /// - [1GiB, 2GiB)：内核专用共享表（L1[1]），用户指针一律拒绝
 /// - [2GiB, USER_VA_MAX]：bootfs 与用户栈（L1[2]/L1[3] 私有表，可映射）
-const USER_VA_LO: usize = 0x0020_0000;
-const KERNEL_REGION_START: usize = 0x4000_0000; // 1 GiB
-const KERNEL_REGION_END: usize = 0x8000_0000; // 2 GiB
-const USER_VA_MAX: usize = 0x0000_FFFF_F000; // 用户栈顶（4GiB - 4KiB）
+#[cfg(test)]
+const USER_VA_LO: usize = zero_abi::validate::USER_VA_LO as usize;
+#[cfg(test)]
+const KERNEL_REGION_START: usize = zero_abi::validate::KERNEL_REGION_START as usize; // 1 GiB
+#[cfg(test)]
+const KERNEL_REGION_END: usize = zero_abi::validate::KERNEL_REGION_END as usize; // 2 GiB
+#[cfg(test)]
+const USER_VA_MAX: usize = zero_abi::validate::USER_VA_MAX as usize; // 用户栈顶（4GiB - 4KiB）
 
-/// QEMU virt 外设空间（MMIO 设备区）：GIC/PL011/virtio-mmio 都在
-/// [0x0800_0000, 0x1000_0000)。mmio lease 的 phys 必须落在此区间。
-const DEVICE_MMIO_LO: usize = 0x0800_0000;
-const DEVICE_MMIO_HI: usize = 0x1000_0000;
+/// QEMU virt 外设空间（MMIO 设备区）边界冻结于
+/// `zero_abi::validate::DEVICE_MMIO_LO/HI`（[0x0800_0000, 0x1000_0000)，
+/// GIC/PL011/virtio-mmio 所在区间）；内核侧无本地镜像——mmio lease 校验
+/// 已整体委托该纯函数。
 
 /// 用户指针校验（第一道：地址范围 + 布局）。
 ///
@@ -44,35 +50,15 @@ const DEVICE_MMIO_HI: usize = 0x1000_0000;
 /// 非块描述符。调用方已按页步进拷贝（见 copy_slice_from/to_user），
 /// 每页一个校验点即可无缝接入。
 fn validate_user_ptr(addr: usize, size: usize) -> Result<(), SysError> {
-    if addr == 0 {
-        return Err(SysError::InvalidArgument);
-    }
-    if addr < USER_VA_LO {
-        return Err(SysError::InvalidArgument);
-    }
-    if addr >= KERNEL_REGION_START && addr < KERNEL_REGION_END {
-        // 内核恒等映射区：共享页表本体，绝不能把用户缓冲区的拷贝写进去。
-        return Err(SysError::InvalidArgument);
-    }
-    let end = addr.checked_add(size).ok_or(SysError::InvalidArgument)?;
-    if end > USER_VA_MAX {
-        return Err(SysError::InvalidArgument);
-    }
-    Ok(())
+    // 工程化第八刀：判定逻辑上收 `zero_abi::validate`（纯函数、宿主可测、
+    // 由 tools/fuzz-syscall 模糊覆盖）；usize→u64 在 AArch64 同宽，语义逐位一致。
+    zero_abi::validate::validate_user_ptr(addr as u64, size as u64)
 }
 
 /// mmio lease 校验：phys 必须落在 QEMU virt 设备区且长度不越界。
 fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
-    let base = base as usize;
-    let len = len as usize;
-    if len == 0 || base < DEVICE_MMIO_LO {
-        return Err(SysError::InvalidArgument);
-    }
-    let end = base.checked_add(len).ok_or(SysError::InvalidArgument)?;
-    if end > DEVICE_MMIO_HI {
-        return Err(SysError::InvalidArgument);
-    }
-    Ok(())
+    // 同上：真值源在 `zero_abi::validate`（u64 签名原生对齐，无类型适配）。
+    zero_abi::validate::validate_mmio_region(base, len)
 }
 
 /// 阻塞接收的收尾（由 scheduler::dispatch 在重入用户态前调用）。
@@ -418,8 +404,8 @@ fn release_mmio(slot: usize, index: u32) -> Result<(), SysError> {
 }
 
 unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
-    // 基本对齐检查：Message 指针需按自身对齐。
-    if addr % core::mem::align_of::<Message>() != 0 {
+    // 基本对齐检查：Message 指针需按自身对齐（规则真值源 zero_abi::validate）。
+    if !zero_abi::validate::message_ptr_aligned(addr as u64) {
         return Err(SysError::InvalidArgument);
     }
     let mut msg = Message::empty();
@@ -432,7 +418,7 @@ unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
 }
 
 unsafe fn copy_message_to_user(addr: usize, msg: &Message) -> Result<(), SysError> {
-    if addr % core::mem::align_of::<Message>() != 0 {
+    if !zero_abi::validate::message_ptr_aligned(addr as u64) {
         return Err(SysError::InvalidArgument);
     }
     let bytes = core::slice::from_raw_parts(
