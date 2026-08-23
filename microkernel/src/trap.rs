@@ -340,6 +340,12 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         // 一致，且无此臂则号位 22 永远 ENOSYS、端到端验收不可能达成；
         // 插入点与其余改动区域零重叠。
         22 => Some(Syscall::WaitPid { pid: regs[1] }),
+        // 号位 23（GetPpid，POSIX getppid 最小集）：ABI 已冻结于 zero-abi。
+        // 【边界披露】本文件由并行 Agent 分头维护；此处仅追加这一条
+        // match 臂（及下方表测试一行断言）——任务要求 decode_syscall/
+        // handle/ABI 三处一致，且无此臂则号位 23 永远 ENOSYS、端到端
+        // 验收不可能达成；插入点与其余改动区域零重叠（模式照抄号位 21）。
+        23 => Some(Syscall::GetPpid),
         _ => None,
     }
 }
@@ -895,6 +901,10 @@ mod tests {
         assert!(matches!(
             decode_syscall(&regs(22, [7, 0, 0, 0])),
             Some(Syscall::WaitPid { pid: 7 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(23, [0, 0, 0, 0])),
+            Some(Syscall::GetPpid)
         ));
         assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
     }

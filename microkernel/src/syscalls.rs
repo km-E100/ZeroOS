@@ -383,6 +383,19 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
             Ok(caller_pid.raw())
         }
+        // 号位 23（POSIX getppid 最小集）：模式照抄 GetPid——经
+        // process::get_parent_pid 只读助手取当前 slot 的 parent 字段。
+        // 语义与孤儿收养策略天然一致：被 init 收养的孤儿其 parent 已
+        // 重定向为 INIT_PID(2)，直接返回字段值即得收养者 pid；内核直生
+        // 根进程（服务注册表 spawn 路径，parent=None）按“无父返回 0”
+        // 约定回 0。外层 None（槽位无记录）与 GetPid 同一防御语义。
+        Syscall::GetPpid => {
+            let caller_slot = crate::scheduler::current_slot();
+            match crate::process::get_parent_pid(caller_slot) {
+                Some(parent) => Ok(parent.map_or(0, |pid| pid.raw())),
+                None => Err(SysError::PermissionDenied),
+            }
+        }
         // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
         // 有活子未退则挂起（登记精确等待目标 wait_target + block_current，
         // 仅匹配目标的子退出才由其 Exit 路径写父 TrapFrame 并 wake——

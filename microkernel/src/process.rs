@@ -642,6 +642,19 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
     table[slot].map(|record| record.pid)
 }
 
+/// 读取指定槽位进程的父 pid（号位 23 GetPpid 的唯一只读助手，
+/// 模式照抄 `pid_at_slot`；只读，不修改任何记录字段）。
+///
+/// 返回值双层 Option：
+/// - 外层 `None`：槽位无有效记录（防御分支，由调用方映射为错误）；
+/// - 外层 `Some`：记录存在，内层即 `record.parent`——`Some(pid)` 为
+///   fork 建立的父子链（含被 init 收养的孤儿：其 parent 已重定向为
+///   INIT_PID=2），`None` 为内核直生根进程（服务注册表 spawn 路径）。
+pub fn get_parent_pid(slot: usize) -> Option<Option<ProcessId>> {
+    let table = PROCESS_TABLE.lock();
+    table[slot].map(|record| record.parent)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // 进程退出与回收：POSIX 风格 zombie / WaitPid（对标 Linux do_exit + wait4）
 //

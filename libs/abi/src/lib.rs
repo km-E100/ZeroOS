@@ -821,6 +821,17 @@ pub mod syscall {
             /// 目标子 pid；0 表示任意子进程。
             pid: u64,
         },
+        /// (23) 查询当前进程的父进程 PID（POSIX getppid 最小集，2026-08 新增；
+        /// **号位 23 冻结**）。无参数。返回值语义与内核孤儿策略
+        /// （microkernel process.rs【孤儿策略】）对齐：
+        /// - Fork 出的子进程：返回父进程 pid——父死后被收养的孤儿，其
+        ///   parent 已被 full_reap 重定向为 INIT_PID，故返回收养者
+        ///   launchd 的 pid=2；
+        /// - 内核直生根进程（服务注册表 spawn 路径，parent=None）：返回
+        ///   0（“无父”约定，对照 Linux 中 pid 1 的 ppid=0）。
+        /// 错误：当前槽位无有效记录 → [`SysError::PermissionDenied`]
+        /// （与号位 21 GetPid 同一防御语义）。
+        GetPpid,
     }
 
     /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。

@@ -75,6 +75,11 @@ pub unsafe extern "C" fn _start(a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
     exit(0);
 }
 
+/// forktest 的期望父 pid：fork 前由父进程写入自身 getpid() 结果；
+/// eager-copy fork 使子进程继承该静态变量的副本（跨 fork 传参的信纸），
+/// 子进程据此断言 getppid() == 父 getpid() 值（号位 23 端到端）。
+static mut FORKTEST_PARENT_PID: u64 = 0;
+
 /// 命令历史：内存态最近 8 条（环形）。单核 shell 独占执行，静态可变安全。
 static mut HISTORY: [[u8; 128]; 8] = [[0; 128]; 8];
 static mut HIST_LEN: [usize; 8] = [0; 8];
@@ -107,9 +112,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"help" || cmd == b"?" {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
-            println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/segvdemo/pid");
+            println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/segvdemo/pid/ppid");
             println("  storage: fstest/blktest");
-            println("  system: launchd/pid/clear/history/echo/whoami/help/exit");
+            println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
@@ -127,12 +132,36 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                     println(")");
                 }
             }
+        } else if cmd == b"ppid" {
+            // 号位 23：显示当前进程的父 pid。shell 由服务注册表 spawn
+            // 路径拉起（parent=None），顶层执行按“无父返回 0”约定显示
+            // ppid=0；forktest 的子进程内则显示其真实父进程的 pid。
+            match userlib::getppid() {
+                Ok(p) => {
+                    print("ppid=");
+                    print_u64(p);
+                    println("");
+                }
+                Err(e) => {
+                    print("ppid: syscall failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
         } else if cmd == b"forktest" {
             // 端到端 fork 验证：svc #0 / x0=2。
             // 返回值区分父子：父=Ok(child_pid)，子=Ok(0)。
             // 子分支打印后立即 exit，绝不回到主循环——否则两个 shell
             // 会并发抢终端（read_line 双消费者）。[P]/[C] 前缀用于在
             // 并发输出交错时辨识来源行（console_write 无进程级串行化）。
+            //
+            // 号位 23 端到端：fork 前把父进程自身 pid 写入静态变量；
+            // eager-copy fork 让子进程继承同一内存副本，子进程据此断言
+            // getppid() == 父 getpid() 值，断言结果经退出码带回父进程。
+            match userlib::getpid() {
+                Ok(my_pid) => unsafe { FORKTEST_PARENT_PID = my_pid },
+                Err(_) => unsafe { FORKTEST_PARENT_PID = 0 },
+            }
             match userlib::fork() {
                 Ok(0) => {
                     print("[C] child: alive (pid via getpid)=");
@@ -145,7 +174,32 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                         }
                     }
                     println("");
-                    exit(0); // -> ! ：子进程到此终结，永不返回主循环
+                    // 号位 23 断言：子的 getppid 必须等于父 fork 前记录的
+                    // 自身 pid；失败以非零退出码报告，父进程收尸可见。
+                    let expected_ppid = unsafe { FORKTEST_PARENT_PID };
+                    let mut ppid_ok = expected_ppid != 0;
+                    print("[C] child: ppid via getppid=");
+                    match userlib::getppid() {
+                        Ok(pp) if pp == expected_ppid => print_u64(pp),
+                        Ok(pp) => {
+                            print_u64(pp);
+                            ppid_ok = false;
+                        }
+                        Err(e) => {
+                            print("syscall failed (");
+                            print_hex(e.code());
+                            print(")");
+                            ppid_ok = false;
+                        }
+                    }
+                    println("");
+                    if ppid_ok {
+                        println("[C] forktest: child ppid assertion PASS");
+                        exit(0); // -> ! ：子进程到此终结，永不返回主循环
+                    } else {
+                        println("[C] forktest: child ppid assertion FAIL");
+                        exit(23); // 非零退出码向父进程暴露断言失败
+                    }
                 }
                 Ok(child_pid) => {
                     print("[P] parent: child_pid=");
@@ -160,6 +214,12 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                             print(" code=");
                             print_i32(code);
                             println("");
+                            // 号位 23 判定：code=0 即子进程 ppid 断言通过。
+                            if code == 0 {
+                                println("[P] forktest: PASS (child getppid == parent getpid)");
+                            } else {
+                                println("[P] forktest: FAIL (child ppid assertion rejected)");
+                            }
                         }
                         Err(e) => {
                             print("[P] forktest: wait failed (");

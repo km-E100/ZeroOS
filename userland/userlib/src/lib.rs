@@ -396,6 +396,18 @@ pub fn getpid() -> Result<u64, SysError> {
     decode_result(ret)
 }
 
+/// 查询当前进程的父进程 PID（号位 23）。
+///
+/// 语义对齐内核孤儿策略（`zero_abi::syscall::Syscall::GetPpid` 文档）：
+/// - fork 出的子进程返回父进程 pid（含被 init 收养的孤儿——返回收养者
+///   launchd 的 pid=2）；
+/// - 内核直生根进程（服务注册表 spawn 路径，如 shell 自身）无父，
+///   返回 0。
+pub fn getppid() -> Result<u64, SysError> {
+    let ret = svc_call(23, [0, 0, 0, 0]);
+    decode_result(ret)
+}
+
 /// 把 `code` 与文本载荷编码为一条 IPC `Message`。
 ///
 /// `text` 最多 127 字节（payload 128 字节，末字节保持 0，
