@@ -341,6 +341,7 @@ pub fn encode_result(result: Result<u64, SysError>) -> u64 {
             SysError::WouldBlock => u64::MAX - 5,
             SysError::DeviceError => u64::MAX - 6,
             SysError::Busy => u64::MAX - 7,
+            SysError::NotSupported => u64::MAX - 8,
         },
     }
 }
@@ -720,13 +721,15 @@ mod tests {
             val if val == u64::MAX - 5 => Err(SysError::WouldBlock),
             val if val == u64::MAX - 6 => Err(SysError::DeviceError),
             val if val == u64::MAX - 7 => Err(SysError::Busy),
+            val if val == u64::MAX - 8 => Err(SysError::NotSupported),
             other => Ok(other),
         }
     }
 
     #[test]
     fn encode_decode_ok_roundtrip() {
-        for value in [0u64, 1, 42, u64::MAX - 8, (1 << 48) - 1] {
+        // u64::MAX-8 起被 NotSupported 占用（第八刀），样本下移一格。
+        for value in [0u64, 1, 42, u64::MAX - 9, (1 << 48) - 1] {
             assert_eq!(decode_result(encode_result(Ok(value))), Ok(value));
         }
     }
@@ -742,11 +745,12 @@ mod tests {
             SysError::WouldBlock,
             SysError::DeviceError,
             SysError::Busy,
+            SysError::NotSupported,
         ];
         for err in errors {
             let encoded = encode_result(Err(err));
             assert!(
-                encoded >= u64::MAX - 7,
+                encoded >= u64::MAX - 8,
                 "error sentinel must live in reserved range: got 0x{encoded:x}"
             );
             assert_eq!(decode_result(encoded), Err(err));

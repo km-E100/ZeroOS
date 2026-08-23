@@ -4,12 +4,13 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::str;
 use spin::Mutex;
+use zero_abi::cap::{CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
 use zero_abi::ipc::Message;
 use zero_abi::syscall::{SysError, Syscall, SyscallResult};
 
+use crate::mm::table_walk::{WalkOutcome, PAGE_SIZE};
 use crate::process::TrapFrame;
 use crate::runtime::serial;
-use crate::shm;
 
 #[derive(Clone, Copy)]
 struct MmioLease {
@@ -34,16 +35,20 @@ const USER_VA_MAX: usize = 0x0000_FFFF_F000; // 用户栈顶（4GiB - 4KiB）
 const DEVICE_MMIO_LO: usize = 0x0800_0000;
 const DEVICE_MMIO_HI: usize = 0x1000_0000;
 
-/// 用户指针校验（第一道：地址范围 + 布局）。
-///
-/// 📌 协调点（mm Agent）：当前只查范围，不查映射存在性 —— 未映射页
-/// 仍会由硬件 data abort 兜底杀进程（可用），但要防"读脏地址才爆炸"
-/// 的窗口。待 mm Agent 落地 `AddressSpace::translate_user_addr` 或等价
-/// 页表 walk（见 mm/paging.rs：L0→L1→L2→L3 四级翻译 + PHYS_ADDR_MASK），
-/// 在此追加"逐页映射存在性"检查：每个 4KiB 页的 L3 entry valid &&
-/// 非块描述符。调用方已按页步进拷贝（见 copy_slice_from/to_user），
-/// 每页一个校验点即可无缝接入。
+/// 单次块 IO 的长度上限（1 MiB = 2048 扇区）：BlockRead/BlockWrite 在
+/// 内核侧以 `vec![0u8; len]` 中转，无上限时用户可用一次系统调用触发
+/// 任意大的堆分配（OOM DoS）。1 MiB 覆盖现有分块协议（blkdrv 按扇区
+/// 分片）与 securityd 整库读写需求。
+const BLOCK_IO_MAX_LEN: usize = 1024 * 1024;
+
+/// 用户指针两道门合一入口（所有代用户拷贝路径的唯一校验点）。
 fn validate_user_ptr(addr: usize, size: usize) -> Result<(), SysError> {
+    validate_user_range(addr, size)?;
+    validate_user_mapping(addr, size)
+}
+
+/// 第一道门：地址范围 + 布局（纯逻辑，host 可单测，不触页表）。
+fn validate_user_range(addr: usize, size: usize) -> Result<(), SysError> {
     if addr == 0 {
         return Err(SysError::InvalidArgument);
     }
@@ -59,6 +64,51 @@ fn validate_user_ptr(addr: usize, size: usize) -> Result<(), SysError> {
         return Err(SysError::InvalidArgument);
     }
     Ok(())
+}
+
+/// 第二道门（第八刀）：对 [addr, addr+len) 覆盖的每个 4KiB 页做
+/// 页级映射校验——用当前进程地址空间的软件走表（mm/paging.rs 的
+/// walk_space，L0→L1→L2→L3）确认该页落在**有效 L3 页描述符**上。
+///
+/// 为什么必须逐页走表（严苛评审 Top 缺陷）：仅查范围放过了两类
+/// 危险指针——① 完全未映射的页（靠硬件 data abort 兜底杀进程，
+/// "读脏地址才爆炸"）；② 从内核恒等映射继承来的 2MiB **block** 窗口
+/// （私有 L2 副本原样引用，AP=EL1-only）。第②类最阴险：EL0 自行访问
+/// 会被权限挡住，但内核代拷贝跑在 EL1、会绕过 AP 把设备/MMIO 窗口
+/// 当普通内存读写——等于给用户一个借内核之手触碰恒等映射的旁路。
+/// 因此 Unmapped 与 Block 一律拒绝，只有 Page 通过。
+///
+/// 性能：拷贝路径本就按 4KiB 步进（copy_slice_from/to_user 每页一次
+/// 校验点），每页一次纯内存走表是 O(1)，无堆分配。
+fn validate_user_mapping(addr: usize, size: usize) -> Result<(), SysError> {
+    let slot = crate::scheduler::current_slot();
+    // 无地址空间的进程（内核直生占位）没有任何合法用户缓冲区：
+    // fail-closed，一律 InvalidArgument。
+    let Some(space) = crate::process::address_space(slot) else {
+        return Err(SysError::InvalidArgument);
+    };
+    for page in page_bases(addr, size) {
+        if !page_walk_accepts(space.walk(page)) {
+            return Err(SysError::InvalidArgument);
+        }
+    }
+    Ok(())
+}
+
+/// [addr, addr+size) 覆盖的 4KiB 页基址迭代（含首尾非对齐页；
+/// size=0 为空迭代）。纯算术，host 单测钉死边界。
+fn page_bases(addr: usize, size: usize) -> impl Iterator<Item = usize> {
+    let end = addr.saturating_add(size);
+    let first = addr & !(PAGE_SIZE - 1);
+    (first..end).step_by(PAGE_SIZE)
+}
+
+/// 页级判定（纯函数，host 用伪造描述符表单测）：只有有效 L3 页
+/// 描述符通过；Unmapped（任一级无效）与 Block（继承的恒等映射块）
+/// 都拒绝——理由见 validate_user_mapping 文档。空槽/无地址空间由
+/// 上游 fail-closed，这里只看走表结果。
+fn page_walk_accepts(outcome: WalkOutcome) -> bool {
+    matches!(outcome, WalkOutcome::Page { .. })
 }
 
 /// mmio lease 校验：phys 必须落在 QEMU virt 设备区且长度不越界。
@@ -178,12 +228,14 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             user_buffer,
             len,
         } => {
+            // 第八刀：块直通数据面收权——仅持 CAP_BLOCK_DEV 的进程
+            // （blkdrv）可发起；len 上限防 vec![0u8; len] 巨分配 DoS。
+            let caller_slot = crate::scheduler::current_slot();
+            ensure_capability(caller_slot, CAP_BLOCK_DEV)?;
             if len == 0 {
                 return Ok(0);
             }
-            if len % 512 != 0 {
-                return Err(SysError::InvalidArgument);
-            }
+            check_block_io_len(len)?;
             let mut buffer = vec![0u8; len];
             crate::drivers::virtio::blk::read_blocks(lba, &mut buffer).map_err(map_block_error)?;
             unsafe {
@@ -196,12 +248,13 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             user_buffer,
             len,
         } => {
+            // 门控同 BlockRead（CAP_BLOCK_DEV + 1 MiB 上限）。
+            let caller_slot = crate::scheduler::current_slot();
+            ensure_capability(caller_slot, CAP_BLOCK_DEV)?;
             if len == 0 {
                 return Ok(0);
             }
-            if len % 512 != 0 {
-                return Err(SysError::InvalidArgument);
-            }
+            check_block_io_len(len)?;
             let mut buffer = vec![0u8; len];
             unsafe {
                 copy_slice_from_user(user_buffer, &mut buffer)?;
@@ -209,29 +262,19 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             crate::drivers::virtio::blk::write_blocks(lba, &buffer).map_err(map_block_error)?;
             Ok(len as u64)
         }
-        Syscall::ShmCreate { size, user_result } => {
-            let (handle, ptr, len) = shm::create(size).map_err(map_shm_error)?;
-            unsafe {
-                write_shm_create_result(user_result, handle, ptr, len)?;
-            }
-            Ok(0)
-        }
-        Syscall::ShmMap { handle } => {
-            let ptr = shm::map(handle).map_err(map_shm_error)?;
-            Ok(ptr as u64)
-        }
-        Syscall::ShmLen { handle } => {
-            let len = shm::len(handle).map_err(map_shm_error)?;
-            Ok(len as u64)
-        }
-        Syscall::ShmRetain { handle } => {
-            shm::retain(handle).map_err(map_shm_error)?;
-            Ok(0)
-        }
-        Syscall::ShmRelease { handle } => {
-            shm::release(handle).map_err(map_shm_error)?;
-            Ok(0)
-        }
+        // ═══ SHM 系统调用族（号位 10-14/17）：第八刀止血下线 ═══
+        // 现实现把内核恒等映射区的指针直接交给 EL0：用户态首次解引用即
+        // 致命异常（恒等映射 AP=EL1-only，EL0 无权访问），号位 17 更是把
+        // 物理地址原样泄漏给不可信调用方——两条路都封死，故整族恒返回
+        // Err(NotSupported)。重设计（Region 表 + map 进请求者地址空间，
+        // 句柄只作引用计数）见 STATUS「第八刀候选」第 3 条；号位冻结，
+        // 届时按同号位恢复语义。受影响的旧 shm 句柄协议路径（blkdrv/
+        // fsd 的历史命令码）本就返回 STATUS_UNSUPPORTED，不受波及。
+        Syscall::ShmCreate { size: _, user_result: _ } => Err(SysError::NotSupported),
+        Syscall::ShmMap { handle: _ } => Err(SysError::NotSupported),
+        Syscall::ShmLen { handle: _ } => Err(SysError::NotSupported),
+        Syscall::ShmRetain { handle: _ } => Err(SysError::NotSupported),
+        Syscall::ShmRelease { handle: _ } => Err(SysError::NotSupported),
         Syscall::DriverCount => {
             let count = crate::drivers::descriptors()
                 .map(|table| table.len())
@@ -245,13 +288,11 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             }
             Ok(0)
         }
-        Syscall::ShmPhys { handle } => {
-            let phys = shm::phys(handle).map_err(map_shm_error)?;
-            Ok(phys as u64)
-        }
+        // 号位 17：物理地址直接出内核 = 信息泄漏，随 SHM 族一并下线。
+        Syscall::ShmPhys { handle: _ } => Err(SysError::NotSupported),
         Syscall::MmioMap { index, user_buffer } => {
             let caller_slot = crate::scheduler::current_slot();
-            ensure_privileged(caller_slot)?;
+            ensure_capability(caller_slot, CAP_MMIO)?;
             let descriptor = descriptor_for_index(index)?;
             // 校验 lease 的 phys（mmio_base）落在设备区，防驱动表被污染。
             validate_mmio_region(descriptor.mmio_base, descriptor.mmio_len)?;
@@ -263,7 +304,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         }
         Syscall::MmioUnmap { index } => {
             let caller_slot = crate::scheduler::current_slot();
-            ensure_privileged(caller_slot)?;
+            ensure_capability(caller_slot, CAP_MMIO)?;
             release_mmio(caller_slot, index)?;
             Ok(0)
         }
@@ -285,7 +326,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         }
         Syscall::SpawnService { name_ptr, name_len } => {
             let caller_slot = crate::scheduler::current_slot();
-            ensure_privileged(caller_slot)?;
+            ensure_capability(caller_slot, CAP_SPAWN_SVC)?;
             let name = copy_string_from_user(name_ptr, name_len)?;
             match crate::services::spawn_service_by_name(name.as_str()) {
                 Ok(pid) => {
@@ -360,20 +401,31 @@ fn map_block_error(err: crate::drivers::BlockError) -> SysError {
     }
 }
 
-fn map_shm_error(err: shm::ShmError) -> SysError {
-    match err {
-        shm::ShmError::Invalid => SysError::InvalidArgument,
-        shm::ShmError::NotFound => SysError::NotFound,
-        shm::ShmError::Capacity => SysError::NoMemory,
-    }
-}
-
-fn ensure_privileged(slot: usize) -> Result<(), SysError> {
-    if crate::process::is_slot_privileged(slot) {
+/// 能力判定（纯函数，host 单测覆盖）：`caps` 持有 `required` 的**全部**
+/// 位才放行；required=0 防御性拒绝（空掩码恒真会静默放行一切）。
+fn ensure_caps(caps: u32, required: u32) -> Result<(), SysError> {
+    if required != 0 && caps & required == required {
         Ok(())
     } else {
         Err(SysError::PermissionDenied)
     }
+}
+
+/// 按槽位取能力位图并做门控（第八刀自布尔特权位升格：原
+/// ensure_privileged/is_slot_privileged 只认一个 bool，无法表达
+/// "能拉起服务但不能摸块设备"这类最小授权）。
+fn ensure_capability(slot: usize, required: u32) -> Result<(), SysError> {
+    ensure_caps(crate::process::slot_capabilities(slot), required)
+}
+
+/// 块 IO 长度校验（BlockRead/BlockWrite 共用）：非零 + 512 对齐 +
+/// 1 MiB 上限（上限理由见 BLOCK_IO_MAX_LEN 注释）。len=0 的合法早退
+/// 语义由调用方先行处理；走到本函数的 0 视为调用序错误。
+fn check_block_io_len(len: usize) -> Result<(), SysError> {
+    if len == 0 || len % 512 != 0 || len > BLOCK_IO_MAX_LEN {
+        return Err(SysError::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn descriptor_for_index(
@@ -492,17 +544,6 @@ fn copy_string_from_user(ptr: usize, len: usize) -> Result<String, SysError> {
     Ok(String::from(text))
 }
 
-unsafe fn write_shm_create_result(
-    addr: usize,
-    handle: u32,
-    ptr_value: usize,
-    len: usize,
-) -> Result<(), SysError> {
-    let rec = [handle as u64, ptr_value as u64, len as u64];
-    let bytes = core::slice::from_raw_parts(rec.as_ptr().cast::<u8>(), rec.len() * 8);
-    copy_slice_to_user(addr, bytes)
-}
-
 unsafe fn write_driver_info(
     addr: usize,
     descriptor: &zero_abi::driver::DriverDescriptor,
@@ -536,36 +577,173 @@ unsafe fn write_mmio_info(addr: usize, base: u64, len: u64) -> Result<(), SysErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::table_walk::{
+        make_leaf_descriptor, make_table_descriptor, walk, DESC_AF, DESC_VALID, USER_AP_RW,
+    };
+
+    // ── 第一道门：范围 + 布局（纯逻辑） ─────────────────────────────
 
     #[test]
-    fn validate_ptr_rejects_null() {
-        assert!(validate_user_ptr(0, 1).is_err());
+    fn validate_range_rejects_null() {
+        assert!(validate_user_range(0, 1).is_err());
     }
 
     #[test]
-    fn validate_ptr_rejects_below_user_va_lo() {
-        assert!(validate_user_ptr(USER_VA_LO - 1, 1).is_err());
-        assert!(validate_user_ptr(USER_VA_LO, 0).is_ok());
+    fn validate_range_rejects_below_user_va_lo() {
+        assert!(validate_user_range(USER_VA_LO - 1, 1).is_err());
+        assert!(validate_user_range(USER_VA_LO, 0).is_ok());
     }
 
     #[test]
-    fn validate_ptr_rejects_kernel_region() {
-        assert!(validate_user_ptr(KERNEL_REGION_START, 1).is_err());
-        assert!(validate_user_ptr(KERNEL_REGION_START + 0x1000, 4096).is_err());
-        assert!(validate_user_ptr(KERNEL_REGION_END - 1, 1).is_err());
+    fn validate_range_rejects_kernel_region() {
+        assert!(validate_user_range(KERNEL_REGION_START, 1).is_err());
+        assert!(validate_user_range(KERNEL_REGION_START + 0x1000, 4096).is_err());
+        assert!(validate_user_range(KERNEL_REGION_END - 1, 1).is_err());
     }
 
     #[test]
-    fn validate_ptr_rejects_overflow_and_top() {
-        assert!(validate_user_ptr(usize::MAX, 2).is_err());
-        assert!(validate_user_ptr(USER_VA_MAX - 3, 4).is_err());
-        assert!(validate_user_ptr(USER_VA_MAX - 4, 4).is_ok());
+    fn validate_range_rejects_overflow_and_top() {
+        assert!(validate_user_range(usize::MAX, 2).is_err());
+        assert!(validate_user_range(USER_VA_MAX - 3, 4).is_err());
+        assert!(validate_user_range(USER_VA_MAX - 4, 4).is_ok());
     }
 
     #[test]
-    fn validate_ptr_boundary_case() {
+    fn validate_range_boundary_case() {
         // 恰好落在 1GiB 边界以下（0x3FFF_FFFF 属于用户区末尾）
-        assert!(validate_user_ptr(KERNEL_REGION_START - 1, 1).is_ok());
+        assert!(validate_user_range(KERNEL_REGION_START - 1, 1).is_ok());
+    }
+
+    // ── 第二道门：页级映射校验（伪造描述符表驱动纯逻辑） ───────────
+
+    /// 4K 对齐的伪页表（与 table_walk 单测同一手法：地址即“物理地址”）。
+    #[repr(align(4096))]
+    struct FakeTables {
+        l0: [u64; 512],
+        l1: [u64; 512],
+        l2: [u64; 512],
+        l3: [u64; 512],
+    }
+
+    impl FakeTables {
+        fn new() -> Self {
+            Self {
+                l0: [0; 512],
+                l1: [0; 512],
+                l2: [0; 512],
+                l3: [0; 512],
+            }
+        }
+
+        fn link_default(&mut self) {
+            self.l0[0] = make_table_descriptor(self.l1.as_ptr() as u64);
+            self.l1[0] = make_table_descriptor(self.l2.as_ptr() as u64);
+            self.l2[0] = make_table_descriptor(self.l3.as_ptr() as u64);
+        }
+
+        fn root(&self) -> *mut u64 {
+            self.l0.as_ptr() as *mut u64
+        }
+    }
+
+    #[test]
+    fn page_walk_accepts_valid_l3_page_only() {
+        let mut t = FakeTables::new();
+        t.link_default();
+        // L3[1] 挂有效页描述符：VA 0x1000 必须通过。
+        t.l3[1] = make_leaf_descriptor(0x4100_3000, USER_AP_RW, false);
+        let outcome = unsafe { walk(t.root(), 0x1000) };
+        assert!(matches!(outcome, WalkOutcome::Page { .. }));
+        assert!(page_walk_accepts(outcome));
+        // 同一张 L3 下未映射的槽位（L3[2]=0）：拒绝——未映射页不再
+        // 依赖硬件 data abort 兜底，校验点直接回 InvalidArgument。
+        let unmapped = unsafe { walk(t.root(), 0x2000) };
+        assert_eq!(unmapped, WalkOutcome::Unmapped);
+        assert!(!page_walk_accepts(unmapped));
+        // 上级表断链（L1[1] 空 → VA 1GiB 处）：同样拒绝。
+        assert!(!page_walk_accepts(unsafe { walk(t.root(), 0x4000_0000) }));
+    }
+
+    #[test]
+    fn page_walk_rejects_block_descriptor() {
+        // 安全核心：从内核恒等映射继承来的 2MiB block（AP=EL1-only）
+        // 对 EL0 本不可访问，但内核代拷贝跑在 EL1 会绕过 AP——第二道
+        // 门必须把 Block 判为非法，堵死“借内核之手读写恒等映射”旁路。
+        let mut t = FakeTables::new();
+        t.link_default();
+        // L2[2] 放 block 描述符（bit1=0），覆盖 VA [4MiB, 6MiB) 窗口。
+        t.l2[2] = (0x40_0000u64) | DESC_VALID | DESC_AF;
+        let outcome = unsafe { walk(t.root(), 0x40_1234) };
+        assert!(matches!(outcome, WalkOutcome::Block { .. }));
+        assert!(!page_walk_accepts(outcome));
+    }
+
+    #[test]
+    fn page_bases_iteration_math() {
+        const P: usize = PAGE_SIZE;
+        // size=0 → 空迭代（校验直通，与历史 len=0 早退语义一致）。
+        assert_eq!(page_bases(P, 0).count(), 0);
+        // 页内单字节 → 一页。
+        assert_eq!(page_bases(P + 5, 1).collect::<Vec<_>>(), vec![P]);
+        // 起始非对齐跨两页。
+        assert_eq!(
+            page_bases(P - 1, 2).collect::<Vec<_>>(),
+            vec![0, P]
+        );
+        // 尾字节恰好落进下一页首字节：新页必须计入。
+        assert_eq!(
+            page_bases(P, P + 1).collect::<Vec<_>>(),
+            vec![P, 2 * P]
+        );
+        // 整数页跨度。
+        assert_eq!(
+            page_bases(P, 3 * P).collect::<Vec<_>>(),
+            vec![P, 2 * P, 3 * P]
+        );
+    }
+
+    // ── capability bitmask 门控（纯逻辑） ──────────────────────────
+
+    #[test]
+    fn ensure_caps_bitwise_decision() {
+        use zero_abi::cap::{CAP_ALL, CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
+        // 单位授予/缺位拒绝。
+        assert_eq!(ensure_caps(CAP_MMIO, CAP_MMIO), Ok(()));
+        assert_eq!(
+            ensure_caps(0, CAP_MMIO),
+            Err(SysError::PermissionDenied)
+        );
+        // 多位要求：必须全部置位（子集不算持有）。
+        let both = CAP_MMIO | CAP_BLOCK_DEV;
+        assert_eq!(ensure_caps(both, both), Ok(()));
+        assert_eq!(
+            ensure_caps(CAP_MMIO, both),
+            Err(SysError::PermissionDenied)
+        );
+        // 多余能力不碍事（最小授权的反面是超集无害）。
+        assert_eq!(ensure_caps(CAP_ALL, CAP_SPAWN_SVC), Ok(()));
+        // required=0 防御性拒绝：空掩码不能静默放行一切。
+        assert_eq!(ensure_caps(CAP_ALL, 0), Err(SysError::PermissionDenied));
+        assert_eq!(ensure_caps(0, 0), Err(SysError::PermissionDenied));
+    }
+
+    // ── 块 IO 长度上限（防巨分配 DoS） ─────────────────────────────
+
+    #[test]
+    fn block_io_len_gate_boundaries() {
+        const MAX: usize = BLOCK_IO_MAX_LEN;
+        assert!(check_block_io_len(512).is_ok());
+        assert!(check_block_io_len(1024 * 512).is_ok());
+        // 恰 1 MiB（2048 扇区）合法；再多半扇区即拒。
+        assert!(check_block_io_len(MAX).is_ok());
+        assert!(check_block_io_len(MAX + 512).is_err());
+        assert!(check_block_io_len(MAX * 16).is_err());
+        assert!(check_block_io_len(usize::MAX / 2).is_err());
+        // 非 512 对齐一律拒绝。
+        assert!(check_block_io_len(513).is_err());
+        assert!(check_block_io_len(511).is_err());
+        // len=0 不进本函数（调用方早退返回 Ok(0)）；此处防御性拒绝。
+        assert!(check_block_io_len(0).is_err());
     }
 
     #[test]
