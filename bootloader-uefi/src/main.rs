@@ -11,6 +11,7 @@ mod boot_state;
 mod elf;
 mod fs;
 mod kernel_loader;
+mod pstore;
 mod util;
 
 use boot_config::{BootPaths, BootVariant};
@@ -33,6 +34,10 @@ fn real_entry(handle: Handle, mut st: SystemTable<Boot>) -> Result<(), Status> {
     log::set_max_level(log::LevelFilter::Info);
 
     log_info!("Zero OS UEFI bootloader starting up");
+
+    // 重启后第一屏：上次崩溃日志（若有）。必须先于任何可能重用窗口
+    // 内存的中期分配完成读取与打印，随后占住窗口供本次内核使用。
+    pstore::recover_previous(st.boot_services());
 
     let device_handle = boot_config::boot_device_handle(&st, handle)?;
 

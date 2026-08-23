@@ -17,17 +17,63 @@ use spin::Mutex;
 
 pub use super::phys_bitmap::{PhysBitmap, PAGE_SIZE};
 
+use crate::debug::pstore::{PSTORE_BASE, PSTORE_SIZE};
+
 const MAX_PAGES: usize = 1024 * 1024; // 4 GiB / 4KiB pages (upper bound)
+
+// -- pstore 固定窗口保留（崩溃日志落盘区，见 debug/pstore.rs）---------
+//
+// 窗口 [0x4200_0000, 0x4201_0000)：QEMU virt RAM 内、实测内核镜像
+// （末尾 ≈0x410D1000，约 17 MiB）之外——初版 0x4100_0000 被内核 BSS
+// 段覆盖（实机 ELF 段表定位），已上移；init_from_regions 收到
+// reserved_bytes 后有运行期 tripwire 兜底镜像再长大的情形。
+// 分配器的两条 init 路径（legacy / memory-map）都必须把整窗标忙，
+// 否则首个跨过窗口的分配就会挪用崩溃日志区。几何约束编译期钉死：
+// 相对页号下溢 / 未对齐 / 越出恒等映射窗口都会在 build 阶段直接失败。
+/// pstore 窗口的 RAM 内相对起始字节偏移。
+const PSTORE_BASE_REL: usize = (PSTORE_BASE as usize)
+    .checked_sub(RAM_BASE)
+    .expect("pstore window below RAM_BASE");
+/// pstore 窗口占用的页数。
+const PSTORE_PAGES: usize = PSTORE_SIZE / PAGE_SIZE;
+
+const _: () = assert!(
+    PSTORE_BASE as usize % PAGE_SIZE == 0,
+    "pstore window not page aligned"
+);
+const _: () = assert!(
+    PSTORE_SIZE % PAGE_SIZE == 0,
+    "pstore window size not page aligned"
+);
+const _: () = assert!(
+    PSTORE_BASE_REL / PAGE_SIZE + PSTORE_PAGES <= 1024 * 512,
+    "pstore window outside identity-mapped 2GiB"
+);
 
 /// QEMU virt 机器的 RAM 物理基址（1GiB 内存时区间为 0x4000_0000..0x8000_0000）。
 /// 此前分配器把物理地址 0 当作 RAM 起点，分配出的"物理页"全部落在
 /// 固件/MMIO 空洞（0x1007000 等），用户数据写进去被静默丢弃。
 pub const RAM_BASE: usize = 0x4000_0000;
 
-static BITMAP_WORDS: [u64; MAX_PAGES / 64] = [0; MAX_PAGES / 64];
+/// 位图存储载体：内层可变（UnsafeCell）。⚠ 不能是普通静态数组：
+/// 纯零、且安全代码里只有 as_ptr() 只读借用的静态会被 LLVM 折叠进
+/// 只读段（macOS 宿主测试落在 __DATA_CONST），init 一写即 SIGBUS——
+/// 与 debug::__zero_symbol_sink / __zero_memory_map 同一个坑，同法根治。
+struct BitmapStorage(core::cell::UnsafeCell<[u64; MAX_PAGES / 64]>);
+// Safety：裸机侧全部访问都发生在 MM 自旋锁内（单核内核）；宿主测试
+// 以 INIT_LOCK 互斥锁串行，不存在并发读写。
+unsafe impl Sync for BitmapStorage {}
+static BITMAP_WORDS: BitmapStorage = BitmapStorage(core::cell::UnsafeCell::new([0; MAX_PAGES / 64]));
+
 /// 每页引用计数（与 BITMAP_WORDS 平行，每物理页一格 u16，2 MiB .bss）。
 /// 上限 65535 份共享/页——COW fork 链远达不到，超出即记账 bug。
-static REF_COUNTS: [u16; MAX_PAGES] = [0; MAX_PAGES];
+/// ⚠ 载体同 BITMAP_WORDS：纯零 static + as_ptr() 只读借用会被折叠进
+/// 只读段（宿主测试 SIGBUS），必须 UnsafeCell 表达可变性。
+struct RefCountStorage(core::cell::UnsafeCell<[u16; MAX_PAGES]>);
+// Safety：与 BitmapStorage 同一纪律——裸机侧全部访问都在 MM 自旋锁内；
+// 宿主测试以 INIT_LOCK 串行。
+unsafe impl Sync for RefCountStorage {}
+static REF_COUNTS: RefCountStorage = RefCountStorage(core::cell::UnsafeCell::new([0; MAX_PAGES]));
 static MM: Mutex<PhysBitmap> = Mutex::new(PhysBitmap::empty());
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 
@@ -46,6 +92,15 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
     let mut regions = MemRegions::default();
     #[allow(unused_assignments)]
     let mut holes_reserved = 0usize; // 分支内必然赋值；初值仅为类型占位
+    // ⚠ pstore 窗口 tripwire：内核镜像保留区一旦长过窗口基址，说明窗口
+    // 落进了内核自身内存（BSS 别名），pstore 不再可用——串口大声报警。
+    if reserved_pages_for(reserved_bytes) > PSTORE_BASE_REL / PAGE_SIZE {
+        crate::warn!(
+            "phys: kernel reservation ({:#x} bytes) reaches past pstore window @0x{:x}; crash log area aliased by kernel image!",
+            reserved_bytes,
+            PSTORE_BASE
+        );
+    }
     let mut mm = MM.lock();
     // Safety 契约：read_memory_map_sink 仅读引导器汇槽（UnsafeCell 外部
     // 写入由灌表先于内核的时序保证）；init_from_regions 内部自管 safety。
@@ -84,15 +139,18 @@ fn legacy_init(mm: &mut PhysBitmap, memory_bytes: usize, reserved_bytes: usize) 
     let reserved = usize::min(reserved_pages_for(reserved_bytes), total).max(1);
     unsafe {
         mm.init(
-            BITMAP_WORDS.as_ptr() as *mut u64,
-            BITMAP_WORDS.len(),
-            REF_COUNTS.as_ptr() as *mut u16,
-            REF_COUNTS.len(),
+            BITMAP_WORDS.0.get().cast::<u64>(),
+            MAX_PAGES / 64,
+            REF_COUNTS.0.get().cast::<u16>(),
+            MAX_PAGES,
             RAM_BASE,
             total,
             reserved,
         );
     }
+    // pstore 固定窗口永久占用：内核保留区（max(镜像,16MiB)=4096 页）
+    // 只到窗口起点为止，不显式标忙分配器就会把崩溃日志页发出去。
+    mark_pstore_busy(mm);
 }
 
 /// 区间驱动初始化：[RAM_BASE, top) 全域建图，随后把**不被任何可用
@@ -116,10 +174,10 @@ fn init_from_regions(
     let total = (top_rel / PAGE_SIZE).max(1);
     unsafe {
         mm.init(
-            BITMAP_WORDS.as_ptr() as *mut u64,
-            BITMAP_WORDS.len(),
-            REF_COUNTS.as_ptr() as *mut u16,
-            REF_COUNTS.len(),
+            BITMAP_WORDS.0.get().cast::<u64>(),
+            MAX_PAGES / 64,
+            REF_COUNTS.0.get().cast::<u16>(),
+            MAX_PAGES,
             RAM_BASE,
             total,
             0,
@@ -131,6 +189,11 @@ fn init_from_regions(
     for page in 0..kernel_pages {
         mm.mark_busy(page);
     }
+
+    // 1.5) pstore 固定窗口永久占用（幂等）：它落在 CONVENTIONAL 区间
+    //      **内部**，下面的扫洞只标「区间之间的空隙」，不会覆盖到它；
+    //      必须在这里显式登记，否则分配器照发不误。
+    mark_pstore_busy(mm);
 
     // 2) 双指针扫洞（全部使用相对页坐标）：
     //    [cursor, region_start) 的空隙 → 标忙；region 内部保持空闲，
@@ -162,6 +225,15 @@ fn init_from_regions(
 /// 首个页表分配写入描述符砸碎页首内核静态变量（ROOTFS_PTR 实机崩）。
 pub const fn reserved_pages_for(bytes: usize) -> usize {
     bytes.div_ceil(PAGE_SIZE)
+}
+
+/// 把 pstore 固定物理窗口整段标忙（幂等）。页号越界（total 太小的
+/// 极端配置）由 mark_busy 自行静默跳过——窗口本就不存在的内存里。
+fn mark_pstore_busy(mm: &mut PhysBitmap) {
+    let base_page = PSTORE_BASE_REL / PAGE_SIZE;
+    for page in base_page..base_page + PSTORE_PAGES {
+        mm.mark_busy(page);
+    }
 }
 
 /// 分配一页物理内存，返回物理地址；无空闲页返回 None。
@@ -226,6 +298,98 @@ mod tests {
         assert_eq!(reserved_pages_for(4096), 1);
         assert_eq!(reserved_pages_for(4097), 2);
         assert_eq!(reserved_pages_for(0x101d040), 0x101e);
+    }
+
+    // ── pstore 窗口保留（几何 + 两条 init 路径）钉死测试 ──────────────
+    //
+    // init 路径内部写模块级 static BITMAP_WORDS，测试间必须串行。
+    static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const MEM_BYTES: usize = 512 * 1024 * 1024;
+
+    /// 断言窗口 16 页全部不可分配，且紧邻页状态符合预期。
+    fn assert_window_reserved(bm: &PhysBitmap) {
+        for i in 0..PSTORE_PAGES {
+            let addr = PSTORE_BASE as usize + i * PAGE_SIZE;
+            assert!(
+                !bm.page_is_free(addr),
+                "pstore window page {i} @0x{addr:x} must never be handed out"
+            );
+        }
+        // 窗口前一页（0x4200_0000 之下）与后一页：普通可分配内存。
+        // （内核保留区实测 ≈17MiB，够不到 32MiB 处的窗口两侧。）
+        assert!(bm.page_is_free(PSTORE_BASE as usize - PAGE_SIZE));
+        assert!(bm.page_is_free(PSTORE_BASE as usize + PSTORE_SIZE));
+    }
+
+    #[test]
+    fn pstore_window_geometry_is_pinned() {
+        // 窗口 @0x4200_0000 = RAM 内偏移 32MiB = 相对页 0x2000，共 16 页。
+        assert_eq!(PSTORE_BASE, 0x4200_0000);
+        assert_eq!(PSTORE_BASE_REL / PAGE_SIZE, 0x2000);
+        assert_eq!(PSTORE_PAGES, 16);
+        // 迁移记录：实测 debug 内核镜像末尾 ≈0x410D1000（约 17 MiB，
+        // 第三加载段 BSS 零填充覆盖到窗口旧址 0x41000000 之上），故窗口
+        // 必须在 17 MiB 之上——32 MiB 处留 ~15 MiB 余量。此断言钉死
+        // 「窗口不得低于实测镜像末尾」的下界，防止回退到重叠地址。
+        assert!(PSTORE_BASE as usize >= 0x410D1000 + PAGE_SIZE);
+        // 默认保留区下限 16MiB（4096 页）< 窗口基页：两条 init 路径的
+        // 显式标忙不可省略；若未来镜像长大越过窗口，init 的运行期
+        // tripwire 会在串口报警（标忙本身幂等无害）。
+        assert!(reserved_pages_for(16 * 1024 * 1024) < PSTORE_BASE_REL / PAGE_SIZE);
+    }
+
+    #[test]
+    fn pstore_window_reserved_legacy_path() {
+        let _g = INIT_LOCK.lock().unwrap();
+        let mut bm = PhysBitmap::empty();
+        legacy_init(&mut bm, MEM_BYTES, 16 * 1024 * 1024);
+        assert_window_reserved(&bm);
+        // 窗口之前的空档（保留区末尾 → 窗口起点）首帧可正常分配。
+        assert_eq!(
+            bm.alloc_page(),
+            Some(RAM_BASE + 16 * 1024 * 1024) // 相对页 4096（绝对地址）
+        );
+        // 跨窗连续分配（空档全部 + 窗口 16 页 + 1）装不进窗口前段，
+        // first-fit 必须整段跳过窗口，落在 0x4201_0000——不得拆窗。
+        let demand = PSTORE_BASE_REL / PAGE_SIZE
+            - reserved_pages_for(16 * 1024 * 1024)
+            + PSTORE_PAGES
+            + 1;
+        assert_eq!(
+            bm.alloc_contiguous(demand),
+            Some(PSTORE_BASE as usize + PSTORE_SIZE)
+        );
+    }
+
+    #[test]
+    fn pstore_window_reserved_memory_map_path() {
+        let _g = INIT_LOCK.lock().unwrap();
+        let mut bm = PhysBitmap::empty();
+        // 引导器精细路径：单块 512MiB CONVENTIONAL 区间（QEMU virt 等价）。
+        init_from_regions(&mut bm, &[(crate::mm::phys::RAM_BASE, MEM_BYTES)], 16 * 1024 * 1024);
+        assert_window_reserved(&bm);
+        // 空闲数必须恰好扣掉窗口 16 页（与 legacy 路径同总量对齐），
+        // 且必须在下面的试分配之前断言（分配会消耗空闲计数）。
+        let mut legacy = PhysBitmap::empty();
+        legacy_init(&mut legacy, MEM_BYTES, 16 * 1024 * 1024);
+        assert_eq!(bm.free_count(), legacy.free_count());
+        assert_eq!(
+            bm.free_count(),
+            MEM_BYTES / PAGE_SIZE
+                - reserved_pages_for(16 * 1024 * 1024)
+                - PSTORE_PAGES
+        );
+        // 跨窗口的连续分配（空档全部 + 窗口 16 页 + 1）必须被整段顶到
+        // 窗口之后（0x4201_0000），不得拆窗。
+        let demand = PSTORE_BASE_REL / PAGE_SIZE
+            - reserved_pages_for(16 * 1024 * 1024)
+            + PSTORE_PAGES
+            + 1;
+        assert_eq!(
+            bm.alloc_contiguous(demand),
+            Some(PSTORE_BASE as usize + PSTORE_SIZE)
+        );
     }
 }
 
