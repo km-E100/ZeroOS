@@ -832,6 +832,33 @@ pub mod syscall {
         /// 错误：当前槽位无有效记录 → [`SysError::PermissionDenied`]
         /// （与号位 21 GetPid 同一防御语义）。
         GetPpid,
+        /// (24) 调整用户堆 break（POSIX brk 最小集，第十刀；**号位 24 冻结**，
+        /// 2026-08 新增）：`x1`=请求的新 break 虚拟地址（u64 按 usize 解释）。
+        ///
+        /// 布局契约（与内核 `mm/address_space.rs::USER_HEAP_BASE` 一致）：
+        /// - 堆区域为 `[USER_HEAP_BASE, brk)`，`USER_HEAP_BASE = 0x1000_0000`
+        ///   （256 MiB，2 MiB 对齐：避开 [0x20_0000, ~4MiB) 的 ELF 链接区，
+        ///   与 bootfs(2GiB)/栈顶(0xFFFF_F000) 不相交，且整段落在用户私有
+        ///   L1[0] 区间（<1GiB），不触碰内核共享表 L1[1]）；
+        /// - 初始 break == USER_HEAP_BASE（0 字节堆）；spawn/exec 重置、
+        ///   fork 原样继承（子堆页随 eager-copy 克隆自然带上）；
+        /// - 上限：堆总量 ≤ 64 MiB（`USER_HEAP_MAX_LEN`），超出返回
+        ///   [`SysError::NoMemory`]（对应 POSIX ENOMEM）。
+        ///
+        /// 语义：
+        /// - `x1 > 当前 break`：按页分配零页并以 USER_AP_RW 映入
+        ///   `[旧break, 对齐后新break)`；中途失败整体回滚（原子性）；
+        /// - `x1 < 当前 break`：解除映射并归还物理页（清 PTE + BBM TLB flush）；
+        /// - `x1 == 0`：查询——返回当前 break，不做任何修改；
+        /// - 请求值向上对齐到 4 KiB 页边界后生效并**返回对齐后的新 break**
+        ///   （对照 Linux 返回原始请求值的差异在此披露：本内核以页为唯一
+        ///   粒度，对齐值即规范值）；`x1 < USER_HEAP_BASE` 返回
+        ///   [`SysError::InvalidArgument`]；
+        /// - 当前进程无地址空间（内核直生占位）→ [`SysError::PermissionDenied`]。
+        Brk {
+            /// 请求的新 break 虚拟地址；0 表示查询当前值。
+            new_break: usize,
+        },
     }
 
     /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。

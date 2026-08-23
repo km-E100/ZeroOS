@@ -8,6 +8,7 @@ use zero_abi::cap::{CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
 use zero_abi::ipc::Message;
 use zero_abi::syscall::{SysError, Syscall, SyscallResult};
 
+use crate::mm::address_space::{USER_HEAP_BASE, USER_HEAP_MAX_LEN};
 use crate::mm::table_walk::{WalkOutcome, PAGE_SIZE};
 use crate::process::TrapFrame;
 use crate::runtime::serial;
@@ -396,6 +397,15 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 None => Err(SysError::PermissionDenied),
             }
         }
+        // ═══ 号位 24：用户堆 break（POSIX brk 最小集，第十刀）═══
+        // ABI 冻结（zero-abi Syscall::Brk 同步注释）：x1=请求的新 break
+        // 虚拟地址；x1=0 为查询。布局：堆区域 [USER_HEAP_BASE(0x1000_0000),
+        // brk)，总量上限 64MiB。无需能力位图——进程只能调整自己的地址空间。
+        // 引擎与规划函数见文件尾部 brk 一节（两阶段锁纪律同 fork/exec）。
+        Syscall::Brk { new_break } => {
+            let caller_slot = crate::scheduler::current_slot();
+            sys_brk(caller_slot, new_break as u64)
+        }
         // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
         // 有活子未退则挂起（登记精确等待目标 wait_target + block_current，
         // 仅匹配目标的子退出才由其 Exit 路径写父 TrapFrame 并 wake——
@@ -418,6 +428,90 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 号位 24：用户堆 break 引擎（POSIX brk 最小集，第十刀新增）。
+//
+// 两阶段锁纪律（同 fork/exec 的「分配在锁外、提交在锁内」）：
+//   阶段一（表锁内）：process::heap_view 取 (地址空间副本, 当前 brk)；
+//   页表操作（表锁外）：增长 map_heap_region / 收缩 unmap_heap_region
+//     ——物理分配器与 TLB 操作绝不持表锁；
+//   阶段二（表锁内）：process::store_brk 提交新值。
+// 单核 + svc 上下文中本进程是自身 brk 的唯一写者，阶段间无并发窗口；
+// 中途失败时增长路径在 map_heap_region 内部整体回滚，调用方只需不提交。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// break 规划结果（纯数据，主机单测钉死查询/对齐/上限三态边界）。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BrkAction {
+    /// x1==0 查询：只返回当前值，不做任何修改。
+    Query,
+    /// 对齐后的目标与当前一致：无页表操作，幂等成功。
+    Same,
+    /// 增长：映射 [from, to)（均页对齐、to 为新 break）。
+    Grow { from: usize, to: usize },
+    /// 收缩：解除 [to, from) 并归还物理页，to 为新 break。
+    Shrink { from: usize, to: usize },
+}
+
+/// 纯规划函数：当前 brk `cur` + 用户原始请求 → 校验/对齐/上限裁决。
+///
+/// - requested == 0 → Query（brk(0) 返回当前 break）；
+/// - 0 < requested < USER_HEAP_BASE → InvalidArgument（堆区之外）；
+/// - 目标向上对齐到 4KiB；对齐算术溢出或越过 64MiB 上限 → NoMemory
+///   （对应 POSIX ENOMEM；恰好在上限边界上的请求合法放行）；
+/// - 其余按目标与当前的相对位置给出 Grow/Shrink/Same。
+fn plan_brk(cur: usize, requested: u64) -> Result<BrkAction, SysError> {
+    const HEAP_LIMIT: usize = USER_HEAP_BASE + USER_HEAP_MAX_LEN;
+    if requested == 0 {
+        return Ok(BrkAction::Query);
+    }
+    let req = requested as usize;
+    if req < USER_HEAP_BASE {
+        return Err(SysError::InvalidArgument);
+    }
+    let target = match req.checked_add(PAGE_SIZE - 1) {
+        Some(v) => v & !(PAGE_SIZE - 1),
+        None => return Err(SysError::NoMemory),
+    };
+    if target > HEAP_LIMIT {
+        return Err(SysError::NoMemory);
+    }
+    if target == cur {
+        return Ok(BrkAction::Same);
+    }
+    if target > cur {
+        Ok(BrkAction::Grow { from: cur, to: target })
+    } else {
+        Ok(BrkAction::Shrink { from: cur, to: target })
+    }
+}
+
+/// Brk 引擎主体：规划 → 锁外页操作 → 提交。返回生效后的新 break
+/// （页对齐规范值；对照 Linux 返回原始请求值的差异见 ABI 披露）。
+fn sys_brk(slot: usize, requested: u64) -> SyscallResult {
+    // 无地址空间（内核直生占位）/槽位无效：fail-closed，与 GetPid
+    // 的 PermissionDenied 防御语义同一风格。
+    let Some((mut space, cur)) = crate::process::heap_view(slot) else {
+        return Err(SysError::PermissionDenied);
+    };
+    let target = match plan_brk(cur, requested)? {
+        BrkAction::Query => return Ok(cur as u64),
+        BrkAction::Same => cur,
+        BrkAction::Grow { from, to } => {
+            // OOM/已映射：map_heap_region 已回滚本次全部映射，break 不动。
+            unsafe { space.map_heap_region(from, to) }.map_err(|_| SysError::NoMemory)?;
+            to
+        }
+        BrkAction::Shrink { from, to } => {
+            // 收缩不可失败（清 PTE + BBM + free；空槽幂等跳过）。
+            unsafe { space.unmap_heap_region(to, from) };
+            to
+        }
+    };
+    crate::process::store_brk(slot, target);
+    Ok(target as u64)
 }
 
 fn map_ipc_error(err: crate::ipc::IpcError) -> SysError {
@@ -808,5 +902,80 @@ mod tests {
         // 上界含端
         assert!(validate_mmio_region(0x0ff0_0000, 0x0010_0000).is_ok());
         assert!(validate_mmio_region(0x0ff0_0000, 0x0010_0001).is_err());
+    }
+
+    // ── 号位 24：brk 查询 / 对齐 / 上限（纯逻辑） ──────────────────
+
+    const HB: usize = USER_HEAP_BASE;
+    /// 堆上限边界（BASE + 64MiB）。
+    const HL: u64 = (USER_HEAP_BASE + USER_HEAP_MAX_LEN) as u64;
+
+    #[test]
+    fn brk_zero_is_query_and_never_mutates() {
+        assert_eq!(plan_brk(HB, 0), Ok(BrkAction::Query));
+        assert_eq!(plan_brk(HB + 8192, 0), Ok(BrkAction::Query));
+        // 查询与当前值无关，也不产生页操作。
+    }
+
+    #[test]
+    fn brk_below_heap_base_rejected() {
+        assert_eq!(plan_brk(HB, (HB - 1) as u64), Err(SysError::InvalidArgument));
+        assert_eq!(plan_brk(HB, 5), Err(SysError::InvalidArgument));
+        assert_eq!(plan_brk(HB, 1), Err(SysError::InvalidArgument));
+        // 边界：恰好等于基址合法（Same）。
+        assert_eq!(plan_brk(HB, HB as u64), Ok(BrkAction::Same));
+    }
+
+    #[test]
+    fn brk_grow_aligns_up_to_page() {
+        // 非对齐请求向上取整到下一页界。
+        assert_eq!(
+            plan_brk(HB, (HB + 1) as u64),
+            Ok(BrkAction::Grow { from: HB, to: HB + PAGE_SIZE })
+        );
+        assert_eq!(
+            plan_brk(HB, (HB + 8192) as u64),
+            Ok(BrkAction::Grow { from: HB, to: HB + 2 * PAGE_SIZE })
+        );
+        // 对齐后恰等于当前值 → Same（幂等）。
+        assert_eq!(plan_brk(HB + 8192, (HB + 8000) as u64), Ok(BrkAction::Same));
+        assert_eq!(plan_brk(HB + 4096, (HB + 4096) as u64), Ok(BrkAction::Same));
+    }
+
+    #[test]
+    fn brk_shrink_targets_aligned_downside() {
+        assert_eq!(
+            plan_brk(HB + 8192, HB as u64),
+            Ok(BrkAction::Shrink { from: HB + 8192, to: HB })
+        );
+        // 非对齐收缩请求：目标对齐到页界后仍小于当前 → 收缩一页。
+        assert_eq!(
+            plan_brk(HB + 8192, (HB + 1000) as u64),
+            Ok(BrkAction::Shrink { from: HB + 8192, to: HB + PAGE_SIZE })
+        );
+        // 对齐后等于当前 → Same（重复收缩幂等）。
+        assert_eq!(
+            plan_brk(HB + PAGE_SIZE, (HB + 1) as u64),
+            Ok(BrkAction::Same)
+        );
+    }
+
+    #[test]
+    fn brk_cap_is_exactly_64mib_with_enomem_beyond() {
+        // 恰好顶满上限：合法。
+        assert_eq!(
+            plan_brk(HB, HL),
+            Ok(BrkAction::Grow { from: HB, to: HL as usize })
+        );
+        // 上限内非对齐尾请求：对齐后恰好落在上限上——放行。
+        assert_eq!(
+            plan_brk(HB, HL - 100),
+            Ok(BrkAction::Grow { from: HB, to: HL as usize })
+        );
+        // 越过上限一字节即 ENOMEM（NoMemory）。
+        assert_eq!(plan_brk(HB, HL + 1), Err(SysError::NoMemory));
+        // 极端值走 checked_add 溢出防御路径，同样 ENOMEM。
+        assert_eq!(plan_brk(HB, u64::MAX), Err(SysError::NoMemory));
+        assert_eq!(plan_brk(HB, u64::MAX - 100), Err(SysError::NoMemory));
     }
 }
