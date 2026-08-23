@@ -31,6 +31,8 @@
 use core::cell::UnsafeCell;
 use alloc::string::String;
 
+pub mod pstore;
+
 /// 汇槽有效标志，ASCII "ZSYMT101"（Zero SYMbol Table v1.0.1）。
 pub const SINK_MAGIC: u64 = 0x5A53_594D_5431_3031;
 /// 汇槽总容量（字节）。bootloader 侧 `symbol_sink::CAPACITY` 与此一致。

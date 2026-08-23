@@ -200,6 +200,17 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
     }
 
     let imm = (esr & 0xffff) as u16;
+    // ==== TEMP FAULT DRILL（pstore 两连启验证专用，提交前回退）====
+    // 用户态第 8 次 ConsoleWrite（号位 9）时从内核态执行 BRK：
+    // 制造一次真实的 EL1 同步异常走 kernel_sync_fault 全链路。
+    if imm == 0 && unsafe { (*frame).regs[0] } == 9 {
+        static DRILL_CW: AtomicU64 = AtomicU64::new(0);
+        if DRILL_CW.fetch_add(1, Ordering::Relaxed) == 8 {
+            crate::error!("[drill] injecting EL1 BRK for pstore verification");
+            unsafe { asm!("brk #0", options(nostack)) };
+        }
+    }
+    // ==== TEMP FAULT DRILL END ====
     unsafe {
         match imm {
             0 => {
@@ -438,6 +449,9 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
             crate::error!("  #{i} pc=0x{:016x}{}", fr.pc, fr.note);
         }
     }
+    // 完整故障摘要持久化到 pstore 固定物理窗口：串口之外的第二份现场，
+    // 复位后由 bootloader 在下一启第一屏取回打印（穷人版 pstore 链路）。
+    crate::debug::pstore::log_kernel_fault(reason, esr, far, elr, &trace);
     reset_or_halt()
 }
 
