@@ -355,7 +355,15 @@ pub fn init() {
     NEXT_PID.store(PID_SEQ_FIRST, Ordering::SeqCst);
 }
 
-pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
+/// 内核直生进程（KernelFn 服务等内核内入口）。
+///
+/// 失败语义（本轮降级改造）：进程表满是**可预期的资源耗尽**，不再
+/// expect 升级为内核停机——返回 `Err(ProcessError::TableFull)` 交由
+/// 调用方降级（services::launch_service 对非核心服务仅告警跳过；
+/// essential 服务仍由其既有 panic 路径兜底）。签名与 fork 的
+/// `Result` 模式对齐；pid 在槽位搜索前分配，表满时该号作废一次，
+/// 与 fork 同款（generation 机制天然容忍跳号）。
+pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, ProcessError> {
     crate::debug!("process::spawn called for name={}", name);
     let pid = alloc_pid();
 
@@ -364,7 +372,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         .iter_mut()
         .enumerate()
         .find(|(_, slot)| slot.is_none())
-        .expect("process table full");
+        .ok_or(ProcessError::TableFull)?;
 
     let user_sp = user_stack_top_raw(slot_index);
     let kernel_sp = kernel_stack_top_raw(slot_index);
@@ -402,10 +410,10 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         brk: USER_HEAP_BASE,
     });
 
-    pid
+    Ok(pid)
 }
 
-pub fn spawn_user(entry: ThreadEntry, name: &'static str) -> ProcessId {
+pub fn spawn_user(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, ProcessError> {
     // 恢复真实实现：console shell 是编译进内核的"内核内进程"，
     // 以函数指针为入口（与 ServiceEntry::KernelFn 同类）。
     // 注意：入口位于内核镜像内，进程以 EL0 运行，首次取指会因
@@ -422,7 +430,7 @@ pub fn spawn_user_from_bootfs(
 ) -> Result<ProcessId, ProcessError> {
     crate::debug!("spawn_user_from_bootfs: path={}", path);
     let elf = user_elf::build_user_elf(path).map_err(ProcessError::ElfError)?;
-    let pid = spawn(thread_exit, name);
+    let pid = spawn(thread_exit, name)?;
     let Some(slot) = slot_for_pid(pid) else {
         return Err(ProcessError::NoSuchProcess);
     };
@@ -1948,7 +1956,9 @@ mod state_machine_tests {
 
     /// 表级测试的互斥哨兵：PROCESS_TABLE 是全局静态，而 cargo test
     /// 默认多线程并行。凡直接改真实表的测试都必须持锁。
-    static TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// pub(crate)：spawn 表满降级测试（spawn_table_full_tests）同样
+    /// 操纵真实表，跨模块共享同一把锁才能与本模块互斥。
+    pub(crate) static TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn make_record(pid_raw: u64, slot: usize, parent: Option<u64>) -> ProcessRecord {
         ProcessRecord {
@@ -2223,5 +2233,65 @@ mod state_machine_tests {
             let mut table = PROCESS_TABLE.lock();
             *table = [const { None }; MAX_PROCESSES];
         }
+    }
+}
+
+// ── 本轮：spawn 表满降级 ────────────────────────────────────────────
+// 严苛评审结论：`expect("process table full")` 把可预期的资源耗尽
+// 升级为内核停机。改造后 spawn 返回 Result，本组测试在**真实全局表**
+// 上钉死两端语义：满载 → Err(TableFull) 绝不 panic；未满 → Ok 且记录
+// 可见。
+#[cfg(test)]
+mod spawn_table_full_tests {
+    use super::*;
+
+    /// 把日志压到 Error：spawn 成功路径的 info! 直写 PL011 串口，
+    /// host 测试无 UART（0x0900_0000 未映射）必崩。结束前恢复 Info。
+    fn silence_uart_and_reset_table() {
+        crate::runtime::logger::set_level(crate::runtime::logger::Level::Error);
+        let mut table = PROCESS_TABLE.lock();
+        *table = [const { None }; MAX_PROCESSES];
+    }
+
+    fn restore_table_and_logger() {
+        let mut table = PROCESS_TABLE.lock();
+        *table = [const { None }; MAX_PROCESSES];
+        crate::runtime::logger::set_level(crate::runtime::logger::Level::Info);
+    }
+
+    #[test]
+    fn full_table_returns_table_full_not_panic() {
+        // 与 state_machine_tests 共享同一把守门锁：操纵真实表的测试
+        // 全局互斥，杜绝并发清场造成的假阳性/假失败。
+        let _g = super::state_machine_tests::TABLE_GUARD.lock().unwrap();
+        silence_uart_and_reset_table();
+        // 占满全部槽位：降级不改正常路径——每一次都必须成功。
+        for i in 0..MAX_PROCESSES {
+            let pid = spawn(thread_exit, "filler")
+                .unwrap_or_else(|e| panic!("spawn #{i} should succeed, got {e:?}"));
+            assert_ne!(pid.raw(), 0);
+        }
+        // 满载前置确认：此刻确实无空槽（防御性，失败即并发干扰）。
+        {
+            let table = PROCESS_TABLE.lock();
+            assert!(table.iter().all(|s| s.is_some()), "table must be full");
+        }
+        // 第 65 次：可预期资源耗尽 → Err(TableFull)，绝非 expect panic。
+        match spawn(thread_exit, "overflow") {
+            Err(ProcessError::TableFull) => {}
+            other => panic!("expected Err(TableFull), got {other:?}"),
+        }
+        restore_table_and_logger();
+    }
+
+    #[test]
+    fn spawn_succeeds_and_records_entry_on_non_full_table() {
+        let _g = super::state_machine_tests::TABLE_GUARD.lock().unwrap();
+        silence_uart_and_reset_table();
+        let pid = spawn(thread_exit, "probe").expect("empty table must admit spawn");
+        let slot = slot_for_pid(pid).expect("record must be present");
+        assert_eq!(pid_at_slot(slot), Some(pid));
+        assert_eq!(state(pid), Some(ProcessState::Runnable));
+        restore_table_and_logger();
     }
 }

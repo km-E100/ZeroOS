@@ -179,7 +179,11 @@ fn spawn_server(descriptor: &ServiceDescriptor) -> Result<ProcessId, ServiceErro
     crate::debug!("spawn_server: name={} entry={}", descriptor.name, kind);
     match descriptor.entry {
         ServiceEntry::KernelFn(entry) => {
-            let pid = process::spawn(entry, descriptor.name);
+            // 表满降级：spawn 的 TableFull 与 Bootfs 分支的失败同构，
+            // 统一映射为 SpawnFailed —— launch_service 对非核心服务
+            // 仅告警跳过，essential（launchd）仍走既有 panic 兜底。
+            let pid = process::spawn(entry, descriptor.name)
+                .map_err(ServiceError::SpawnFailed)?;
             if descriptor.privileged {
                 process::set_privileged(pid, true);
             }
