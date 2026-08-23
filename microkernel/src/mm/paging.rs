@@ -2,10 +2,11 @@ use core::ptr;
 
 use super::phys;
 use super::table_walk::{
-    self, descriptor_to_table, is_table, is_valid, make_leaf_descriptor,
-    make_table_descriptor, page_table_indices, walk, AP_EL1_RW_EL0_NONE, DESC_AF,
-    DESC_ATTRIDX_NORMAL, DESC_SH_INNER, DESC_TYPE_TABLE, DESC_UXN, DESC_VALID,
-    KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1, PHYS_ADDR_MASK, USER_AP_RW, USER_AP_RX,
+    self, classify_leaf, cow_break_leaf, cow_share_leaf, descriptor_to_table, is_cow_leaf,
+    is_table, is_valid, make_leaf_descriptor, make_table_descriptor, page_table_indices, walk,
+    LeafShareClass, AP_EL1_RW_EL0_NONE, DESC_AF, DESC_ATTRIDX_NORMAL, DESC_SH_INNER,
+    DESC_TYPE_TABLE, DESC_UXN, DESC_VALID, KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1,
+    PHYS_ADDR_MASK, USER_AP_RW, USER_AP_RX,
 };
 
 // 本文件所用常量与 table_walk.rs 保持一致（语义相同，直接复用）。
@@ -408,6 +409,20 @@ unsafe fn map_physical_page(
     ap: u64,
     executable: bool,
 ) -> Result<(), MapError> {
+    install_leaf_descriptor(space, virt, make_page_descriptor(phys as u64, ap, executable))
+}
+
+/// 建全表链并把**完整构造好的叶子描述符**写入 VA 槽位。
+/// clone 的 COW 共享映射需要带 DESC_SW_COW 等自定义位的描述符，
+/// 故从 map_physical_page 抽出本入口（安全护栏原样保留）。
+///
+/// # Safety
+/// space 的根表必须有效且未被并发修改；virt 页对齐。
+unsafe fn install_leaf_descriptor(
+    space: &mut AddressSpace,
+    virt: usize,
+    desc: u64,
+) -> Result<(), MapError> {
     assert_eq!(
         virt & (PAGE_SIZE - 1),
         0,
@@ -430,7 +445,7 @@ unsafe fn map_physical_page(
     if table.0[l3_idx] & DESC_VALID != 0 {
         return Err(MapError::AlreadyMapped);
     }
-    table.0[l3_idx] = make_page_descriptor(phys as u64, ap, executable);
+    table.0[l3_idx] = desc;
     Ok(())
 }
 
@@ -485,6 +500,12 @@ pub unsafe fn deactivate_user_address_space() {
 }
 
 /// 递归释放用户地址空间：L0/L1/私有 L2/L3 页表页 + 用户数据/栈/bootfs 物理页。
+///
+/// ⚠ 第十刀 COW：叶子物理页经 phys::free_page **引用减一**释放——
+/// COW 共享页（clone 时 retain 过）由最后一个退出者真正回收；
+/// 先退出的一方只减记账，绝不回收仍被对端映射的页
+/// （回归钉死见 mm-host-tests refcount_lifecycle / cow_fork 场景）。
+/// 页表页永远独占（clone 全新分配），照旧直接回收。
 ///
 /// ⚠ 铁律：**严禁**释放 L1[KERNEL_SHARED_L1] 指向的内核 L2_1 表本体——
 /// 它属于内核恒等映射 [1GiB,2GiB)（镜像/堆/向量表/内核栈），一旦 free，
@@ -575,30 +596,53 @@ pub fn walk_space(space: &AddressSpace, va: usize) -> table_walk::WalkOutcome {
     unsafe { walk(space.root_table as *mut u64, va) }
 }
 
-/// eager-copy 克隆地址空间（fork 用）。
+// ── COW clone 统计（最近一次 clone 的快照，fork 日志与验收脚本消费）──
+static CLONE_COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CLONE_RO_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CLONE_COPIED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 最近一次 clone 的页级统计：(COW 共享, 只读直接共享, 实际复制)。
+/// copied==0 即零复制 fork 生效的直接证据。
+pub fn last_clone_stats() -> (usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        CLONE_COW_SHARED.load(Relaxed),
+        CLONE_RO_SHARED.load(Relaxed),
+        CLONE_COPIED.load(Relaxed),
+    )
+}
+
+/// COW 克隆地址空间（第十刀，fork 用）。零数据复制：
 ///
-/// 算法（与设计方案一致）：
-/// 1. 新建 child（复用 create_user_address_space：私有 L0/L1/L2_0 副本 + 共享 L1[1]）；
-/// 2. 遍历 parent 除 KERNEL_SHARED_L1 外全部 L1 槽位；
-/// 3. 对 parent 每个用户私有 L2 表：表条目逐页复制（新分配物理页 + memcpy，
-///    恒等映射下直接按 PA 拷贝）；
-/// 4. skip 一切 block 条目（只可能是继承来的内核恒等映射，
-///    child 的 L2_0 副本里已有同物）；
-/// 5. skip 未映射/无效条目；child 侧映射经 map_physical_page 统一建表
-///    （自动处理 block 拆表与内核区护栏）。
+/// 1. 新建 child（create_user_address_space：私有 L0/L1/L2_0 + 共享 L1[1]）；
+/// 2. 遍历 parent 除 KERNEL_SHARED_L1 外全部有效叶子 PTE，按
+///    table_walk::classify_leaf 分派：
+///    - CowShare（可写页 AP=RW，或已带 COW 位——fork 链二次 fork）：父子
+///      共享同一物理页。phys::retain_page 记账后，子 PTE = 同 PA + AP 只读
+///      + DESC_SW_COW；父 PTE 同步 BBM 改只读 + 置位（父此刻正运行，
+///      陈旧 RW TLB 表项会让共享写静默穿透，必须逐 VA tlbi）。
+///    - ReadOnlyDirect（text/rodata）：直接映射同一 PA 不复制、不打 COW 位
+///      （写 text 必须 SIGSEGV，W^X 底线），retain_page 保命防一方退出误回收。
+///    - EagerCopy（防御兜底，正常不出现）：保留旧全量 memcpy 路径。
+/// 3. skip block 条目（内核恒等快照/MMIO，child 的 L2_0 副本已有同物）。
 ///
-/// ⚠ 绝不复制 L1[KERNEL_SHARED_L1]（共享表），绝不复制表描述符本体——
-///   只复制叶子页的内容。COW 留待后续：帧上标注 refcount + 写时复制，
-///   可复用的物理页对保留在 parent，child 首写时才分配。
+/// 断链在 trap 路径的 handle_cow_fault：任一方首写触发 Permission fault
+/// 时按 refcount 复制或原地恢复可写。
 ///
-/// 失败（OOM/非法条目）返回 Err；调用方负责丢弃半成品 child（此时
-/// child 的页已由 map_physical_page 记账，不会泄漏到 allocator 之外）。
+/// ⚠ 绝不复制 L1[KERNEL_SHARED_L1]（共享表），绝不共享表描述符本体——
+///   子的页表页全部新建，只有**数据叶**被共享。
+///
+/// 已知取舍（与旧 eager 版一致）：中途 OOM 返回 Err 时半成品 child 直接
+/// 泄漏（其 retain 过的共享页引用计数虚高，只会导致对端多走几次慢断链，
+/// 不会破坏隔离性）；修复需引入半成品回滚，超出本刀范围。
 ///
 /// # Safety
-/// `parent` 必须处于稳定状态（无并发修改）。
+/// `parent` 必须处于稳定状态（无并发修改）；parent 当前已装入 TTBR 且
+/// 可能在 eret 后立即执行（BBM 屏障不可省略）。
 pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressSpace, MapError> {
+    use core::sync::atomic::Ordering::Relaxed;
     crate::info!(
-        "paging: clone_user_address_space parent root_phys=0x{:016x}",
+        "paging: cow clone_user_address_space parent root_phys=0x{:016x}",
         parent.root_phys
     );
     let mut child = create_user_address_space();
@@ -608,6 +652,10 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
         return Err(MapError::OutOfMemory);
     }
     let pl1 = descriptor_to_table(e0) as *mut PageTable;
+
+    let mut cow_shared = 0usize;
+    let mut ro_shared = 0usize;
+    let mut copied = 0usize;
 
     for l1_idx in 0..512 {
         if l1_idx == KERNEL_SHARED_L1 {
@@ -632,23 +680,138 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                 if !is_valid(pte) {
                     continue;
                 }
-                let src = (pte & PHYS_ADDR_MASK) as usize;
                 // 拒绝内核共享区（防御：parent 里本就不该有）
                 if l1_idx == KERNEL_SHARED_L1 {
                     return Err(MapError::KernelRegion);
                 }
+                let src = (pte & PHYS_ADDR_MASK) as usize;
                 let va = (l1_idx << 30) | (l2_idx << 21) | (l3_idx << 12);
-                let dst = alloc_user_page()?;
-                ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE_SIZE);
-                let ap = (pte >> 6) & 0b11;
                 let executable = pte & DESC_UXN == 0;
-                map_physical_page(&mut child, va, dst, ap, executable)?;
+                match classify_leaf(pte) {
+                    LeafShareClass::CowShare => {
+                        // 父子共享同一物理页；双侧只读 + 软件 COW 位。
+                        phys::retain_page(src);
+                        let child_desc = cow_share_leaf(pte);
+                        install_leaf_descriptor(&mut child, va, child_desc)?;
+                        // 父侧 BBM 改只读 + 置位（保留 PA/attr/UXN，仅换 AP）。
+                        // 父正在运行：陈旧 RW TLB 必须逐 VA 击落，否则共享写
+                        // 会静默穿透 COW 防线（bbm_update_page 内含屏障序）。
+                        let mut b = |v: usize| kbbm_barrier(v);
+                        table_walk::bbm_update_page(
+                            pl3 as *mut u64,
+                            l3_idx,
+                            va,
+                            cow_share_leaf(pte),
+                            &mut b,
+                        );
+                        cow_shared += 1;
+                    }
+                    LeafShareClass::ReadOnlyDirect => {
+                        // text/rodata：同 PA 直接映射（省复制），不打 COW 位。
+                        phys::retain_page(src);
+                        install_leaf_descriptor(
+                            &mut child,
+                            va,
+                            make_leaf_descriptor(src as u64, USER_AP_RX, executable),
+                        )?;
+                        ro_shared += 1;
+                    }
+                    LeafShareClass::EagerCopy => {
+                        // 兜底（异常 AP 编码）：维持旧全量复制语义。
+                        let dst = alloc_user_page()?;
+                        ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE_SIZE);
+                        let ap = (pte >> table_walk::AP_SHIFT) & 0b11;
+                        install_leaf_descriptor(
+                            &mut child,
+                            va,
+                            make_leaf_descriptor(dst as u64, ap, executable),
+                        )?;
+                        copied += 1;
+                    }
+                }
             }
         }
     }
+    CLONE_COW_SHARED.store(cow_shared, Relaxed);
+    CLONE_RO_SHARED.store(ro_shared, Relaxed);
+    CLONE_COPIED.store(copied, Relaxed);
     crate::info!(
-        "paging: clone_user_address_space done child root_phys=0x{:016x}",
-        child.root_phys
+        "paging: cow clone done child root_phys=0x{:016x} shared={} readonly_shared={} copied={}",
+        child.root_phys,
+        cow_shared,
+        ro_shared,
+        copied
     );
     Ok(child)
+}
+
+/// COW 缺页断链（trap.rs Permission fault 路径调用）。
+///
+/// 前置：far 处 PTE 带 DESC_SW_COW（clone 时双侧标记）。语义：
+/// - refcount > 1（真共享）：分配新页、整页 memcpy、重映射为原 AP 可写
+///   （UXN 沿用）、老页引用减一归对端——BBM 更新 + TLBI 后 eret 重放即可；
+/// - refcount == 1（对端已退出/已断链）：同一物理页原地恢复可写，零分配。
+///
+/// 返回 true 表示已断链（调用方应 restore_frame 重放指令）；
+/// false 表示与本机制无关或资源不足（OOM），调用方按原路径处置
+/// （SIGSEGV 终止——OOM 下宁可杀进程也不静默吞掉用户写）。
+///
+/// # Safety
+/// space 必须是当前正在故障的地址空间（单核同步 fault，无并发修改）。
+pub unsafe fn handle_cow_fault(space: &AddressSpace, va: usize) -> bool {
+    let [l0_idx, l1_idx, l2_idx, l3_idx] = page_table_indices(va);
+    if l0_idx != 0 || l1_idx == KERNEL_SHARED_L1 {
+        return false; // 内核区永远没有 COW 页
+    }
+    // walk 已验证链路有效，这里可直达各级表指针。
+    let e0 = (*space.root_table).0[l0_idx];
+    if !is_valid(e0) || !is_table(e0) {
+        return false;
+    }
+    let l1 = descriptor_to_table(e0) as *mut PageTable;
+    let e1 = (*l1).0[l1_idx];
+    if !is_valid(e1) || !is_table(e1) {
+        return false;
+    }
+    let l2 = descriptor_to_table(e1) as *mut PageTable;
+    let e2 = (*l2).0[l2_idx];
+    if !is_valid(e2) || !is_table(e2) {
+        return false;
+    }
+    let l3 = descriptor_to_table(e2) as *mut PageTable;
+    let pte = (*l3).0[l3_idx];
+    if !is_valid(pte) || !is_cow_leaf(pte) {
+        return false; // 非 COW 页：交还原故障路径（真 SIGSEGV）
+    }
+
+    let old_pa = (pte & PHYS_ADDR_MASK) as usize;
+    let rc = phys::ref_count(old_pa);
+    let new_pa = if rc > 1 {
+        // 真共享：复制私有副本，老页减一留给对端。
+        match alloc_user_page() {
+            Ok(dst) => {
+                ptr::copy_nonoverlapping(old_pa as *const u8, dst as *mut u8, PAGE_SIZE);
+                phys::free_page(old_pa);
+                dst
+            }
+            Err(_) => {
+                crate::warn!("paging: cow fault OOM va=0x{:x} pa=0x{:x}", va, old_pa);
+                return false;
+            }
+        }
+    } else {
+        // 最后一个持有者：无需复制，原地恢复可写。
+        old_pa
+    };
+    let new_desc = cow_break_leaf(pte, new_pa as u64);
+    let mut b = |v: usize| kbbm_barrier(v);
+    table_walk::bbm_update_page(l3 as *mut u64, l3_idx, va, new_desc, &mut b);
+    crate::debug!(
+        "paging: cow break va=0x{:x} pa=0x{:x}->0x{:x} rc={}",
+        va,
+        old_pa,
+        new_pa,
+        rc
+    );
+    true
 }

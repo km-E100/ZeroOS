@@ -99,6 +99,17 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
             let ctx = capture_trap_context();
             let message = format_sync_exception(&decoded, &ctx);
             if decoded.from_el0 {
+                // ── 第十刀 COW：EL0 写权限故障优先走写时复制断链 ──
+                // PTE 带 DESC_SW_COW ⇒ 分配私有副本/原地恢复可写后
+                // restore_frame，eret 重放同一条访存指令（不杀不重启）。
+                // 非 COW 页原样落入下方 SIGSEGV 路径。
+                if let SyncExceptionKind::DataAbort(info) = decoded.kind {
+                    if info.kind == FaultKind::Permission
+                        && process::handle_cow_write_fault(ctx.far as usize)
+                    {
+                        unsafe { crate::arch::restore_frame(frame) }
+                    }
+                }
                 // 用户态故障：审计行保留 info，然后按默认动作投递信号终止。
                 // 信号归因对标 Linux force_sig_fault 的页故障分类：
                 // 数据访问对齐错误 → SIGBUS；其余页故障（翻译/权限/
@@ -123,6 +134,22 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 dump_user_pte(ctx.far);
                 terminate_faulting_process(&ctx, sig)
             } else {
+                // ── 第十刀 COW：EL1 代用户写落在 COW 共享页上同样可恢复 ──
+                // （fork 后窗口内 copy_to_user 写用户缓冲即此场景）：
+                // 断链成功则 eret 回 EL1 重放踩故障的访存指令，memcpy 无感续行；
+                // PTE 无 COW 位则照旧走下方处置，行为不变。
+                if let SyncExceptionKind::DataAbort(info) = decoded.kind {
+                    if info.kind == FaultKind::Permission
+                        && ctx.slot.is_some()
+                        && process::handle_cow_write_fault(ctx.far as usize)
+                    {
+                        crate::info!(
+                            "[trap] cow break on EL1 user-write far=0x{:016x}",
+                            ctx.far
+                        );
+                        unsafe { crate::arch::restore_frame(frame) }
+                    }
+                }
                 // 穷人版 exception table（对照 Linux __ex_table）：内核在
                 // 代用户拷贝（copy_slice_from/to_user）时踩到坏页 ⇒
                 // 视为 EFAULT 类用户错误：杀调用进程，而非重启整机。
