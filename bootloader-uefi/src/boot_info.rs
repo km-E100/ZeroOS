@@ -56,6 +56,10 @@ impl KernelBootContext {
 
         patch_kernel_memory(kernel, memory_bytes);
 
+        // 精细内存图：把合并后的 CONVENTIONAL 区间表灌入内核汇槽，
+        // 物理分配器据此登记空洞（失败仅告警，内核回退总量路径）。
+        fill_memory_map_sink(kernel, st);
+
         log_info!("boot context prepared");
         Ok(Self {
             memory_bytes,
@@ -121,6 +125,96 @@ fn collect_usable_memory(st: &mut SystemTable<Boot>) -> Result<(u64, UsableBlock
         }
     }
     Ok((total, best))
+}
+
+/// 内核侧 `__zero_memory_map` 汇槽协议常量（与 mm/phys.rs 镜像一致）。
+mod memory_map_sink {
+    pub const MAGIC: u64 = 0x5A4D_454D_3130_3131;
+    pub const HEADER: usize = 0x10;
+    pub const ENTRY: usize = 16;
+    pub const CAPACITY: usize = 4096;
+}
+
+/// 把合并后的 CONVENTIONAL 区间表写入内核 `__zero_memory_map` 汇槽。
+/// 超容截断保低址段；magic 最后落笔；任何异常仅告警——内核侧会
+/// 因 magic 不符回退总量路径。
+fn fill_memory_map_sink(
+    kernel: &crate::kernel_loader::KernelImage,
+    st: &mut SystemTable<Boot>,
+) {
+    let Some(sink_va) = kernel.segments.symbol_address("__zero_memory_map") else {
+        log_warn!("memory map sink `__zero_memory_map` absent; kernel uses total fallback");
+        return;
+    };
+    if !kernel.segments.contains_addr(sink_va) {
+        log_warn!("memory map sink outside loaded segments; skipped");
+        return;
+    }
+
+    // 收集并合并 CONVENTIONAL 区间（升序）。
+    let mut buffer = alloc::vec![0u8; 64 * 1024];
+    let map = match st.boot_services().memory_map(&mut buffer) {
+        Ok(m) => m,
+        Err(e) => {
+            log_warn!("memory map unavailable: {:?}", e.status());
+            return;
+        }
+    };
+    let mut regions: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    for desc in map.entries() {
+        if desc.ty != uefi::table::boot::MemoryType::CONVENTIONAL {
+            continue;
+        }
+        let start = desc.phys_start;
+        let end = desc.phys_start.saturating_add(desc.page_count * 4096);
+        if let Some(last) = regions.last_mut() {
+            let last_end = last.0.saturating_add(last.1);
+            if start <= last_end {
+                last.1 = end.saturating_sub(last.0);
+                continue;
+            }
+        }
+        regions.push((start, end - start));
+    }
+
+    let max_entries = (memory_map_sink::CAPACITY - memory_map_sink::HEADER)
+        / memory_map_sink::ENTRY;
+    if regions.len() > max_entries {
+        regions.truncate(max_entries);
+    }
+
+    let sink = sink_va as *mut u8;
+    unsafe {
+        let mut off = memory_map_sink::HEADER;
+        for &(base, len) in &regions {
+            core::ptr::copy_nonoverlapping(
+                base.to_le_bytes().as_ptr(),
+                sink.add(off),
+                8,
+            );
+            core::ptr::copy_nonoverlapping(
+                len.to_le_bytes().as_ptr(),
+                sink.add(off + 8),
+                8,
+            );
+            off += memory_map_sink::ENTRY;
+        }
+        // count 先于 magic 落笔，magic 是有效性最终承诺。
+        core::ptr::copy_nonoverlapping(
+            (regions.len() as u64).to_le_bytes().as_ptr(),
+            sink.add(0x08),
+            8,
+        );
+        core::ptr::copy_nonoverlapping(
+            memory_map_sink::MAGIC.to_le_bytes().as_ptr(),
+            sink,
+            8,
+        );
+    }
+    log_info!(
+        "memory map sink filled @0x{sink_va:016x}: {} regions",
+        regions.len()
+    );
 }
 
 /// 写回内核镜像 `.rodata.boot` 的 `__zero_memory_bytes` 占位符。

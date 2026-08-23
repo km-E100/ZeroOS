@@ -13,9 +13,14 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use userlib::{console_read, console_write, encode_message, exit, extract_payload_text};
-use zero_abi::channels::{LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP};
+use userlib::{
+    console_read, console_write, encode_message, exit, extract_payload_text, wait_pid,
+    wait_pid_flags, WAIT_NOHANG,
+};
+use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP};
 use zero_abi::ipc::Message;
+use zero_abi::protocol::fs as fs_proto;
+use zero_abi::protocol::fs::vtable as fs_vt;
 use zero_abi::protocol::launchd::{CMD_LIST_SERVICES, CMD_RESTART_SERVICE, CMD_STATUS};
 use zero_abi::syscall::SysError;
 
@@ -77,7 +82,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("bye");
             break;
         } else if cmd == b"help" || cmd == b"?" {
-            println("commands: help info echo whoami pid forktest waittest clear history launchd exit");
+            println("commands: help info echo whoami pid forktest waittest nohangtest orphantest fstest clear history launchd exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
@@ -191,6 +196,149 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                     println(")");
                 }
             }
+        } else if cmd == b"nohangtest" {
+            // WNOHANG 端到端（第七刀）：fork 子延时 exit(7)；父以
+            // wait_pid_flags(0, WAIT_NOHANG) 轮询——子存活期间必须返回
+            // Ok(None)（内核回 0、不挂起），子成尸后同一调用收集 (pid,7)。
+            // 若轮询语义回归成挂起，父会卡死、提示符不再出现，实机一眼可判。
+            match userlib::fork() {
+                Ok(0) => {
+                    println("[C] nohangtest: child alive, delaying before exit(7)");
+                    delay_cycles(8_000_000);
+                    userlib::exit(7);
+                }
+                Ok(child_pid) => {
+                    print("[P] nohangtest: forked child ");
+                    print_u64(child_pid);
+                    println("");
+                    let mut misses = 0u64;
+                    let mut done = false;
+                    for _ in 0..400 {
+                        match wait_pid_flags(0, WAIT_NOHANG) {
+                            Ok(None) => {
+                                misses += 1;
+                                userlib::yield_now();
+                            }
+                            Ok(Some((pid, code))) => {
+                                print("[P] nohangtest: polls-missed=");
+                                print_u64(misses);
+                                print(" collected pid=");
+                                print_u64(pid);
+                                print(" code=");
+                                print_i32(code);
+                                println("");
+                                if misses > 0 && code == 7 && pid == child_pid {
+                                    println("[P] nohangtest: PASS");
+                                } else {
+                                    println("[P] nohangtest: FAIL (bad sequence)");
+                                }
+                                done = true;
+                                break;
+                            }
+                            Err(e) => {
+                                print("[P] nohangtest: poll failed (");
+                                print_hex(e.code());
+                                println(")");
+                                done = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !done {
+                        println("[P] nohangtest: FAIL (never collected within budget)");
+                    }
+                }
+                Err(e) => {
+                    print("[P] nohangtest: fork failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"orphantest" {
+            // 孤儿收养端到端（第七刀）：四代进程链 P→A→B→C。
+            //   A exit(5) → 父 P 收尸（BecomeZombie→Collect）；
+            //   B exit(9) 时其父 A 已不在表 → ReapImmediately → full_reap(B)，
+            //     此刻 C 还活着 ⇒ 命中 AdoptToInit：内核串口打
+            //     "process .. orphaned: parent .. died, adopted by init(pid=2)"；
+            //   C exit(11)：adopted=true ⇒ 防御回收（跳过 Zombie 直接完全回收）。
+            // 收养/防御回收的证据行在内核日志（qemu 串口）而非 shell 输出。
+            match userlib::fork() {
+                Ok(0) => {
+                    // A：中间代
+                    match userlib::fork() {
+                        Ok(0) => {
+                            // B：将在无父状态下退出并触发对 C 的收养
+                            match userlib::fork() {
+                                Ok(0) => {
+                                    // C：将成孤儿的第四代
+                                    println("[GG] orphantest: great-grandchild alive, delaying before exit(11)");
+                                    delay_cycles(20_000_000);
+                                    userlib::exit(11);
+                                }
+                                Ok(grand_pid) => {
+                                    print("[G] orphantest: B forked C pid=");
+                                    print_u64(grand_pid);
+                                    println(", delaying before exit(9)");
+                                    delay_cycles(6_000_000);
+                                    userlib::exit(9);
+                                }
+                                Err(e) => {
+                                    print("[G] orphantest: fork C failed (");
+                                    print_hex(e.code());
+                                    println(")");
+                                    userlib::exit(6);
+                                }
+                            }
+                        }
+                        Ok(child_pid) => {
+                            print("[C] orphantest: A forked B pid=");
+                            print_u64(child_pid);
+                            println(", exiting now (5) to start the chain");
+                            userlib::exit(5);
+                        }
+                        Err(e) => {
+                            print("[C] orphantest: fork B failed (");
+                            print_hex(e.code());
+                            println(")");
+                            userlib::exit(6);
+                        }
+                    }
+                }
+                Ok(child_pid) => {
+                    print("[P] orphantest: forked A pid=");
+                    print_u64(child_pid);
+                    println("");
+                    match wait_pid(child_pid) {
+                        Ok((pid, code)) => {
+                            print("[P] orphantest: collected A pid=");
+                            print_u64(pid);
+                            print(" code=");
+                            print_i32(code);
+                            println("");
+                            if code == 5 {
+                                println("[P] orphantest: PASS (see kernel log for adopted-by-init + defensive reap)");
+                            } else {
+                                println("[P] orphantest: FAIL (unexpected exit code)");
+                            }
+                        }
+                        Err(e) => {
+                            print("[P] orphantest: wait failed (");
+                            print_hex(e.code());
+                            println(")");
+                        }
+                    }
+                }
+                Err(e) => {
+                    print("[P] orphantest: fork failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"fstest" {
+            // 端到端文件语义验证（第七刀）：经 launchd list 预检 fsd/
+            // blkdrv 在线后，向 FS_REQ 发 open/create → write("ZERO-FSD")
+            // → read 回读比对 → close 序列，逐步打印结果。
+            fstest_command();
         } else if cmd == b"clear" {
             // ANSI：清屏 + 光标归位
             let _ = console_write(b"\x1b[2J\x1b[H");
@@ -213,6 +361,21 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         }
     }
     0
+}
+
+/// 用户态近似延时（易失黑盒递减 + 周期性 yield）。环境无时钟源，
+/// 与 waittest 内联循环同源写法；仅用于让父进程先抵达等待点 /
+/// 拉开多代退出次序。
+fn delay_cycles(mut spin: u64) {
+    while spin > 0 {
+        spin -= 1;
+        if spin & 0xFF == 0 {
+            core::hint::black_box(spin);
+        }
+        if spin % (1 << 22) == 0 {
+            userlib::yield_now();
+        }
+    }
 }
 
 /// 记录一条命令进历史（单核 shell：静态可变安全由独占执行保证）。
@@ -312,6 +475,205 @@ fn request(code: u32, payload: &[u8]) {
             }
         }
     }
+}
+
+/// fstest —— fsd 块卷文件语义端到端验证（第七刀）。
+///
+/// 序列：launchd list 预检 fsd/blkdrv 在线 → open("zerofsd.txt",
+/// CREATE) → write "ZERO-FSD" → close → reopen(EXISTING) → read 回读
+/// 比对 → close。写后必须重开再读：fd 偏移随写推进（POSIX 语义），
+/// 顺序读只会得到 EOF。任何一步失败即中止并打印协议错误码。响应
+/// 配对依赖单客户端纪律（见 zero_abi::protocol::fs::vtable 冻结注释）；
+/// 预检的意义：向无人应答的 FS_REQ 发消息会在阻塞接收上无限等待
+/// ——必须先确认服务在线。
+fn fstest_command() {
+    // ---- 0) 预检：fsd / blkdrv 必须处于 [running] ----
+    let mut listing = Message::empty();
+    if userlib::ipc_send(LAUNCHD_CMD_REQ, &encode_message(CMD_LIST_SERVICES, &[])).is_err() {
+        println("fstest: launchd unreachable");
+        return;
+    }
+    loop {
+        match userlib::ipc_receive(LAUNCHD_CMD_RESP, &mut listing) {
+            Ok(_) => break,
+            Err(SysError::WouldBlock) => userlib::yield_now(),
+            Err(_) => {
+                println("fstest: launchd list receive failed");
+                return;
+            }
+        }
+    }
+    let text = extract_payload_text(&listing.payload);
+    if !text.contains("fsd [running") {
+        println("fstest: fsd not running (try: launchd spawn fsd)");
+        return;
+    }
+    if !text.contains("blkdrv [running") {
+        println("fstest: blkdrv not running (no block backend; try: launchd spawn blkdrv)");
+        return;
+    }
+
+    const MARK: &[u8; 8] = b"ZERO-FSD";
+    const NAME: &[u8] = b"zerofsd.txt";
+
+    // ---- 1) open/create ----
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_OPEN;
+    request.payload[..NAME.len()].copy_from_slice(NAME);
+    request.payload[NAME.len()] = 0; // NUL 收尾
+    request.payload[NAME.len() + 1] = fs_vt::OPEN_CREATE; // mode 字节
+    print("[1/6] open \"zerofsd.txt\" create: ");
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code != 0 {
+        print_fs_fail("open", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    print("fd=");
+    print_u64(fd as u64);
+    println("");
+
+    // ---- 2) write "ZERO-FSD" ----
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_WRITE;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    request.payload[4..8].copy_from_slice(&(MARK.len() as u32).to_le_bytes());
+    request.payload[8..8 + MARK.len()].copy_from_slice(MARK);
+    print("[2/6] write \"ZERO-FSD\": ");
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code != 0 {
+        print_fs_fail("write", response.code);
+        return;
+    }
+    let written = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    print("wrote ");
+    print_u64(written as u64);
+    println(" bytes");
+
+    // ---- 3) close 写句柄（POSIX 语义：写后偏移在文件尾，须重开再读）----
+    print("[3/6] close write fd=");
+    print_u64(fd as u64);
+    print(": ");
+    if !send_close(fd) {
+        return;
+    }
+
+    // ---- 4) 重开（EXISTING，偏移归零；无 mode 字节路径）----
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_OPEN;
+    request.payload[..NAME.len()].copy_from_slice(NAME);
+    request.payload[NAME.len()] = 0; // NUL 收尾，无 mode → EXISTING
+    print("[4/6] reopen existing: ");
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code != 0 {
+        print_fs_fail("reopen", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    print("fd=");
+    print_u64(fd as u64);
+    println("");
+
+    // ---- 5) read 回读 + 比对 ----
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_READ;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    request.payload[4..8].copy_from_slice(&(MARK.len() as u32).to_le_bytes());
+    print("[5/6] read 8 bytes back: \"");
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code != 0 {
+        print_fs_fail("read", response.code);
+        return;
+    }
+    print_bytes(&response.payload[..MARK.len()]);
+    println("\"");
+    if &response.payload[..MARK.len()] == MARK {
+        println("      compare: MATCH");
+    } else {
+        println("      compare: MISMATCH (expected ZERO-FSD)");
+        // 尽力关掉 fd 后中止。
+        send_close(fd);
+        println("fstest: FAIL at compare step");
+        return;
+    }
+
+    // ---- 6) close ----
+    print("[6/6] close fd=");
+    print_u64(fd as u64);
+    print(": ");
+    if !send_close(fd) {
+        return;
+    }
+
+    println("fstest: PASS - fsd block-backed volume verified end-to-end");
+}
+
+/// 发送一条 FS 请求并等待 FS_RESP 响应。发送失败（通道满/不可用）
+/// 返回 None 并提示。收到错误码由调用方按协议解释。
+fn fs_exchange(request: &Message) -> Option<Message> {
+    match userlib::ipc_send(FS_REQ, request) {
+        Ok(_) => {}
+        Err(SysError::ChannelUnavailable) => {
+            println("fstest: FS_REQ queue full");
+            return None;
+        }
+        Err(_) => {
+            println("fstest: FS_REQ send failed (is fsd online?)");
+            return None;
+        }
+    }
+    loop {
+        let mut response = Message::empty();
+        match userlib::ipc_receive(FS_RESP, &mut response) {
+            Ok(_) => return Some(response),
+            Err(SysError::WouldBlock) => userlib::yield_now(),
+            Err(_) => {
+                println("fstest: FS_RESP receive failed");
+                return None;
+            }
+        }
+    }
+}
+
+/// CLOSE 一条 fd；失败时打印并返回 false。
+fn send_close(fd: u32) -> bool {
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_CLOSE;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    let Some(response) = fs_exchange(&request) else {
+        return false;
+    };
+    if response.code != 0 {
+        print_fs_fail("close", response.code);
+        return false;
+    }
+    println("ok");
+    true
+}
+
+/// 协议错误码 → 可读文本 + 统一失败行。
+fn print_fs_fail(step: &str, code: u32) {
+    print("FAIL (");
+    print(step);
+    print(": ");
+    let reason = match code {
+        fs_proto::ERR_NOT_FOUND => "not found",
+        fs_proto::ERR_INVALID => "invalid argument",
+        fs_proto::ERR_NO_DESCRIPTOR => "no descriptor / table full",
+        fs_proto::ERR_DEVICE => "device error (volume not mounted? blkdrv/disk missing?)",
+        _ => "unknown error",
+    };
+    print(reason);
+    println(")");
+    println("fstest: FAIL");
 }
 
 fn read_line(buf: &mut [u8]) -> usize {

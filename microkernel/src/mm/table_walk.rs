@@ -16,6 +16,10 @@ pub const DESC_TYPE_TABLE: u64 = 1 << 1;
 pub const DESC_AF: u64 = 1 << 10;
 pub const DESC_SH_INNER: u64 = 3 << 8;
 pub const DESC_ATTRIDX_NORMAL: u64 = 0 << 2;
+/// Device-nGnRE 属性（MAIR AttrIdx 1 = 0b0000_0100）。
+/// MMIO 区间必须用 Device 内存：Normal-cacheable 下 volatile 绕不过
+/// 硬件写合并/重排，真实设备会收到错序合并的寄存器访问。
+pub const DESC_ATTRIDX_DEVICE_NGNRE: u64 = 1 << 2;
 pub const DESC_UXN: u64 = 1 << 54;
 pub const DESC_PXN: u64 = 1 << 53;
 pub const AP_SHIFT: u64 = 6;

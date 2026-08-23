@@ -112,7 +112,14 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 dump_user_pte(ctx.far);
                 terminate_faulting_process(&ctx)
             } else {
-                // EL1 内核态同步异常：完整上下文 + 重启，绝不裸死循环。
+                // 穷人版 exception table（对照 Linux __ex_table）：内核在
+                // 代用户拷贝（copy_slice_from/to_user）时踩到坏页 ⇒
+                // 视为 EFAULT 类用户错误：杀调用进程，而非重启整机。
+                let elr = read_elr_el1();
+                if ctx.slot.is_some() && fault_in_user_copy_path(elr) {
+                    crate::error!("[trap] user-copy path fault; killing caller (ELR=0x{:016x})", elr);
+                    terminate_faulting_process(&ctx)
+                }
                 crate::error!("{}", message);
                 kernel_sync_fault(&message, esr, frame)
             }
@@ -363,6 +370,19 @@ fn log_unknown_sync(esr: u64) {
 /// 打印完整上下文（ESR/FAR/ELR/SPSR/SP、槽号、pid、trap frame 指针），
 /// 然后尝试复位机器；复位不可用时打印 "SYSTEM HALT" 后停机（日志直写
 /// PL011，已完整落盘）。
+/// 故障 PC 是否落在内核代用户拷贝的例程内（copy_slice_from/to_user）。
+/// 依据符号表子串匹配——Rust 修饰名包含完整路径，contains 足够稳健。
+/// 这是穷人版 exception table：命中即把故障降级为调用进程终止，
+/// 而非整机重启（对照 Linux __ex_table 的 fixup 跳转）。
+fn fault_in_user_copy_path(pc: u64) -> bool {
+    match crate::debug::symbolize(pc) {
+        Some((name, _)) => {
+            name.contains("copy_slice_from_user") || name.contains("copy_slice_to_user")
+        }
+        None => false,
+    }
+}
+
 fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
     let slot = crate::scheduler::current_slot_opt();
     let pid = slot

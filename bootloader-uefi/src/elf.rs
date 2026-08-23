@@ -159,6 +159,13 @@ impl ElfImage {
         })
     }
 
+    /// 判断地址是否落在任一已加载段内（含 bss 的 mem_size 尾部）。
+    pub fn contains_addr(&self, addr: u64) -> bool {
+        self.segments
+            .iter()
+            .any(|seg| addr >= seg.physical_addr && addr < seg.physical_addr + seg.mem_size)
+    }
+
     /// 在内核镜像（已按 p_vaddr 恒等映射加载）中查找符号的加载地址。
     pub fn symbol_address(&self, name: &str) -> Option<u64> {
         self.symbols

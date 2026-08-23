@@ -41,15 +41,16 @@ pub unsafe fn init_kernel_page_table() {
     const BLOCKS_PER_L2: usize = 512; // 512 * 2MiB = 1GiB
     const NUM_L2_TABLES: usize = 2; // map first 2 GiB via two L2 tables
 
-    // 页面属性：有效 block，Normal 内存，Inner-shareable，AF=1。
-    // AP[2:1]=0b00 => EL1 可读写，EL0 无访问权限（内核恒等映射不对用户态开放）。
-    //
-    // 注意：此前的实现错误地在 BLOCK_FLAGS 里加了 DESC_PXN（bit 53），
-    // 导致整个恒等映射对 EL1 也禁止取指：内核一旦真正走自己的页表取指
-    // 就触发 permission fault（2025-11-15 死机日志的根因）。修复方式是
-    // 去掉 PXN，并在切换页表后刷新 TLB（见 arch/aarch64.rs）。
-    let block_flags = DESC_VALID | DESC_AF | DESC_SH_INNER
-        | (AP_EL1_RW_EL0_NONE << 6) | DESC_ATTRIDX_NORMAL;
+    // 页面属性基座：有效 block，Inner-shareable，AF=1，AP=EL1-only。
+    // AttrIdx 按块地址二选一：
+    //   * [DEVICE_LO, DEVICE_HI) → Device-nGnRE（MMIO 区间；Normal-cacheable
+    //     下 volatile 绕不过硬件写合并，真实设备会收到错序访问）
+    //   * 其余 → Normal
+    // QEMU virt 设备区 0x0800_0000..0x1000_0000 恰为 2MiB 对齐，块级
+    // 划分无跨界。对照 Linux ioremap 的 MT_DEVICE_nGnRE。
+    let flags_base = DESC_VALID | DESC_AF | DESC_SH_INNER | (AP_EL1_RW_EL0_NONE << 6);
+    const DEVICE_LO: u64 = 0x0800_0000;
+    const DEVICE_HI: u64 = 0x1000_0000;
 
 // L0: 根表，所有 entry 先清零。
     let l0 =
@@ -93,7 +94,13 @@ pub unsafe fn init_kernel_page_table() {
         let table_idx = block / BLOCKS_PER_L2;
         let entry_idx = block % BLOCKS_PER_L2;
         let pa = (block as u64) * BLOCK_SIZE_L2;
-        let entry = (pa & 0x0000_ffff_ffe0_0000) | block_flags;
+        // MMIO 窗口内的块用 Device-nGnRE（AttrIdx 1），其余 Normal。
+        let attridx = if pa >= DEVICE_LO && pa < DEVICE_HI {
+            super::table_walk::DESC_ATTRIDX_DEVICE_NGNRE
+        } else {
+            DESC_ATTRIDX_NORMAL
+        };
+        let entry = (pa & 0x0000_ffff_ffe0_0000) | flags_base | attridx;
         match table_idx {
             0 => (*l2_0).0[entry_idx] = entry,
             1 => (*l2_1).0[entry_idx] = entry,

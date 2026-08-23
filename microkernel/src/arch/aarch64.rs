@@ -131,6 +131,17 @@ pub fn init(_boot_info: &BootInfo) {
         asm!("msr SPSel, #1", options(nostack, preserves_flags));
         set_vector_base(&__vector_table as *const _ as usize);
         crate::info!("arch/aarch64: vectors set");
+
+        // MAIR AttrIdx 1 配置为 Device-nGnRE（0b0000_0100）：恒等映射的
+        // MMIO 块引用该属性，寄存器访问不被缓存合并（对照 Linux ioremap）。
+        // 保留其余属性槽（固件 Normal 定义在 AttrIdx 0，继续生效）。
+        let mut mair: u64;
+        asm!("mrs {}, mair_el1", out(reg) mair);
+        mair &= !(0xFFu64 << 8);
+        mair |= 0x04u64 << 8;
+        asm!("msr mair_el1, {}", in(reg) mair);
+        asm!("tlbi vmalle1", options(nostack));
+
         gic::init();
         crate::info!("arch/aarch64: gic init done");
         timer::init(10);

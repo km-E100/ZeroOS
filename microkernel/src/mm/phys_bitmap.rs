@@ -185,6 +185,18 @@ impl PhysBitmap {
         self.free
     }
 
+    /// 把一页标记为永久占用（EFI 空洞 / 固件保留），并同步扣减空闲计数。
+    /// 已占用则幂等返回 false。仅用于 init 阶段的区间登记。
+    pub fn mark_busy(&mut self, page: usize) -> bool {
+        self.assert_ready();
+        if page >= self.total || self.page_busy(page) {
+            return false;
+        }
+        self.set_bit(page);
+        self.free -= 1;
+        true
+    }
+
     fn page_busy(&self, page: usize) -> bool {
         unsafe { *self.words.add(page / 64) & (1u64 << (page % 64)) != 0 }
     }
