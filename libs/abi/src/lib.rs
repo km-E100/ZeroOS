@@ -1551,3 +1551,48 @@ pub mod userdb {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// 第十四刀：ABI 解码模糊属性测试（宿主）。
+//
+// LCG 伪随机 u64 全域轰击 syscall::decode：断言两条不变式——
+// (1) 任意输入不 panic 且判定确定；(2) 错误带（u64::MAX-8..=MAX）之外
+// 一律原样 Ok 透传、带内一律 Err。错误码契约见 SysError 文档（冻结）。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::syscall::decode;
+
+    /// LCG 参数取 Numerical Recipes 常量；u64 溢出即自由截断。
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state
+    }
+
+    #[test]
+    fn decode_never_panics_and_band_contract_holds() {
+        let mut state = 0x5EED_2026u64; // 第十四刀种子
+        for _ in 0..20_000 {
+            let raw = next(&mut state);
+            let in_error_band = raw >= u64::MAX - 8;
+            match decode(raw) {
+                Ok(v) => {
+                    assert!(!in_error_band, "raw=0x{raw:016x} 落入错误区间却解码成功");
+                    assert_eq!(v, raw, "成功值必须原样透传");
+                }
+                Err(_) => {
+                    assert!(in_error_band, "raw=0x{raw:016x} 应视为成功透传");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn error_band_boundaries_are_exact() {
+        // 带外第一格必须成功；带内九个判别值必须全部 Err。
+        assert!(decode(u64::MAX - 9).is_ok());
+        for k in 0..9u64 {
+            assert!(decode(u64::MAX - k).is_err(), "k={k} 应解码为错误");
+        }
+    }
+}

@@ -59,6 +59,11 @@ static PROC_LEVEL: [core::sync::atomic::AtomicU8; 64] =
 
 /// 内核单调 tick 计数（每次定时器中断 +1）。睡眠唤醒的时钟基准。
 static TICK_NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 软看门狗：连续无 Running 进程的 tick 数（第十四刀）。
+static IDLE_STREAK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 告警阈值：600 tick（约 60s @100Hz；对照 Linux kernel panic 10s 的
+/// 宽松化——本内核 idle 属常态而非故障）。
+const WATCHDOG_IDLE_TICKS: u32 = 600;
 /// 上一次全局优先级提升发生的 tick。
 static LAST_BOOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -435,6 +440,25 @@ pub fn on_tick_consume() -> bool {
             }
         }
     }
+
+    // ── 软看门狗（第十四刀）：连续 N tick 无 Running 进程即告警一次。
+    // 单核 idle 属正常（对照 Linux cpuidle），告警阈值远高于正常空转；
+    // 若系"全员阻塞且唤醒者缺席"类调度事故，此处留下第一现场日志。
+    if current_slot_opt()
+        .map(|slot| process::state_slot(slot) != Some(ProcessState::Running))
+        .unwrap_or(true)
+    {
+        let streak = IDLE_STREAK.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if streak == WATCHDOG_IDLE_TICKS {
+            crate::error!(
+                "watchdog: no Running process for {} ticks (idle streak), tick_now={}",
+                streak,
+                now
+            );
+        }
+        return false;
+    }
+    IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
 
     // ── 当前进程时间片记账与降级 ──
     // 守门（第十一刀实机排障结论）：CURRENT_SLOT 在进程 Blocking 后
