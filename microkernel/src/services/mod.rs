@@ -18,6 +18,7 @@ pub fn launch_core(_info: &BootInfo) {
             entry: ServiceEntry::Bootfs("/System/Core/zero-launchd"),
             essential: true,
             privileged: true, // 作为 init 应当是 privileged
+            capabilities: zero_abi::cap::CAP_ALL,
         },
         ServiceDescriptor {
             name: "securityd",
@@ -28,6 +29,8 @@ pub fn launch_core(_info: &BootInfo) {
             // KNOWN_SERVICES 启动对账），否则 launchd 拿不到真实 pid。
             essential: false,
             privileged: false,
+            // userdb 持久化经号位 7/8 写盘 ⇒ 需要 CAP_BLOCK_DEV。
+            capabilities: zero_abi::cap::CAP_BLOCK_DEV,
         },
         ServiceDescriptor {
             name: "blkdrv",
@@ -38,6 +41,7 @@ pub fn launch_core(_info: &BootInfo) {
             // MmioMap 租约；当前直通路径不强制。
             essential: false,
             privileged: true,
+            capabilities: zero_abi::cap::CAP_BLOCK_DEV | zero_abi::cap::CAP_MMIO,
         },
         ServiceDescriptor {
             name: "fsd",
@@ -47,6 +51,7 @@ pub fn launch_core(_info: &BootInfo) {
             // 直通。无 MMIO 依赖，privileged=false。
             essential: false,
             privileged: false,
+            capabilities: 0,
         },
     ];
 
@@ -181,8 +186,19 @@ fn spawn_server(descriptor: &ServiceDescriptor) -> Result<ProcessId, ServiceErro
             Ok(pid)
         }
         ServiceEntry::Bootfs(path) => {
-            process::spawn_user_from_bootfs(path, descriptor.name, descriptor.privileged)
-                .map_err(|e| ServiceError::SpawnFailed(e))
+            let pid = process::spawn_user_from_bootfs(path, descriptor.name, descriptor.privileged)
+                .map_err(|e| ServiceError::SpawnFailed(e))?;
+            // 精细能力授予：descriptor.capabilities 位或 privileged 布尔
+            // 的历史映射（true=CAP_ALL），两者并存取并集。
+            let caps = if descriptor.privileged {
+                zero_abi::cap::CAP_ALL | descriptor.capabilities
+            } else {
+                descriptor.capabilities
+            };
+            if caps != 0 {
+                process::set_capabilities(pid, caps);
+            }
+            Ok(pid)
         }
     }
 }
@@ -192,7 +208,12 @@ pub struct ServiceDescriptor {
     pub name: &'static str,
     pub entry: ServiceEntry,
     pub essential: bool,
+    /// 兼容字段：true ⇒ spawn 时映射 CAP_ALL（历史语义）。
+    /// 新代码请用 [`capabilities`] 精细位图；两者并存时按位或生效。
     pub privileged: bool,
+    /// 精细能力位图（zero_abi::cap 常量）：spawn 后经 set_capabilities
+    /// 授予。0 = 仅继承 privileged 标志的映射。
+    pub capabilities: u32,
 }
 
 #[derive(Copy, Clone)]
