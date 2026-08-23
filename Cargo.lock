@@ -965,8 +965,6 @@ version = "0.1.0"
 name = "zero-blkdrv"
 version = "0.1.0"
 dependencies = [
- "heapless",
- "log",
  "spin",
  "userlib",
  "zero-abi",
@@ -990,8 +988,6 @@ dependencies = [
 name = "zero-fsd"
 version = "0.1.0"
 dependencies = [
- "heapless",
- "log",
  "spin",
  "userlib",
  "zero-abi",

@@ -12,8 +12,7 @@ name = "zero-fsd"
 path = "src/bin/main.rs"
 
 [dependencies]
+# 块后端卷文件服务：纯 IPC + 静态表，无堆依赖（heapless/log 已随旧实现移除）。
 zero-abi = { path = "../../libs/abi" }
-heapless = { version = "0.8", default-features = false }
-log = { workspace = true }
 spin = { workspace = true }
 userlib = { path = "../../userland/userlib" }

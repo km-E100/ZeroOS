@@ -29,6 +29,25 @@ pub fn launch_core(_info: &BootInfo) {
             essential: false,
             privileged: false,
         },
+        ServiceDescriptor {
+            name: "blkdrv",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-blkdrv"),
+            // 块设备服务（第七刀）：数据面经号位 7/8 内核直通（块设备
+            // 唯一属主仍是内核 virtio-blk 驱动）。privileged=true 按
+            // 服务契约预留——未来恢复用户态原生 MMIO 队列路径时需要
+            // MmioMap 租约；当前直通路径不强制。
+            essential: false,
+            privileged: true,
+        },
+        ServiceDescriptor {
+            name: "fsd",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-fsd"),
+            // 文件服务（第七刀）：块后端卷文件表（名字→LBA），客户端
+            // 面纯 IPC（FS_REQ/FS_RESP），对 blkdrv 走 BLKDRV_REQ 分块
+            // 直通。无 MMIO 依赖，privileged=false。
+            essential: false,
+            privileged: false,
+        },
     ];
 
     for service in bundled {

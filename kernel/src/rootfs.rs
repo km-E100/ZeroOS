@@ -5,7 +5,7 @@ use zero_abi::boot::{RootFsEntry, RootFsImage};
 #[no_mangle]
 #[used]
 #[link_section = ".rodata.boot"]
-pub static __zero_rootfs_entries: [RootFsEntry; 8] = [
+pub static __zero_rootfs_entries: [RootFsEntry; 10] = [
     RootFsEntry::new(
         "/etc/motd",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs/etc/motd")),
@@ -57,6 +57,23 @@ pub static __zero_rootfs_entries: [RootFsEntry; 8] = [
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/rootfs/System/Core/zero-securityd"
+        )),
+    ),
+    // blkdrv 块设备服务裸机 ELF（xtask sync_userland_blobs 同步；
+    // launchd 启动对账时按名 spawn，见 services/mod.rs bundled）。
+    RootFsEntry::new(
+        "/System/Core/zero-blkdrv",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/rootfs/System/Core/zero-blkdrv"
+        )),
+    ),
+    // fsd 文件服务裸机 ELF（块后端卷文件表，fstest 端到端验证）。
+    RootFsEntry::new(
+        "/System/Core/zero-fsd",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/rootfs/System/Core/zero-fsd"
         )),
     ),
 ];

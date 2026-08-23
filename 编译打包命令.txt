@@ -7,10 +7,19 @@ cargo run -p xtask -- build-servers
 cargo run -p xtask -- build-installer
 cargo run -p xtask -- build-recovery
 
-# 说明：build-servers 现在会同时产出 zero-launchd 与 zero-securityd 的
-# aarch64-unknown-none 裸机 release ELF，并经 sync_userland_blobs 同步到
-# kernel/rootfs/System/Core/（zero-launchd / zero-securityd），随后的
+# 说明：build-servers 现在会同时产出 zero-launchd、zero-securityd、
+# zero-blkdrv 与 zero-fsd 的 aarch64-unknown-none 裸机 release ELF，
+# 并经 sync_userland_blobs 同步到 kernel/rootfs/System/Core/
+# （zero-launchd / zero-securityd / zero-blkdrv / zero-fsd），随后的
 # build-rootfs / build-iso 会把它们嵌入内核镜像。
+#
+# 第七刀文件服务上线（fsd + blkdrv）：
+#   - blkdrv：块设备服务，数据面走内核直通（号位 7/8 BlockRead/
+#     BlockWrite），协议见 zero_abi::protocol::blk::passthrough；
+#   - fsd：块后端卷文件服务（名字→LBA 内存表，超级块 @LBA8192，
+#     数据区 @LBA16384 起；避开内核自检@2048 与 userdb@4096 起），
+#     协议见 zero_abi::protocol::fs::vtable；
+#   - 两者由 launchd 开机自动对账拉起（KNOWN_SERVICES 已含）。
 
 # 构建微内核/裸机内核
 cargo run -p xtask -- build-kernel
@@ -76,18 +85,21 @@ qemu-system-aarch64 \
 
 # ---- 用户态服务生命周期（launchd）----
 #
-# 当前内核登记并交由 launchd 拉起的服务：securityd
-# （/System/Core/zero-securityd，纯 IPC + 控制台，无 MMIO 依赖；
-# 无盘环境下 userdb 持久化失败仅告警降级，不影响在线）。
+# 当前内核登记并交由 launchd 拉起的服务：securityd、blkdrv、fsd
+# （均 /System/Core/ 下裸机 ELF；blkdrv privileged=true 预留 MMIO 租约，
+# fsd 纯 IPC。blkdrv 缺盘时降级告警；fsd 探测不到 blkdrv 时同样降级）。
 #
 # 开机自动对账：launchd 启动时逐个向内核 spawn KNOWN_SERVICES——
 # 已登记的服务记为 [running pid=N]，未登记的保持 [not-installed]。
-# 因此启动日志可见：securityd banner（"Zero OS securityd (EL0 service)
-# online"）+ launchd 对账行（"launchd: service online: securityd pid=N"）。
+# 因此启动日志可见：fsd/blkdrv/securityd banner + launchd 对账行
+# （"launchd: service online: <name> pid=N"）。
 #
 # shell 验证命令：
-#   launchd list            # 应看到 securityd [running] pid=N
+#   launchd list            # 应看到 fsd/blkdrv/securityd 均 [running] pid=N
 #   launchd spawn securityd # 已运行 → 友好提示 "already running pid=N"（幂等，不重复拉起）
+#   fstest                  # 文件语义端到端验证：
+#                           #   open(create)→write "ZERO-FSD"→close→
+#                           #   reopen→read 比对→close，打印 PASS/MATCH
 #   launchd status          # launchd up; services registered=N
 #
 # 脚本化实机验证（无盘、串口注入两条命令，约 26 秒后看 /tmp/svc.log）：

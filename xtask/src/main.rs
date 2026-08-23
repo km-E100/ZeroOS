@@ -133,6 +133,9 @@ fn build_kernel_bare(sh: &Shell) -> Result<()> {
 fn build_baremetal_blobs(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
+    // 第七刀：fsd（块后端卷文件服务）与 blkdrv（直通块设备服务）。
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fsd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-blkdrv --release").run()?;
     Ok(())
 }
 
@@ -145,6 +148,11 @@ fn build_servers(sh: &Shell) -> Result<()> {
 
     // zero-securityd 同样只编裸机版本（rootfs 运行物；host 版仅作分析副本）
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
+
+    // 第七刀：zero-blkdrv / zero-fsd 只编裸机版本（rootfs 运行物；
+    // host 版由上方第一行照常产出，供 ISO userland/ 分析用）。
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-blkdrv --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fsd --release").run()?;
 
     // 一致性核对：
     //   A. ISO 的 userland/ 目录（image.rs）收集的是 target/debug 下的 HOST 版
@@ -182,6 +190,16 @@ fn sync_userland_blobs(sh: &Shell, warn_missing: bool) -> Result<()> {
             "target/aarch64-unknown-none/release/zero-securityd",
             "kernel/rootfs/System/Core/zero-securityd",
             "securityd 服务器",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-blkdrv",
+            "kernel/rootfs/System/Core/zero-blkdrv",
+            "blkdrv 块设备服务器（第七刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-fsd",
+            "kernel/rootfs/System/Core/zero-fsd",
+            "fsd 文件服务器（第七刀）",
         ),
     ];
     for (src_rel, dst_rel, what) in blobs {
