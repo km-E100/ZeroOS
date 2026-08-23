@@ -495,8 +495,14 @@ pub mod protocol {
             pub const CMD_READ: u32 = 0x22;
             /// 关闭 fd（文件与数据保留）。
             pub const CMD_CLOSE: u32 = 0x23;
-            /// 列出卷内全部文件名。
+            /// 列出目录内容（第十二刀起支持路径参数：空=根目录）。
             pub const CMD_LIST: u32 = 0x24;
+            /// 创建目录（第十二刀）：`[path\0]`，父目录必须已存在。
+            pub const CMD_MKDIR: u32 = 0x25;
+            /// 删除空目录（第十二刀）：`[path\0]`，含子项 → ERR_INVALID。
+            pub const CMD_RMDIR: u32 = 0x26;
+            /// 删除文件（第十二刀）：`[path\0]`；目录须走 CMD_RMDIR。
+            pub const CMD_UNLINK: u32 = 0x27;
 
             /// OPEN mode：仅打开已存在文件（不存在 → ERR_NOT_FOUND）。
             pub const OPEN_EXISTING: u8 = 0;

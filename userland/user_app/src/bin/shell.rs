@@ -116,7 +116,8 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/segvdemo/pid/ppid");
             println("  sched/sleep: sleepdemo (号位 25 Sleep(ticks))");
             println("  memory:  brktest");
-            println("  storage: fstest/blktest");
+            println("  storage: fstest/fsdemo/blktest");
+            println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
@@ -569,6 +570,18 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"blktest" || cmd.starts_with(b"blktest ") {
             // raw 块设备端到端验证：号位 7/8 内核直通（绕过 fsd 卷语义）。
             blktest_command(cmd);
+        } else if cmd == b"ls" || cmd.starts_with(b"ls ") {
+            // 目录树列表（第十二刀）：经 fsd LIST 路径版。
+            ls_command(cmd);
+        } else if cmd == b"cat" || cmd.starts_with(b"cat ") {
+            // 文件内容打印（第十二刀）：OPEN EXISTING → 分块 READ → CLOSE。
+            cat_command(cmd);
+        } else if cmd == b"mkdir" || cmd.starts_with(b"mkdir ") {
+            // 建目录（第十二刀 CMD_MKDIR）。
+            mkdir_command(cmd);
+        } else if cmd == b"fsdemo" {
+            // 目录树端到端验证（第十二刀）。见 fsdemo_command。
+            fsdemo_command();
         } else if cmd == b"clear" {
             // ANSI：清屏 + 光标归位
             let _ = console_write(b"\x1b[2J\x1b[H");
@@ -1386,4 +1399,324 @@ fn print_hex(mut v: u64) {
         v >>= 4;
     }
     let _ = console_write(&digits[i..]);
+}
+// ═══════════════ 第十二刀：目录树命令（ls/cat/mkdir/fsdemo）═══════════════
+
+/// 取命令首个空格后的参数（去首尾空格；无参数返回空切片）。
+fn cmd_arg(cmd: &[u8]) -> &[u8] {
+    let rest = match cmd.iter().position(|&b| b == b' ') {
+        Some(pos) => &cmd[pos + 1..],
+        None => b"",
+    };
+    let mut start = 0usize;
+    let mut end = rest.len();
+    while start < end && (rest[start] == b' ' || rest[start] == b'\t') {
+        start += 1;
+    }
+    while end > start && (rest[end - 1] == b' ' || rest[end - 1] == b'\t') {
+        end -= 1;
+    }
+    &rest[start..end]
+}
+
+/// 构造带路径参数的 fsd 请求：[path NUL][extra?]。
+fn path_request(code: u32, path: &[u8], extra: Option<u8>) -> Message {
+    let mut request = Message::empty();
+    request.code = code;
+    let mut pos = 0usize;
+    if !path.is_empty() {
+        let take = path.len().min(request.payload.len() - 2);
+        request.payload[..take].copy_from_slice(&path[..take]);
+        pos = take;
+    }
+    request.payload[pos] = 0; // NUL 收尾
+    if let Some(byte) = extra {
+        request.payload[pos + 1] = byte;
+    }
+    request
+}
+
+/// ls —— 列目录。`ls` 列根，`ls <dir>` 列子目录；子目录条目自带尾 '/'。
+fn ls_command(cmd: &[u8]) {
+    let arg = cmd_arg(cmd);
+    let dir: &[u8] = if arg.starts_with(b"/") { &arg[1..] } else { arg };
+    // 嵌套路径直接透传 fsd（空段/点段的权威拒绝在服务端）。
+    let request = path_request(fs_vt::CMD_LIST, dir, None);
+    print("fs> ");
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    match response.code {
+        0 => {
+            // payload 为 `name\n` 串；逐行打印
+            let mut line_start = 0usize;
+            for i in 0..response.payload.len() {
+                if response.payload[i] == 0 {
+                    break;
+                }
+                if response.payload[i] == b'\n' {
+                    println_bytes(&response.payload[line_start..i]);
+                    line_start = i + 1;
+                }
+            }
+            if line_start == 0 && response.payload[0] == 0 {
+                println("(empty)");
+            } else if line_start < response.payload.len() && response.payload[line_start] != 0 {
+                println_bytes(&response.payload[line_start..]);
+            }
+        }
+        _ => print_fs_fail("ls", response.code),
+    }
+}
+
+/// cat —— 打印文件内容到串口。OPEN(EXISTING) → 循环 READ(≤96B) → CLOSE。
+fn cat_command(cmd: &[u8]) {
+    let raw = cmd_arg(cmd);
+    if raw.is_empty() {
+        println("usage: cat <path>");
+        return;
+    }
+    let path: &[u8] = if raw.starts_with(b"/") { &raw[1..] } else { raw };
+    // open existing
+    let request = path_request(fs_vt::CMD_OPEN, path, None);
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code != 0 {
+        print_fs_fail("cat open", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    // read loop
+    loop {
+        let mut request = Message::empty();
+        request.code = fs_vt::CMD_READ;
+        request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+        request.payload[4..8].copy_from_slice(&96u32.to_le_bytes());
+        let Some(response) = fs_exchange(&request) else {
+            let _ = send_close(fd);
+            return;
+        };
+        if response.code != 0 {
+            let _ = console_write(b"\r\n");
+            print_fs_fail("cat read", response.code);
+            let _ = send_close(fd);
+            return;
+        }
+        let end = response.payload.iter().position(|&b| b == 0).unwrap_or(response.payload.len());
+        if end == 0 {
+            break; // EOF（0 字节回包）
+        }
+        let _ = console_write(&response.payload[..end]);
+        if end < 96 {
+            break; // 短读即尾
+        }
+    }
+    let _ = console_write(b"\r\n");
+    if !send_close(fd) {
+        return;
+    }
+}
+
+/// mkdir —— 创建目录。
+fn mkdir_command(cmd: &[u8]) {
+    let raw = cmd_arg(cmd);
+    if raw.is_empty() {
+        println("usage: mkdir <path>");
+        return;
+    }
+    let path: &[u8] = if raw.starts_with(b"/") { &raw[1..] } else { raw };
+    let request = path_request(fs_vt::CMD_MKDIR, path, None);
+    let Some(response) = fs_exchange(&request) else {
+        return;
+    };
+    if response.code == 0 {
+        print("mkdir ");
+        print_bytes(path);
+        println(": ok");
+    } else {
+        print_fs_fail("mkdir", response.code);
+    }
+}
+
+/// fsdemo —— 目录树端到端验证（第十二刀）。
+///
+/// 序列：mkdir /zfdemo → create+write /zfdemo/note.txt("TREE-OK") →
+/// 重开回读比对 → ls /zfdemo 断言含 "note.txt" → mkdir 嵌套 /zfdemo/sub
+/// → 在其下 create/读回 /zfdemo/sub/b.txt → unlink 两文件 → rmdir 两目录
+/// （先空后父）→ 全过 PASS。任何一步失败即 FAIL 并指明阶段。
+fn fsdemo_command() {
+    const DIR: &[u8] = b"zfdemo";
+    const SUB: &[u8] = b"zfdemo/sub";
+    const NOTE: &[u8] = b"zfdemo/note.txt";
+    const BFILE: &[u8] = b"zfdemo/sub/b.txt";
+
+    // [1] mkdir 根级目录
+    let response = match fs_exchange(&path_request(fs_vt::CMD_MKDIR, DIR, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[1/9] mkdir zfdemo", response.code);
+        return;
+    }
+    println("[1/9] mkdir zfdemo: ok");
+
+    // [2] create + write note.txt
+    let mut request = path_request(fs_vt::CMD_OPEN, NOTE, Some(fs_vt::OPEN_CREATE));
+    request.code = fs_vt::CMD_OPEN;
+    let response = match fs_exchange(&request) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[2/9] create note.txt", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    let mark = b"TREE-OK";
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_WRITE;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    request.payload[4..8].copy_from_slice(&(mark.len() as u32).to_le_bytes());
+    request.payload[8..8 + mark.len()].copy_from_slice(mark);
+    let response = match fs_exchange(&request) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[2/9] write note.txt", response.code);
+        return;
+    }
+    if !send_close(fd) {
+        return;
+    }
+    println("[2/9] write zfdemo/note.txt \"TREE-OK\": ok");
+
+    // [3] reopen + read back + 比对
+    let response = match fs_exchange(&path_request(fs_vt::CMD_OPEN, NOTE, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[3/9] reopen note.txt", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_READ;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    request.payload[4..8].copy_from_slice(&(mark.len() as u32).to_le_bytes());
+    let response = match fs_exchange(&request) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 || &response.payload[..mark.len()] != mark {
+        print_fs_fail("[3/9] readback note.txt", response.code);
+        return;
+    }
+    let _ = send_close(fd);
+    println("[3/9] readback \"TREE-OK\": MATCH");
+
+    // [4] ls 目录断言含 note.txt
+    let response = match fs_exchange(&path_request(fs_vt::CMD_LIST, DIR, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    let text_ok = response.code == 0
+        && response
+            .payload
+            .windows(8)
+            .any(|w| w == b"note.txt");
+    if !text_ok {
+        print_fs_fail("[4/9] ls zfdemo", response.code);
+        return;
+    }
+    println("[4/9] ls zfdemo contains note.txt: ok");
+
+    // [5] mkdir 嵌套 + 子文件写读
+    let response = match fs_exchange(&path_request(fs_vt::CMD_MKDIR, SUB, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[5/9] mkdir zfdemo/sub", response.code);
+        return;
+    }
+    let response = match fs_exchange(&path_request(fs_vt::CMD_OPEN, BFILE, Some(fs_vt::OPEN_CREATE))) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[5/9] create sub/b.txt", response.code);
+        return;
+    }
+    let fd = u32::from_le_bytes(response.payload[0..4].try_into().unwrap_or([0; 4]));
+    let mut request = Message::empty();
+    request.code = fs_vt::CMD_WRITE;
+    request.payload[0..4].copy_from_slice(&fd.to_le_bytes());
+    request.payload[4..8].copy_from_slice(&2u32.to_le_bytes());
+    request.payload[8..10].copy_from_slice(b"BB");
+    let response = match fs_exchange(&request) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code != 0 {
+        print_fs_fail("[5/9] write sub/b.txt", response.code);
+        return;
+    }
+    let _ = send_close(fd);
+    println("[5/9] nested zfdemo/sub/b.txt write: ok");
+
+    // [6] rmdir 非空目录必须被拒（POSIX 语义）
+    let response = match fs_exchange(&path_request(fs_vt::CMD_RMDIR, SUB, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code == 0 {
+        println("[6/9] rmdir non-empty zfdemo/sub: FAIL (should be denied)");
+        return;
+    }
+    println("[6/9] rmdir non-empty zfdemo/sub: correctly denied");
+
+    // [7] unlink 两文件
+    for (path, step) in [(NOTE, "[7/9] unlink note.txt"), (BFILE, "[7/9] unlink sub/b.txt")] {
+        let response = match fs_exchange(&path_request(fs_vt::CMD_UNLINK, path, None)) {
+            Some(r) => r,
+            None => return,
+        };
+        if response.code != 0 {
+            print_fs_fail(step, response.code);
+            return;
+        }
+    }
+    println("[7/9] unlink note.txt + sub/b.txt: ok");
+
+    // [8] rmdir 空 sub → 成功；再 rmdir zfdemo → 成功
+    for (path, step) in [
+        (SUB, "[8/9] rmdir zfdemo/sub"),
+        (DIR, "[8/9] rmdir zfdemo"),
+    ] {
+        let response = match fs_exchange(&path_request(fs_vt::CMD_RMDIR, path, None)) {
+            Some(r) => r,
+            None => return,
+        };
+        if response.code != 0 {
+            print_fs_fail(step, response.code);
+            return;
+        }
+    }
+    println("[8/9] rmdir empty sub then zfdemo: ok");
+
+    // [9] 复查：目录已消失（LIST 应 NOT_FOUND）
+    let response = match fs_exchange(&path_request(fs_vt::CMD_LIST, DIR, None)) {
+        Some(r) => r,
+        None => return,
+    };
+    if response.code == 0 {
+        println("[9/9] post-rmdir ls: FAIL (still exists)");
+        return;
+    }
+    println("[9/9] post-rmdir ls: gone");
+    println("fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)");
 }
