@@ -2,30 +2,26 @@
 
 > 新会话先读本文件 + `git log --oneline` 接上进度。
 
-## 当前里程碑（2026-08-22 · 第五刀：三线并行交付）
-- **fork 端到端打通**（实机）：clone_user_address_space eager-copy 零缺陷；
-  shell `forktest` 命令父子双行验证；子进程回收链路完整
-- **virtio-blk 上线**（实机自检通过）：IRQ 槽位修正 48/49、EL1 轮询完成路径、
-  开机 LBA2048 写读自检；run-qemu.sh / xtask run 挂盘固化；专用 disk.img
-- **内核故障符号化回溯**（实机）：bootloader 灌符号进 .data 汇槽
-  （192KiB，.data 而非 .bss——zero_bss 会清掉后者）；trap 输出 elr=__symbol+off；
-  8 项单测。注意：汇槽容量截断保低址段
-- **体积硬闸**：xtask 所有命令前置 du 检查，超 2048MB 锁死构建；`purge` 自救
-- **诊断增强**：显式 alloc_error_handler（OOM 打印 Layout+phys 余量）；
-  logger 支持动态格式化 panic 载荷（曾吞掉 assert_eq! 真实文本）
+## 当前里程碑（2026-08-22 · 第六刀：POSIX 进程回收 + 双服务在线）
+- **zombie/waitpid 实机打通**：Exit 有父转 Zombie（释放地址空间保留
+  退出码）；号位 22 WaitPid 收集返回 (pid<<32)|code，无可收子挂起，
+  无子 NotFound；shell waittest 实机验证 zombie→collected 全链路
+- **securityd 真实上线**：launchd spawn 运行 [running] pid=4，加载
+  /etc/users，auth/userdb 就绪；blk 缺失时优雅降级警告
+- **时间片调度**：SLICE_TICKS=4 记账，未耗尽直接 restore_frame 免切换
+- **FP 链符号化栈回溯**：kernel_sync_fault 输出 Call Trace 段
 
 ## 实机验收清单（全部 ✓）
-symbol sink / launchd online / shell 交互 / forktest 父子 / 服务注册表视图 /
-pid / 无 MISALIGNED / 无 panic
+forktest 父子 / waittest zombie→collected / launchd list 含 running 服务 /
+securityd banner+userdb / symbol sink / shell 交互 / 时间片下响应正常
 
-## 已知待办（第六刀候选）
-1. wait/waitpid/zombie 回收（fork 已通，POSIX 进程族谱缺一半）
-2. userland block_write/read 端到端命令（驱动已就绪，缺 shell 集成）
-3. ZFS/fsd/blkdrv 用户态服务真实上线（依赖块设备，现已具备）
-4. EFI memory map 精细消费；时间片/优先级调度；符号化栈回溯（FP 链）
-5. virtio-net 槽位空置 warn 噪音；短读语义；真机 DMA cache 一致性
+## 已知待办（第七刀候选）
+1. 孤儿进程策略文档化 + init 收养模式；waitpid 扩展 WNOHANG
+2. fsd 上线（blkdrv IPC 通道对接 virtio-blk）→ ZFS 挂载路径
+3. 用户态块设备命令（blktest）；securityd userdb 落盘持久化
+4. EFI memory map 精细消费；符号化栈回溯接入用户态故障路径
+5. 多核 GIC/SMP 评估；每 CPU 中断栈分离
 
 ## 构建与实机验证
-cargo run -p xtask -- build-iso          # 超 2048MB 会锁死，purge 自救
+cargo run -p xtask -- build-iso          # 超 2048MB 锁死，purge 自救
 ./run-qemu.sh                            # 交互串口 + 自动挂盘
-# 或 cargo run -p xtask -- run normal
