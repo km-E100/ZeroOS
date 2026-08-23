@@ -161,8 +161,14 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
             if handled {
                 crate::arch::restore_frame(frame)
             } else {
-                crate::debug!("trap: unhandled irq={}, yielding current", irq);
-                crate::scheduler::yield_current()
+                // 杂散 IRQ：EOI 已完成（上方 end_irq），无任何驱动事件、
+                // 无任何调度理由 —— 直接恢复被打断进程。此前误走
+                // yield_current()：一次硬件噪声就强制一次上下文切换，
+                // 白白损失当前进程剩余时间片并放大延迟；且杂散 IRQ 高频
+                // 重放时会把调度器搅成抖动源。restore_frame 只重装现场
+                // 并 eret，不触碰就绪队列。
+                crate::debug!("trap: stray irq={}, resuming current", irq);
+                crate::arch::restore_frame(frame)
             }
         }
     }

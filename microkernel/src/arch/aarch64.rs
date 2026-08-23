@@ -55,6 +55,10 @@ __vector_table:\n\
      // * SP_EL1 在异常进入时由硬件自动切换，其当前值恒为该槽内核栈顶\n\
      //   （每次 eret 前都从帧内 #272 重置），故直接存入 #272 并复位 SP，\n\
      //   保证嵌套/重入时栈指针幂等归位。\n\
+     // * 【第八刀：执行域扩展】TPIDR_EL0（用户 TLS）与 v0-v31/FPSR/FPCR\n\
+     //   全量急切保存（帧内 #280 / #288..#804）。前提：arch::init 已置\n\
+     //   CPACR_EL1.FPEN=0b11 —— 否则本存根的 stp q*/mrs fpsr 自身就会\n\
+     //   同步异常。内核态浮点约定与 lazy-save 优化路径见 process::FpuState。\n\
      .macro SAVE_TRAP_AND_CALL kind\n\
          mrs x16, tpidr_el1\n\
          str x17, [x16, #136]\n\
@@ -82,6 +86,36 @@ __vector_table:\n\
          mov x17, sp\n\
          str x17, [x16, #272]\n\
          mov sp, x17\n\
+         // 用户 TLS（TPIDR_EL0）：x17 此刻已空闲（SPSR 已落帧），经其中转；\n\
+         // EL1 访问 TPIDR_EL0 无条件允许。\n\
+         mrs x17, tpidr_el0\n\
+         str x17, [x16, #280]\n\
+         // FPU/NEON 全量急切保存：#288..#799 = v0-v31，#800/#804 = FPSR/\n\
+         // FPCR。v 寄存器独立于 x16/x17 暂存方案，零冲突；内核不使用 FP\n\
+         // => 存根此刻的 v 寄存器仍是用户现场原值（约定见 process::FpuState）。\n\
+         // STP Qt 立即数须 16 对齐且 <=1008 —— 帧基址由 TrapFrameCell\n\
+         // align(16) 保证对齐。FPSR/FPCR 是 32 位寄存器：用 str w 编码\n\
+         // （imm12 按 4 缩放）；64 位 STR 立即数须 8 对齐，#804 编码不下。\n\
+         stp q0, q1, [x16, #288]\n\
+         stp q2, q3, [x16, #320]\n\
+         stp q4, q5, [x16, #352]\n\
+         stp q6, q7, [x16, #384]\n\
+         stp q8, q9, [x16, #416]\n\
+         stp q10, q11, [x16, #448]\n\
+         stp q12, q13, [x16, #480]\n\
+         stp q14, q15, [x16, #512]\n\
+         stp q16, q17, [x16, #544]\n\
+         stp q18, q19, [x16, #576]\n\
+         stp q20, q21, [x16, #608]\n\
+         stp q22, q23, [x16, #640]\n\
+         stp q24, q25, [x16, #672]\n\
+         stp q26, q27, [x16, #704]\n\
+         stp q28, q29, [x16, #736]\n\
+         stp q30, q31, [x16, #768]\n\
+         mrs x17, fpsr\n\
+         str w17, [x16, #800]\n\
+         mrs x17, fpcr\n\
+         str w17, [x16, #804]\n\
          mov x0, x16\n\
          mov x1, #\\kind\n\
          bl __zero_trap_handler\n\
@@ -127,6 +161,25 @@ pub fn init(_boot_info: &BootInfo) {
             ttbr0,
             ttbr1
         );
+
+        // ── FPU/NEON 使能（第八刀：执行域状态保存补全）──────────────
+        // CPACR_EL1.FPEN[21:20] = 0b11：EL0/EL1 的 FP/SIMD 访问不再陷阱。
+        // 必须先于 VBAR 安装执行：此后每次异常入口存根都会 stp q*/mrs
+        // fpsr/fpcr，若 FPEN=00 这些指令自身同步异常、直接打穿内核。
+        // 此前 FPEN 保持复位值 0b00 ⇒ 用户态碰 FP 要么 EC=0x07 同步异常，
+        // 要么（即便使能了）现场不保存而互踩——本处 + TrapFrame 扩展 +
+        // 存根急切保存三件套一并闭环。
+        //
+        // 内核态浮点使用约定：内核代码不持有跨调度点的 FP/SIMD 状态
+        // （core/alloc 无浮点；softfloat 目标不向量化），故无需内核侧
+        // 保存/惰性切换。未来优化路径（lazy save）：FPEN=0b01 令 EL0 首
+        // 次访问 FP 时陷阱，此时才把 v 区换入帧并置 FPEN=0b11 —— 见
+        // process::FpuState 头注。
+        let mut cpacr: u64;
+        asm!("mrs {}, cpacr_el1", out(reg) cpacr);
+        cpacr |= 0b11 << 20;
+        asm!("msr cpacr_el1, {}", in(reg) cpacr);
+        crate::info!("arch/aarch64: CPACR_EL1.FPEN=0b11 (EL0 FP/SIMD enabled)");
 
         asm!("msr SPSel, #1", options(nostack, preserves_flags));
         set_vector_base(&__vector_table as *const _ as usize);
@@ -273,6 +326,31 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
          msr elr_el1, x16
          ldr x16, [x20, #264]
          msr spsr_el1, x16
+         // 用户 TLS（TPIDR_EL0）与 FPU 全量恢复 —— 与入口存根严格对称：
+         // 存根保存什么，这里就装回什么，否则跨切换的执行域状态静默漂移。
+         // x16 作暂存（随后被 ldp x16, x17 从帧内覆盖，无副作用）。
+         ldr x16, [x20, #280]
+         msr tpidr_el0, x16
+         ldp q0, q1, [x20, #288]
+         ldp q2, q3, [x20, #320]
+         ldp q4, q5, [x20, #352]
+         ldp q6, q7, [x20, #384]
+         ldp q8, q9, [x20, #416]
+         ldp q10, q11, [x20, #448]
+         ldp q12, q13, [x20, #480]
+         ldp q14, q15, [x20, #512]
+         ldp q16, q17, [x20, #544]
+         ldp q18, q19, [x20, #576]
+         ldp q20, q21, [x20, #608]
+         ldp q22, q23, [x20, #640]
+         ldp q24, q25, [x20, #672]
+         ldp q26, q27, [x20, #704]
+         ldp q28, q29, [x20, #736]
+         ldp q30, q31, [x20, #768]
+         ldr w16, [x20, #800]
+         msr fpsr, x16
+         ldr w16, [x20, #804]
+         msr fpcr, x16
          ldp x0, x1, [x20, #0]
          ldp x2, x3, [x20, #16]
          ldp x4, x5, [x20, #32]
