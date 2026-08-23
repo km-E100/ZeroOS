@@ -6,7 +6,7 @@ use zero_abi::{
     ProcessId,
 };
 
-use crate::process::{self, ProcessState, TrapFrame};
+use crate::process::{self, TrapFrame};
 
 #[repr(u64)]
 pub enum TrapKind {
@@ -90,7 +90,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                     ctx.elr,
                     ctx.pid.map(|p| p.raw())
                 );
-                terminate_faulting_process(&ctx)
+                terminate_faulting_process(&ctx, zero_abi::signals::SIGTRAP)
             } else {
                 kernel_sync_fault("BRK issued from kernel", esr, frame)
             }
@@ -99,7 +99,18 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
             let ctx = capture_trap_context();
             let message = format_sync_exception(&decoded, &ctx);
             if decoded.from_el0 {
-                // 用户态故障：审计行保留 info，然后杀进程回收槽位。
+                // 用户态故障：审计行保留 info，然后按默认动作投递信号终止。
+                // 信号归因对标 Linux force_sig_fault 的页故障分类：
+                // 数据访问对齐错误 → SIGBUS；其余页故障（翻译/权限/
+                // 取指 abort）→ SIGSEGV。
+                let sig = match &decoded.kind {
+                    SyncExceptionKind::DataAbort(info)
+                        if info.kind == FaultKind::Alignment =>
+                    {
+                        zero_abi::signals::SIGBUS
+                    }
+                    _ => zero_abi::signals::SIGSEGV,
+                };
                 crate::info!("{}", message);
                 crate::info!(
                     "[trap] DBG LR=0x{:016x} FP=0x{:016x} x11=0x{:016x} x0=0x{:016x} x1=0x{:016x}",
@@ -110,7 +121,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                     unsafe { (*frame).regs[1] },
                 );
                 dump_user_pte(ctx.far);
-                terminate_faulting_process(&ctx)
+                terminate_faulting_process(&ctx, sig)
             } else {
                 // 穷人版 exception table（对照 Linux __ex_table）：内核在
                 // 代用户拷贝（copy_slice_from/to_user）时踩到坏页 ⇒
@@ -118,7 +129,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 let elr = read_elr_el1();
                 if ctx.slot.is_some() && fault_in_user_copy_path(elr) {
                     crate::error!("[trap] user-copy path fault; killing caller (ELR=0x{:016x})", elr);
-                    terminate_faulting_process(&ctx)
+                    terminate_faulting_process(&ctx, zero_abi::signals::SIGSEGV)
                 }
                 crate::error!("{}", message);
                 kernel_sync_fault(&message, esr, frame)
@@ -568,24 +579,36 @@ fn capture_trap_context() -> TrapContext {
     }
 }
 
-/// 终止故障进程。锁纪律：两个 lock()（PROCESS_TABLE / CURRENT_SLOT）
-/// 都是语句级 Guard，进入 exit_current → reschedule 前已全部释放，
-/// 绝无跨 noreturn 调用持锁。
-fn terminate_faulting_process(ctx: &TrapContext) -> ! {
-    if let Some(slot) = ctx.slot {
-        process::set_state_slot(slot, ProcessState::Dying);
-    }
+/// 终止故障进程：先投递默认动作信号，再走 Exit 同款状态机（第九刀）。
+///
+/// 此前实现是“无声蒸发”：置 Dying 后 remove_slot 即时销毁——退出码不
+/// 可收集，父进程无从得知死因（无信号语义不可观测）。现对标 Linux
+/// `force_sig(SIGSEGV)` + do_group_exit 默认动作：把 `sig` 登记进当前
+/// 进程 pending_signals 位图（死因登记，见 process::deliver_fatal_signal），
+/// 并以 POSIX 信号退出码 code = -(sig) 走与 Exit 系统调用**完全相同**的
+/// Dying→Zombie→WaitPid 流程——父 waitpid 收到的 code 即区分死因
+/// （SIGSEGV → -11、SIGBUS → -7、SIGTRAP → -5）。
+///
+/// 锁纪律照旧：deliver_fatal_signal / exit_current_with_status 各自持表
+/// 锁且均为语句级 Guard，进入 noreturn 前已全部释放；无进程上下文
+/// （slot=None）时维持旧路 exit_current（行为不变）。
+fn terminate_faulting_process(ctx: &TrapContext, sig: u8) -> ! {
     match (ctx.pid, ctx.slot) {
         (Some(pid), Some(slot)) => {
             crate::info!(
-                "[trap] terminating pid={} slot={} due to user sync exception",
+                "[trap] terminating pid={} slot={} due to user sync exception (default action: sig={})",
                 pid.raw(),
-                slot
+                slot,
+                sig
             );
+            let code = process::deliver_fatal_signal(slot, sig);
+            process::exit_current_with_status(code)
         }
-        _ => crate::info!("[trap] terminating unknown process due to user sync exception"),
+        _ => {
+            crate::info!("[trap] terminating unknown process due to user sync exception");
+            crate::scheduler::exit_current()
+        }
     }
-    crate::scheduler::exit_current()
 }
 
 fn decode_esr(esr: u64) -> DecodedEsr {

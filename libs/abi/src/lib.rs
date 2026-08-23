@@ -24,6 +24,84 @@
 
 pub mod bootfs;
 
+/// POSIX 信号编号最小集 + 进程 pending 位图编码（第九刀「信号位图最小版」）。
+///
+/// 只取当前故障投递需要的常量，值严格对齐 POSIX `<signal.h>`；位图约定
+/// `bit(sig - 1)`。宿主单测把位值钉死——漂移即编译期外红。
+///
+/// 【宽度披露】批评报告草案写的是 u8 位图，但 SIGSEGV=11 ⇒ `bit(10)`
+/// 超出 u8 的 bit0..=7 —— 故位图宽度定为 **u16**（覆盖 sig 1..=16，
+/// 含本模块全部常量），`bit(sig - 1)` 编码语义不变。
+pub mod signals {
+    /// 非法指令。当前内核故障路径无对应信号源（AArch64 未分配编码走
+    /// Uncategorized EC，尚未接投递）；预留，值对齐 POSIX。
+    pub const SIGILL: u8 = 4;
+    /// 断点陷阱：EL0 BRK（Rust panic / 显式陷阱）。对标 Linux 把 brk
+    /// 异常 force_sig(SIGTRAP) 的默认动作。
+    pub const SIGTRAP: u8 = 5;
+    /// 总线错误：EL0 数据访问的地址对齐故障（DFSC=0b100001）。
+    pub const SIGBUS: u8 = 7;
+    /// 浮点异常。当前 CPACR_EL1.FPEN 全开、无 FP 陷阱源；预留。
+    pub const SIGFPE: u8 = 8;
+    /// 段违例：EL0 取指/数据 abort 的页故障（翻译/权限等）——解引用
+    /// 空指针即落到本信号，默认动作 = 终止进程。
+    pub const SIGSEGV: u8 = 11;
+
+    /// pending 位图的位：`bit(sig - 1)`。sig 必须落在 1..=16（u16 容量，
+    /// 见模块头宽度披露）；内核侧仅以本模块常量调用，越界属契约破坏，
+    /// 调试构建直接断言暴露。
+    pub const fn signal_bit(sig: u8) -> u16 {
+        debug_assert!(sig >= 1 && sig <= 16, "signal number out of bitmap range");
+        1u16 << (sig - 1)
+    }
+
+    /// 故障默认动作的退出码编码：POSIX waitpid 用“被信号杀死”表达死因；
+    /// 我们沿用最小可观测形式 `code = -(sig)`（如 SIGSEGV → -11）。负码
+    /// 经内核 pack_wait_result / 用户态 unpack_wait_result 的 32 位补码
+    /// 路径无损往返（见两侧单测）。
+    pub const fn fatal_exit_code(sig: u8) -> i32 {
+        -(sig as i32)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn values_match_posix() {
+            assert_eq!(SIGILL, 4);
+            assert_eq!(SIGTRAP, 5);
+            assert_eq!(SIGBUS, 7);
+            assert_eq!(SIGFPE, 8);
+            assert_eq!(SIGSEGV, 11);
+        }
+
+        #[test]
+        fn bitmap_bit_is_sig_minus_one() {
+            assert_eq!(signal_bit(SIGILL), 1 << 3);
+            assert_eq!(signal_bit(SIGTRAP), 1 << 4);
+            assert_eq!(signal_bit(SIGBUS), 1 << 6);
+            assert_eq!(signal_bit(SIGFPE), 1 << 7);
+            // u8 容不下 bit10：这正是位图取 u16 的原因（模块头披露）
+            assert_eq!(signal_bit(SIGSEGV), 1 << 10);
+            // 位互不重叠：多信号可共存于同一位图
+            let all =
+                signal_bit(SIGILL) | signal_bit(SIGTRAP) | signal_bit(SIGBUS)
+                    | signal_bit(SIGFPE) | signal_bit(SIGSEGV);
+            assert_eq!(all.count_ones(), 5);
+        }
+
+        #[test]
+        fn fatal_exit_code_is_negative_signal() {
+            assert_eq!(fatal_exit_code(SIGSEGV), -11);
+            assert_eq!(fatal_exit_code(SIGBUS), -7);
+            // 补码往返：按内核 (pid<<32)|code 打包再解包，父进程看到的仍是 -11
+            let packed = (7u64 << 32) | (fatal_exit_code(SIGSEGV) as u32 as u64);
+            assert_eq!((packed >> 32, packed as u32 as i32), (7, -11));
+        }
+    }
+}
+
 /// 内核在引导阶段传给用户进程的启动数据集合。
 ///
 /// 该结构由引导器经 `boot_info_struct` 强符号固定在内核镜像的
