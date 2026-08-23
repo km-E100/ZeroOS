@@ -227,17 +227,6 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
     }
 
     let imm = (esr & 0xffff) as u16;
-    // ==== TEMP FAULT DRILL（pstore 两连启验证专用，提交前回退）====
-    // 用户态第 8 次 ConsoleWrite（号位 9）时从内核态执行 BRK：
-    // 制造一次真实的 EL1 同步异常走 kernel_sync_fault 全链路。
-    if imm == 0 && unsafe { (*frame).regs[0] } == 9 {
-        static DRILL_CW: AtomicU64 = AtomicU64::new(0);
-        if DRILL_CW.fetch_add(1, Ordering::Relaxed) == 8 {
-            crate::error!("[drill] injecting EL1 BRK for pstore verification");
-            unsafe { asm!("brk #0", options(nostack)) };
-        }
-    }
-    // ==== TEMP FAULT DRILL END ====
     unsafe {
         match imm {
             0 => {

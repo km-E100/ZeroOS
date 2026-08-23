@@ -113,7 +113,6 @@ pub enum LeafShareClass {
 
 /// 判定一个有效叶描述符的克隆策略。
 pub fn classify_leaf(leaf: u64) -> LeafShareClass {
-    if true { return LeafShareClass::EagerCopy; } // BISECT-KILL-SWITCH (temporary)
     let ap = (leaf >> AP_SHIFT) & 0b11;
     if leaf & DESC_SW_COW != 0 {
         // 已是 COW 共享页（fork 链上二次 fork）：继续传播共享标记。
