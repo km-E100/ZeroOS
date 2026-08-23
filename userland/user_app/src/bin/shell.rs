@@ -85,7 +85,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"help" || cmd == b"?" {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
-            println("  process: forktest/waittest/nohangtest/orphantest/pid");
+            println("  process: forktest/waittest/nohangtest/orphantest/waitspec/pid");
             println("  storage: fstest/blktest");
             println("  system: launchd/pid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
@@ -335,6 +335,94 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                 }
                 Err(e) => {
                     print("[P] orphantest: fork failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"waitspec" {
+            // 精确目标 wait 端到端（第九刀）：fork 两个子进程**乱序**退出
+            //   A：长延时 → exit(33)；B：短延时 → exit(66)（B 必先死）。
+            // 父随后立刻 wait_pid(A)，阻塞在精确目标上——期间 B 先退出，
+            // 这正是“bool 单标记误投递”的历史缺口场景：旧内核会把 B 的
+            // (pid,66) 写进等 A 的父帧并误消费 B 尸体；新内核只认登记的
+            // 目标，父睡到 A 真正退出才收到 (A,33)。随后 wait_pid(B)
+            // 快路径收走留表的 B 尸体得 (B,66)。两行 collected 各归其主
+            // ⇒ 不误投。
+            match userlib::fork() {
+                Ok(0) => {
+                    // 子 A：长延时后 exit(33)
+                    println("[A] waitspec: child A alive, long delay then exit(33)");
+                    delay_cycles(20_000_000);
+                    userlib::exit(33);
+                }
+                Ok(a_pid) => match userlib::fork() {
+                    Ok(0) => {
+                        // 子 B：短延时后 exit(66)，必先于 A 死亡
+                        println("[B] waitspec: child B alive, short delay then exit(66)");
+                        delay_cycles(3_000_000);
+                        userlib::exit(66);
+                    }
+                    Ok(b_pid) => {
+                        print("[P] waitspec: A=");
+                        print_u64(a_pid);
+                        print(" B=");
+                        print_u64(b_pid);
+                        println("");
+                        let mut pass = true;
+                        // ① 先等 A（精确 pid）：阻塞期间 B 会先退出。
+                        match userlib::wait_pid(a_pid) {
+                            Ok((pid, code)) => {
+                                print("collected pid=");
+                                print_u64(pid);
+                                print(" code=");
+                                print_i32(code);
+                                println("");
+                                if pid != a_pid || code != 33 {
+                                    pass = false;
+                                }
+                            }
+                            Err(e) => {
+                                print("[P] waitspec: wait(A) failed (");
+                                print_hex(e.code());
+                                println(")");
+                                pass = false;
+                            }
+                        }
+                        // ② 再等 B：尸体应原样留在表里（未被①误消费），
+                        //    快路径收取。若①被误投，这里要么 NotFound
+                        //    （尸体已被错拿）要么拿到错的码。
+                        match userlib::wait_pid(b_pid) {
+                            Ok((pid, code)) => {
+                                print("collected pid=");
+                                print_u64(pid);
+                                print(" code=");
+                                print_i32(code);
+                                println("");
+                                if pid != b_pid || code != 66 {
+                                    pass = false;
+                                }
+                            }
+                            Err(e) => {
+                                print("[P] waitspec: wait(B) failed (");
+                                print_hex(e.code());
+                                println(")");
+                                pass = false;
+                            }
+                        }
+                        if pass {
+                            println("[P] waitspec: PASS (two precise collects, out-of-order exits)");
+                        } else {
+                            println("[P] waitspec: FAIL (misdelivered or wrong-code collect)");
+                        }
+                    }
+                    Err(e) => {
+                        print("[P] waitspec: fork B failed (");
+                        print_hex(e.code());
+                        println(")");
+                    }
+                },
+                Err(e) => {
+                    print("[P] waitspec: fork A failed (");
                     print_hex(e.code());
                     println(")");
                 }

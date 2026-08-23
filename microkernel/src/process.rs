@@ -188,13 +188,103 @@ struct ProcessRecord {
     adopted: bool,
     /// 退出码：Exit 系统调用记录；Zombie 态期间由父经 WaitPid 读走。
     exit_code: Option<i32>,
-    /// 挂起的 WaitPid：父在“无可收子但有活子”时置位并阻塞；子 Exit
-    /// 在同一表锁临界区内发现置位 ⇒ 取走标记并把编码好的返回值直接
-    /// 写进父 TrapFrame 的 x0（零侵入 continuation，见设计注释）。
-    pending_wait: bool,
+    /// 挂起的 WaitPid **等待目标**（第九刀：bool 单标记 → 目标集合化）。
+    /// None = 无挂起等待；Some(spec) = 父在“无可收子但有活子”时登记的
+    /// 精确目标并阻塞。单线程进程同一时刻至多一个未完结的阻塞 wait，
+    /// 单槽即完备集合。子 Exit 在同一表锁临界区内做 spec 匹配
+    /// （wait_wake_decision）：匹配才取走登记并把编码好的返回值直接写进
+    /// 父 TrapFrame 的 x0（零侵入 continuation，见设计注释）；不匹配则
+    /// 登记原样保留——堵住第七刀已知缺口“父 wait(A) 期间子 B 先退出被
+    /// 误投递”。
+    wait_target: Option<WaitSpec>,
 }
 
-static NEXT_PID: AtomicU64 = AtomicU64::new(2);
+/// 挂起 WaitPid 的等待目标（目标集合化的集合元素），对标 POSIX wait4
+/// 的 pid 参数二态：0=任意子、N=精确 pid。匹配永远比较**完整 64 位
+/// pid 原始值**（含 generation，见 alloc_pid）——回绕复用后的 stale
+/// pid（同 seq 不同代）天然不命中 wake/wait 匹配。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WaitSpec {
+    /// wait(0)：任何子退出都唤醒等待者（POSIX wait 语义）。
+    Any,
+    /// wait(N)：仅 pid==N 的子退出唤醒等待者。
+    Pid(ProcessId),
+}
+
+impl WaitSpec {
+    /// 唤醒判定（纯函数）：本等待目标是否覆盖 dying 子进程。
+    pub(crate) fn matches(self, dying: ProcessId) -> bool {
+        match self {
+            WaitSpec::Any => true,
+            WaitSpec::Pid(p) => p == dying,
+        }
+    }
+}
+
+/// 子 Exit 时对父登记目标的唤醒决策（纯函数，主机单测覆盖误投递回归；
+/// exit_current_with_status 的实际取走逻辑直接调用本函数，模型与实现
+/// 共用同一段代码杜绝漂移）。返回 false 时登记必须原样保留——这是
+/// bool 时代无法表达的语义。
+pub(crate) fn wait_wake_decision(
+    registration: Option<WaitSpec>,
+    dying: ProcessId,
+) -> bool {
+    matches!(registration, Some(spec) if spec.matches(dying))
+}
+
+// ── pid 分配：(generation << 16) | seq（第九刀防复用）─────────────────
+// seq 段 16 位在 [PID_SEQ_FIRST, 0xFFFF] 内步进（0 无效、1 保留；
+// INIT_PID=2 的引导约定要求首个分配值恰为 2）；seq 耗尽时代数 +1、
+// 从 FIRST 重新起步。同一 seq 值跨代复现时完整 pid 已不同 ⇒ wake/wait
+// 全值比较天然免疫 stale pid。
+//
+// 回绕周期估算：
+//   - 结构回绕（同 seq 复现）：每代 65534 个 pid，即每 65534 次分配
+//     一次；但完整 pid 不重复。
+//   - 完整 pid 不复用窗口：48 位代数 × 每代 65534 ≈ 1.8e19 次。
+//   - 实际承载上限受 pack_wait_result 的 32 位 pid 位宽约束（pid 放
+//     高 32 位、退出码放低 32 位）：gen < 2^16，约 4.29e9 次分配触及
+//     ——按每秒 1000 次 fork/spawn 连续压测也要 ~49.7 天，u64 空间
+//     充足，无需更复杂的回收位图方案。
+const PID_SEQ_BITS: u64 = 16;
+const PID_SEQ_MASK: u64 = (1 << PID_SEQ_BITS) - 1;
+const PID_SEQ_FIRST: u64 = 2;
+const PID_SEQ_LAST: u64 = PID_SEQ_MASK;
+
+static NEXT_PID: AtomicU64 = AtomicU64::new(PID_SEQ_FIRST);
+
+/// 由当前计数器值推演下一合法分配值（纯函数，主机单测钉死回绕行为）。
+pub(crate) fn next_pid_raw(cur: u64) -> u64 {
+    let mut seq = cur & PID_SEQ_MASK;
+    let mut gen = cur >> PID_SEQ_BITS;
+    seq += 1;
+    if seq > PID_SEQ_LAST {
+        gen = gen.wrapping_add(1);
+        seq = PID_SEQ_FIRST;
+    }
+    (gen << PID_SEQ_BITS) | seq
+}
+
+/// 分配全局唯一 pid（spawn / fork 共用入口）。单核 + SeqCst 即全局
+/// 串行；CAS 循环仅为形式完备（fetch_add 无法表达 seq 段的跳变）。
+pub(crate) fn alloc_pid() -> ProcessId {
+    loop {
+        let cur = NEXT_PID.load(Ordering::SeqCst);
+        // pack_wait_result 把 pid 放进高 32 位：越过 2^32 会静默污染
+        // 退出码位。debug 构建立即炸出；release 靠上方 4.29e9 次预算。
+        debug_assert!(
+            cur < (1 << 32),
+            "pid space exceeded 32-bit pack_wait_result capacity"
+        );
+        let next = next_pid_raw(cur);
+        if NEXT_PID
+            .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return ProcessId::new(cur);
+        }
+    }
+}
 static PROCESS_TABLE: Mutex<[Option<ProcessRecord>; MAX_PROCESSES]> =
     Mutex::new([const { None }; MAX_PROCESSES]);
 #[repr(C, align(16))]
@@ -249,12 +339,12 @@ pub fn init() {
     for slot in table.iter_mut() {
         *slot = None;
     }
-    NEXT_PID.store(2, Ordering::SeqCst);
+    NEXT_PID.store(PID_SEQ_FIRST, Ordering::SeqCst);
 }
 
 pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
     crate::debug!("process::spawn called for name={}", name);
-    let pid = ProcessId::new(NEXT_PID.fetch_add(1, Ordering::SeqCst));
+    let pid = alloc_pid();
 
     let mut table = PROCESS_TABLE.lock();
     let (slot_index, slot) = table
@@ -293,7 +383,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         parent: None, // 内核直生的根进程：无父，退出即完全回收
         adopted: false,
         exit_code: None,
-        pending_wait: false,
+        wait_target: None,
     });
 
     pid
@@ -553,14 +643,17 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
 //   届时被收养孤儿的尸体可被 launchd 正常 WaitPid 收集。
 //
 // 【挂起恢复 = 零侵入 continuation】（对照 pending_recv 模式，选最小
-//   侵入方案：平行的 pending_wait 单标记，不改 scheduler.rs/trap.rs）
-//   父 WaitPid 无可收子但有活子 ⇒ 同一表锁临界区内完成「扫描 + 置
-//   pending_wait」（登记→阻塞原子；单核 + EL1 关中断 ⇒ 无丢失唤醒
-//   窗口）⇒ block_current()。子 Exit 在锁内发现父 pending_wait 置位
-//   ⇒ 取走标记，把编码好的返回值**直接写进父 TrapFrame 的 x0**，再
-//   wake(父)。结果先于唤醒写入帧 ⇒ 父被 dispatch 恢复现场时 x0 已是
-//   最终返回值——dispatch 无需任何 pending_wait 分支（scheduler.rs 本
-//   轮只读的关键设计约束）。即使假想虚假唤醒，帧内也是正确结果。
+//   侵入方案：平行的 wait_target 登记字段，不改 scheduler.rs/trap.rs）
+//   父 WaitPid 无可收子但有活子 ⇒ 同一表锁临界区内完成「扫描 + 登记
+//   wait_target」（登记→阻塞原子；单核 + EL1 关中断 ⇒ 无丢失唤醒窗
+//   口）⇒ block_current()。子 Exit 在锁内对父登记做精确匹配
+//   （wait_wake_decision）：目标覆盖本退出子 ⇒ 取走登记，把编码好的
+//   返回值**直接写进父 TrapFrame 的 x0**，再 wake(父)；不覆盖（典型：
+//   父 wait(A) 期间子 B 先退）⇒ 登记原样保留、B 尸体留表待按需收取，
+//   绝不假父之名投递（第九刀：bool 单标记 → 目标集合化）。结果先于
+//   唤醒写入帧 ⇒ 父被 dispatch 恢复现场时 x0 已是最终返回值——
+//   dispatch 无需任何 wait_target 分支（scheduler.rs 本轮只读的关键
+//   设计约束）。即使假想虚假唤醒，帧内也是正确结果。
 //
 // 【锁纪律】（照 scheduler.rs 头部）：表锁只在“决策 + 摘除/改字段”的
 //   语句块内持有；AddressSpace::destroy 一律锁外执行（第 3 条）；
@@ -865,12 +958,18 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 me.exit_code = Some(status);
                 me.state = ProcessState::Zombie;
                 let space = me.addr_space.take(); // 用户页/页表此刻归还
+                // 第九刀目标集合化：仅当父的登记覆盖本退出子才取走标记。
+                // 判定与取走在同一表锁临界区内两段完成（单核无并发窗口；
+                // 决策函数 wait_wake_decision 与主机单测共用同一实现）。
                 let wake_parent = parent_view.and_then(|pv| {
-                    let marked = table[pv.slot]
+                    let hit = table[pv.slot]
                         .as_mut()
-                        .map(|r| core::mem::replace(&mut r.pending_wait, false))
+                        .map(|r| wait_wake_decision(r.wait_target, my_pid))
                         .unwrap_or(false);
-                    marked.then_some((pv.slot, pv.pid))
+                    if hit {
+                        table[pv.slot].as_mut().and_then(|r| r.wait_target.take());
+                    }
+                    hit.then_some((pv.slot, pv.pid))
                 });
                 Plan::Zombie(ZombiePlan {
                     wake_parent,
@@ -919,7 +1018,8 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 );
                 crate::scheduler::wake(parent_pid);
             } else {
-                // 无等待者：留尸待父将来 wait 补收（快路径 Collect 分支）。
+                // 无匹配等待者（父没在等 / 登记的是别的 pid）：留尸待父
+                // 将来 wait 补收（快路径 Collect 分支）。
                 crate::info!(
                     "process slot={} became zombie (status={})",
                     slot,
@@ -938,9 +1038,9 @@ pub fn exit_current_with_status(status: i32) -> ! {
 pub enum WaitStep {
     /// 已收尸并完全回收：携带编码好的返回值（见 pack_wait_result）。
     Completed(u64),
-    /// 有活子未退：调用方应立即 block_current()（pending_wait 已置位）。
+    /// 有活子未退：调用方应立即 block_current()（wait_target 目标已登记）。
     Blocked,
-    /// WNOHANG 置位且“有活子但无尸可收”：不挂起、不登记 pending_wait，
+    /// WNOHANG 置位且“有活子但无尸可收”：不挂起、不登记等待目标，
     /// 调用方立即返回 0（对照 Linux wait4 WNOHANG 约定，见 zero-abi）。
     WouldBlock,
 }
@@ -953,7 +1053,7 @@ pub enum WaitStep {
 pub(crate) enum WaitAction {
     /// 收尸：携带 (槽位, 编码返回值)。
     Collect { slot: usize, packed: u64 },
-    /// 挂起等待（登记 pending_wait 后阻塞）。
+    /// 挂起等待（登记 wait_target 精确目标后阻塞）。
     Sleep,
     /// WNOHANG 轮询落空：立即返回 0。
     PollMiss,
@@ -1013,11 +1113,17 @@ pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
             }
             WaitAction::Sleep => {
                 if let Some(me) = table[caller_slot].as_mut() {
-                    me.pending_wait = true;
+                    // 登记精确等待目标（第九刀目标集合化）：0=任意子、
+                    // N=只等 pid==N。此后仅匹配的退出才唤醒本父。
+                    me.wait_target = Some(if target_pid == 0 {
+                        WaitSpec::Any
+                    } else {
+                        WaitSpec::Pid(ProcessId::new(target_pid))
+                    });
                 }
                 Act::Block
             }
-            // 关键：WNOHANG 落空**绝不**置 pending_wait——否则本次轮询的
+            // 关键：WNOHANG 落空**绝不**登记 wait_target——否则本次轮询的
             // 登记会与后续真正的阻塞 wait 语义互相污染（父没睡却带着
             // “有人在等”的标记，子退出时会白写一次帧 + 白唤醒一次）。
             WaitAction::PollMiss => return Ok(WaitStep::WouldBlock),
@@ -1194,7 +1300,7 @@ pub fn fork(
     };
 
     let child_slot;
-    let child_pid = ProcessId::new(NEXT_PID.fetch_add(1, Ordering::SeqCst));
+    let child_pid = alloc_pid();
 
     // 地址空间克隆必须在持锁外进行（分配物理页/可能失败），
     // 且 clone_space 当前显式失败（见 address_space.rs 注释）。
@@ -1233,7 +1339,7 @@ pub fn fork(
             // 的孙进程”而非收养孤儿本身，其退出语义与普通子一致。
             adopted: false,
             exit_code: None,
-            pending_wait: false,
+            wait_target: None,
         });
     }
 
@@ -1520,7 +1626,7 @@ mod state_machine_tests {
             parent: parent.map(ProcessId::new),
             adopted: false,
             exit_code: None,
-            pending_wait: false,
+            wait_target: None,
         }
     }
 
@@ -1596,5 +1702,146 @@ mod state_machine_tests {
         assert_ne!(capabilities_from_flag(true) & CAP_BLOCK_DEV, 0);
         // launchd 拉起服务的依赖：全位必含 CAP_SPAWN_SVC。
         assert_ne!(capabilities_from_flag(true) & CAP_SPAWN_SVC, 0);
+    }
+
+    // ── 第九刀：WaitSpec 目标集合化（wait 精确匹配 / 误投递回归）────
+
+    #[test]
+    fn wait_spec_matches_only_its_target() {
+        let a = ProcessId::new(33);
+        let b = ProcessId::new(34);
+        // Any 覆盖一切子；Pid 只覆盖自身——完整 64 位原始值比较。
+        assert!(WaitSpec::Any.matches(a));
+        assert!(WaitSpec::Any.matches(b));
+        assert!(WaitSpec::Pid(a).matches(a));
+        assert!(!WaitSpec::Pid(a).matches(b));
+        assert!(!WaitSpec::Pid(b).matches(a));
+    }
+
+    #[test]
+    fn misdelivery_regression_parent_waiting_a_not_woken_by_b() {
+        // 第七刀缺口回归（任务三指定场景）：父 wait_pid(A) 挂起（登记
+        // Pid(A)），子 B 先退出。bool 单标记时代：标记被 B 的 Exit 取走
+        // ⇒ B 的结果被写进父帧（张冠李戴）+ B 尸体被误消费 + 父带着
+        // 已消费的登记假醒、A 死时再无人唤醒。目标集合化后：
+        let a = ProcessId::new(40);
+        let b = ProcessId::new(41);
+        let mut registration = Some(WaitSpec::Pid(a));
+        // ① B 先退：决策 false —— 登记原样保留，B 尸体留表待按需收取。
+        assert!(!wait_wake_decision(registration, b));
+        assert_eq!(
+            registration,
+            Some(WaitSpec::Pid(a)),
+            "mismatched exit must not consume the registration"
+        );
+        // ② A 后退：命中 ⇒ 唤醒；实现侧 take 后登记清空。
+        assert!(wait_wake_decision(registration, a));
+        registration = None; // 模拟 exit_current_with_status 取走登记
+        // ③ 二次事件（假想虚假唤醒/stale 投递）：登记已空，绝不再醒。
+        assert!(!wait_wake_decision(registration, a));
+        assert!(!wait_wake_decision(registration, b));
+    }
+
+    #[test]
+    fn any_target_wakes_on_first_exiting_child_then_consumed() {
+        // wait(0) 语义不变：任一子先退即唤醒（僵尸优先于活子的 POSIX
+        // 行为由扫描面保证，见 targeted_scan_* 测试）。
+        let a = ProcessId::new(50);
+        let b = ProcessId::new(51);
+        let mut registration = Some(WaitSpec::Any);
+        assert!(wait_wake_decision(registration, b), "wait(0) wakes on any child");
+        assert!(wait_wake_decision(registration, a));
+        registration = None;
+        assert!(!wait_wake_decision(registration, a));
+    }
+
+    #[test]
+    fn targeted_scan_ignores_sibling_zombie_in_a_b_scenario() {
+        // 扫描面配合：父只 wait(A)。B 已先退成尸（exit 路径正确地没
+        // 唤醒、没误收）⇒ 此刻 wait(A) 必须 Block（A 还活着），且绝不
+        // 能把 B 当成可收对象；wait(B) 则可直接快路径收 B。
+        let t = table_of(&[
+            pv(0, P, None, ProcessState::Running, None),
+            pv(1, 60, Some(P), ProcessState::Zombie, Some(66)), // B 先退
+            pv(2, 61, Some(P), ProcessState::Running, None),    // A 活着
+        ]);
+        assert_eq!(wait_scan(caller(), 61, &t), WaitDecision::Block);
+        assert_eq!(
+            wait_scan(caller(), 60, &t),
+            WaitDecision::Collect { slot: 1, pid: ProcessId::new(60), code: 66 }
+        );
+        // A 也退出后：wait(A) 收 A 自身的码；两具尸体互不串线。
+        let t2 = table_of(&[
+            pv(0, P, None, ProcessState::Running, None),
+            pv(1, 60, Some(P), ProcessState::Zombie, Some(66)),
+            pv(2, 61, Some(P), ProcessState::Zombie, Some(33)),
+        ]);
+        assert_eq!(
+            wait_scan(caller(), 61, &t2),
+            WaitDecision::Collect { slot: 2, pid: ProcessId::new(61), code: 33 }
+        );
+        assert_eq!(
+            wait_scan(caller(), 60, &t2),
+            WaitDecision::Collect { slot: 1, pid: ProcessId::new(60), code: 66 }
+        );
+    }
+
+    // ── 第九刀：pid generation 防复用 ──────────────────────────────────
+
+    #[test]
+    fn pid_seq_walks_monotonically_inside_generation() {
+        // 引导初值 2 起，代内步进严格 +1 直到 seq 上界；首个分配值恰为
+        // INIT_PID=2 的约定由此钉死（NEXT_PID 初值 = PID_SEQ_FIRST）。
+        assert_eq!(PID_SEQ_FIRST, 2);
+        let mut cur = PID_SEQ_FIRST;
+        for expected in (PID_SEQ_FIRST + 1)..=PID_SEQ_LAST {
+            let nxt = next_pid_raw(cur);
+            assert_eq!(nxt, expected);
+            cur = nxt;
+        }
+        // seq 耗尽：代数 +1，seq 回到 FIRST——reserved seq 0/1 永不复用。
+        assert_eq!(next_pid_raw(cur), 0x1_0002);
+    }
+
+    #[test]
+    fn pid_generation_wrap_skips_reserved_seqs_every_generation() {
+        // 新代起点与代间衔接：任意代边界处都跳过 0/1。
+        assert_eq!(next_pid_raw(0x0000_FFFF), 0x0001_0002);
+        assert_eq!(next_pid_raw(0x0001_FFFF), 0x0002_0002);
+        assert_eq!(next_pid_raw(0x7FFF_FFFF), 0x8000_0002);
+        assert_eq!(next_pid_raw(0x0001_0002), 0x0001_0003);
+    }
+
+    #[test]
+    fn pid_allocation_never_reuses_across_two_generations() {
+        // 连续分配 > 2 个代（140_000 > 2×65534）：全值唯一，且观测窗口
+        // 内始终低于 pack_wait_result 的 32 位 pid 承载上限。
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = PID_SEQ_FIRST;
+        for _ in 0..140_000usize {
+            assert!(seen.insert(cur), "pid {} allocated twice", cur);
+            cur = next_pid_raw(cur);
+        }
+        assert!(cur < (1u64 << 32), "pid budget must stay within packing capacity");
+    }
+
+    #[test]
+    fn stale_pid_from_previous_generation_does_not_match() {
+        // stale 免疫端到端：第 0 代用掉的 seq=42 与回绕后新代的 seq=42
+        // 是不同完整 pid —— wake/wait 全值比较不会把旧引用错认新进程
+        // （wake(ProcessId(stale)) 打不中新 pid；wait(stale) 也收不到它）。
+        let stale = 42u64; // gen 0
+        let mut cur = PID_SEQ_FIRST;
+        while cur != PID_SEQ_LAST {
+            cur = next_pid_raw(cur);
+        }
+        cur = next_pid_raw(cur); // 跨入 gen 1（0x1_0002）
+        assert_eq!(cur >> PID_SEQ_BITS, 1);
+        let fresh_same_seq = (cur & !PID_SEQ_MASK) | 42;
+        assert_eq!(fresh_same_seq, 0x1_002a);
+        assert_ne!(ProcessId::new(stale), ProcessId::new(fresh_same_seq));
+        // 匹配层面：等 stale 的人不会被新代同 seq 进程惊醒，反之亦然。
+        assert!(!WaitSpec::Pid(ProcessId::new(stale)).matches(ProcessId::new(fresh_same_seq)));
+        assert!(!WaitSpec::Pid(ProcessId::new(fresh_same_seq)).matches(ProcessId::new(stale)));
     }
 }
