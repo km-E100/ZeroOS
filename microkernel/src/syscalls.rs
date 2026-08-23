@@ -316,13 +316,49 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             crate::scheduler::enqueue(child_pid);
             Ok(child_pid.raw())
         }
+        // ═══ 号位 3：execve 最小完备版（第九刀，破坏性升级）═══
+        // ABI 冻结（zero-abi Syscall::Exec 同步注释）：x1=name_ptr（rootfs
+        // 内路径，如 /System/Core/zero-launchd）、x2=name_len、x3=透传参数
+        // （新映像以 x2 收到；对照号位 22 flags 的帧直读先例，不经
+        // decode_syscall 解包——trap.rs 对本号位的冻结映射恰好兼容）。
+        //
+        // 【为何放弃 x2==0 旧函数指针兼容门——三理由】
+        // 1) 全仓库零调用方：grep 证实 userland/kernel 无任何 legacy exec
+        //    调用点（仅 decode_syscall 单测构造过假值），破坏性升级的实际
+        //    破坏面为零；
+        // 2) 双语义同号位存在永久编码歧义：legacy 调用方传非零 arg 时，其
+        //    x1（内核文本指针）会被误读为路径指针，只能靠 validate 兜底拒
+        //    绝——ABI 从此说不清 x2 到底是 arg 还是 name_len；
+        // 3) 旧语义正是本轮替换对象：伪 exec 不换地址空间、不加载 ELF，
+        //    进程身份与映像脱节；保留它等于永久维护两套互斥的进程模型。
+        // 附带收益：decode_syscall 对号位 3 冻结的 x1!=0 强制恰好等价于
+        // "路径指针非 NULL"——trap.rs 零改动即获得 NULL 拒绝。
         Syscall::Exec { entry, arg } => {
             let caller_slot = crate::scheduler::current_slot();
-            unsafe {
-                crate::process::exec(caller_slot, entry, arg, &mut *frame)
-                    .map_err(map_process_error)?;
-                Ok((*frame).regs[0])
+            let name_len = arg as usize;
+            if name_len == 0 {
+                // x2=0 不再是"函数指针模式"开关：空长度即非法路径长度。
+                return Err(SysError::InvalidArgument);
             }
+            // 路径两道门校验 + 代拷贝（validate_user_ptr 页级走表针对当前
+            // 地址空间——此刻仍是旧映像，正确；换空间发生在 exec_load 的
+            // Commit 之后）。len≤256 / UTF-8 / NUL 截断语义同 SpawnService。
+            let path = copy_string_from_user(entry as usize, name_len)?;
+            // 仅允许 rootfs 已登记文件：未登记路径返回 NotFound（区别于
+            // 已登记但 ELF 解析失败的 InvalidArgument）。loader 内部会再次
+            // 读取文件内容，此处预检只为错误码精度。
+            if crate::rootfs::read_file(path.as_str()).is_none() {
+                return Err(SysError::NotFound);
+            }
+            let passthrough = unsafe { (*frame).regs[3] };
+            let entries_ptr = unsafe {
+                crate::process::exec_load(caller_slot, &path, passthrough, &mut *frame)
+                    .map_err(map_process_error)?
+            };
+            // encode_result(Ok(v))==v（恒等编码）：eret 后 x0=entries_ptr，
+            // 与帧内预设的 bootfs ABI 一致。成功路径控制流已转向新映像入口，
+            // 本 Ok 值仅作为新程序的第一份 x0 生效，不会回到原调用点。
+            Ok(entries_ptr)
         }
         Syscall::SpawnService { name_ptr, name_len } => {
             let caller_slot = crate::scheduler::current_slot();

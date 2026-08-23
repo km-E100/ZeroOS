@@ -1260,32 +1260,290 @@ pub fn fork(
     Ok((child_pid, child_slot))
 }
 
-pub unsafe fn exec(
-    slot: usize,
-    entry: ThreadEntry,
-    arg: u64,
-    frame: &mut TrapFrame,
-) -> Result<(), ProcessError> {
-    if entry as usize == 0 {
-        return Err(ProcessError::InvalidArgument);
+// ═══════════════════════════════════════════════════════════════════════
+// execve 最小完备版（第九刀）：真换地址空间的 Exec
+//
+// 语义（ABI 冻结说明见 zero-abi `Syscall::Exec` 与 syscalls.rs 号位 3 臂）：
+//   销毁当前地址空间 → 按 rootfs 路径装载新 ELF → 切 TTBR0 → 重置帧跳新
+//   入口。进程身份（pid / parent / capabilities / 族谱）原样保留——exec
+//   换的是映像，不是进程。
+//
+// 【失败原子性】新地址空间在旧空间仍然完整时构建（BuildNewImage 是唯一
+//   可失败阶段），任何一步失败都只销毁半成品新空间并返回 Err——旧映像
+//   无损，调用进程原地继续（POSIX：exec 失败返回 -1）。Commit 之后不再
+//   存在可失败步骤。
+//
+// 【提交次序不变量】BuildNewImage → CommitRebind → ActivateNew →
+//   DestroyOld → ResetFrame。Activate 必须先于 DestroyOld：svc 返回走
+//   trap.rs 的 restore_frame **直接 eret**，不经过 dispatch 的
+//   address_space 激活路径；若先销毁后激活，TTBR0 会指向已释放页表。
+//   次序由 exec_tests::exec_stage_plan_* 主机单测钉死。
+//
+// 【dispatch 无需额外处理】scheduler::dispatch 每次都从
+//   process::address_space(next_slot) **现读**根表并 space.activate()
+//   （见 scheduler.rs dispatch）——rebind 之后所有后续调度自然激活新根，
+//   调度器侧零改动、零感知。exec 当次返回的 TTBR0 由 ActivateNew 显式
+//   切换（理由见上）。
+//
+// 【TPIDR_EL1 时序】TPIDR_EL1 恒指向本槽 TRAP_FRAMES[slot]（静态存储，
+//   生命周期与地址空间无关）；exec 全程处于本进程 EL1 syscall 上下文
+//   （IRQ 屏蔽 + 单核），入口存根不可能在改写中途触发；restore_frame /
+//   restore_context 在 eret 前把 TPIDR_EL1 重新指回同一槽帧——无需任何
+//   特殊时序处理。锁纪律与 spawn_user_from_bootfs 的 configure 流程同源：
+//   表锁只覆盖字段改写语句块，页表操作一律锁外。
+//
+// 【锁纪律】PROCESS_TABLE 仅在 rebind_address_space 的字段改写语句块内
+//   持有；AddressSpace::destroy 一律锁外执行（scheduler.rs 锁纪律第 3
+//   条：表锁→物理分配器锁的反转风险）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// exec 提交阶段模型（纯数据，主机单测钉死两条不变量：① 成功路径
+/// ActivateNew 先于 DestroyOld；② 构建失败在触碰旧映像前短路）。
+/// [`exec_load`] 按此计划执行，注释引用同名概念防实现与模型漂移。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExecStage {
+    /// 阶段 1：旧映像完整时构建全新地址空间（唯一可失败阶段）。
+    BuildNewImage,
+    /// 提交点：表锁内换入新空间、带出旧空间（此后不可失败）。
+    CommitRebind,
+    /// 新 TTBR0 生效 + TLB 全量刷新（必须在 DestroyOld 之前，理由见头部）。
+    ActivateNew,
+    /// 锁外递归释放旧空间的页表页与用户物理页。
+    DestroyOld,
+    /// TrapFrame 重置为"新映像首启"现场（bootfs ABI + 干净执行域）。
+    ResetFrame,
+}
+
+/// 阶段计划：成功为完整五步；构建失败止步于第一步——Commit 及其后全部
+/// 不发生，旧地址空间自始至终不被触碰（失败原子性的模型化表述）。
+pub(crate) fn exec_stage_plan(build_ok: bool) -> &'static [ExecStage] {
+    if build_ok {
+        &[
+            ExecStage::BuildNewImage,
+            ExecStage::CommitRebind,
+            ExecStage::ActivateNew,
+            ExecStage::DestroyOld,
+            ExecStage::ResetFrame,
+        ]
+    } else {
+        &[ExecStage::BuildNewImage]
     }
-    {
-        let mut table = PROCESS_TABLE.lock();
-        let record = table
-            .get_mut(slot)
-            .and_then(|slot| slot.as_mut())
-            .ok_or(ProcessError::NoSuchProcess)?;
-        record.entry = entry;
+}
+
+/// TrapFrame 重置为"新映像首启"现场（exec 专用辅助；纯函数，主机单测
+/// 覆盖——TLS/FPU 归零是易漏点，漏了即跨 exec 泄漏上一映像的执行域状态）。
+///
+/// 参数布局（与 set_initial_user_args / bootfs ABI 对齐）：
+/// - x0/x1 = bootfs 文件表首址 / 条目数（任何用户程序起步都能找到自己的文件）
+/// - x2    = 调用方透传值（userlib::exec 的 arg；0 表示未使用）
+/// - x3    = 0（预留）
+fn apply_exec_frame(
+    frame: &mut TrapFrame,
+    entry: usize,
+    user_sp: usize,
+    kernel_sp: usize,
+    args: [u64; 4],
+) {
+    frame.regs = [0; 31];
+    frame.regs[0] = args[0];
+    frame.regs[1] = args[1];
+    frame.regs[2] = args[2];
+    frame.regs[3] = args[3];
+    // main 正常返回 = exit(0)：沿用 spawn 的 trampoline 约定，
+    // 新映像的退出码同样可被父进程 WaitPid 收集（forktest/execdemo 依赖）。
+    frame.regs[30] = thread_exit as usize as u64;
+    frame.sp_el0 = user_sp as u64;
+    frame.elr_el1 = entry as u64;
+    frame.spsr_el1 = 0; // EL0t，中断随 SPSR 对 EL0 开启
+    frame.sp_el1 = kernel_sp as u64;
+    // 新映像从零 TLS 与干净 FP 状态起步（对照 init_user）：上一映像的
+    // TPIDR_EL0 / FPCR / FPSR / v 寄存器一律不得泄漏进新执行域。
+    frame.tpidr_el0 = 0;
+    frame.fpu = FpuState::new();
+}
+
+/// 提交点（configure_user_process 的 exec 变体）：表锁内原子换入新地址
+/// 空间并把旧空间带出，同步刷新 entry_point / user_stack_top / started。
+/// 返回 (旧空间, 是否提交成功)；记录消失（理论不可达）时 committed=false，
+/// 新空间由调用方销毁防泄漏。旧空间交调用方**锁外**销毁（锁纪律第 3 条）。
+fn rebind_address_space(
+    slot: usize,
+    space: AddressSpace,
+    entry: usize,
+    user_sp: usize,
+) -> (Option<AddressSpace>, bool) {
+    let mut table = PROCESS_TABLE.lock();
+    match table.get_mut(slot) {
+        Some(Some(record)) => {
+            let old = record.addr_space.take();
+            record.addr_space = Some(space);
+            record.entry_point = Some(entry);
+            record.user_stack_top = Some(user_sp);
+            // 新映像 = 首启语义：后续 dispatch 经 first_run_context 以
+            // enter_user_mode 进入（与 spawn_user_from_bootfs 同一条路；
+            // enter_user_mode 与 switch_to 最终都从同一 TrapFrame 恢复，
+            // TTBR0 已由 dispatch 的 activate 分支现读现切）。
+            record.started = false;
+            (old, true)
+        }
+        _ => (None, false),
+    }
+}
+
+/// Exec 系统调用核心：按 rootfs 路径重载当前进程映像（真 execve）。
+///
+/// 成功返回新映像的 bootfs 表首址（即新程序起步时的 x0 值；trap.rs 的
+/// encode_result(Ok(v))==v 恒等写回 regs[0]，两处一致）。控制流随后转向
+/// 新 ELF 入口，原调用点不再可见地"返回"。失败返回 Err 且旧映像完好。
+///
+/// # Safety
+/// `frame` 必须是当前运行进程的 TrapFrame（syscall 入口传入的保存帧）；
+/// 必须在该进程的 EL1 syscall 上下文中调用（IRQ 屏蔽、单核）。
+pub unsafe fn exec_load(
+    slot: usize,
+    path: &str,
+    passthrough: u64,
+    frame: *mut TrapFrame,
+) -> Result<u64, ProcessError> {
+    let pid = pid_at_slot(slot);
+    crate::debug!(
+        "exec_load: slot={} pid={} path={}",
+        slot,
+        pid.map(|p| p.raw()).unwrap_or(0),
+        path
+    );
+
+    // —— BuildNewImage：旧空间完整期间构建全新空间（唯一可失败阶段）。
+    //    半成品当场销毁，绝不留泄漏；错误逐级映射保持 spawn 路径同款语义。
+    let elf = user_elf::build_user_elf(path).map_err(ProcessError::ElfError)?;
+    let mut space = AddressSpace::new();
+    if let Err(err) = map_user_elf_segments(&mut space, &elf, path) {
+        space.destroy();
+        return Err(ProcessError::MapError(err));
+    }
+    if let Err(err) = space.map_stack(USER_STACK_TOP, USER_STACK_LEN) {
+        space.destroy();
+        return Err(ProcessError::MapError(err));
+    }
+    let bootfs_info =
+        match rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE) {
+            Ok(info) => info,
+            Err(err) => {
+                space.destroy();
+                return Err(ProcessError::MapError(err));
+            }
+        };
+
+    // —— CommitRebind：表锁内原子换入（此后不再有可失败步骤）。
+    let (old_space, committed) =
+        rebind_address_space(slot, space, elf.entry as usize, USER_STACK_TOP);
+    if !committed {
+        // AddressSpace 是 Copy，这里仍可触达新空间：防御性销毁防泄漏。
+        space.destroy();
+        return Err(ProcessError::NoSuchProcess);
     }
 
-    frame.regs = [0; 31];
-    frame.regs[0] = arg;
-    frame.regs[30] = thread_exit as usize as u64;
-    frame.sp_el0 = user_stack_top_raw(slot) as u64;
-    frame.sp_el1 = kernel_stack_top_raw(slot) as u64;
-    frame.elr_el1 = entry as usize as u64;
-    frame.spsr_el1 = 0;
-    Ok(())
+    // —— ActivateNew：本次 svc 返回不经 dispatch（restore_frame 直接
+    //    eret），必须在此显式切换 TTBR0；set_user_ttbr 含全量 TLB 刷新。
+    //    此刻起旧空间的页表再无硬件引用者，销毁窗口闭合。——
+    space.activate();
+
+    // —— DestroyOld：锁外递归回收（此刻 EL1 取指/栈都走内核共享 L1[1]，
+    //    与被回收的私有表无关；TLB 已随 Activate 刷新，无陈旧翻译残留）。
+    if let Some(old) = old_space {
+        old.destroy();
+    }
+
+    // —— ResetFrame：新映像首启现场。x30=thread_exit 保证新程序的 main
+    //    返回后走 exit(0) 状态机（可收集），而不是跌进未知地址。——
+    apply_exec_frame(
+        &mut *frame,
+        elf.entry as usize,
+        USER_STACK_TOP,
+        kernel_stack_top_raw(slot),
+        [
+            bootfs_info.entries_ptr,
+            bootfs_info.entries_len,
+            passthrough,
+            0,
+        ],
+    );
+    crate::info!(
+        "exec_load: pid={} image replaced with {} (entry={:#x} root_phys={:#x} old_as_destroyed=true)",
+        pid.map(|p| p.raw()).unwrap_or(0),
+        path,
+        elf.entry as usize,
+        space.ttbr0_phys()
+    );
+    Ok(bootfs_info.entries_ptr)
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    /// 帧重置 = 全新执行域：寄存器清零、LR=thread_exit、ELR=新入口、
+    /// TLS/FP 归零、参数精确落位 x0-x3。任何一项漂移都是跨 exec 的
+    /// 执行域泄漏或启动现场污染（历史事故模式：伪 exec 只重置了半张帧）。
+    #[test]
+    fn exec_frame_reset_is_fresh_domain() {
+        let mut frame = TrapFrame {
+            regs: [0xDEAD_BEEF; 31],
+            sp_el0: 0x1111,
+            elr_el1: 0x2222,
+            spsr_el1: 0xF,
+            sp_el1: 0x3333,
+            tpidr_el0: 0x5555,
+            fpu: FpuState {
+                v: [0xA5A5; 32],
+                fpsr: 0x7F,
+                fpcr: 0x3,
+            },
+        };
+        apply_exec_frame(
+            &mut frame,
+            0x20_0000,
+            0xFFFF_F000,
+            0x8888_0000,
+            [0x1000, 8, 77, 0],
+        );
+        assert_eq!(frame.elr_el1, 0x20_0000);
+        assert_eq!(frame.spsr_el1, 0); // EL0t
+        assert_eq!(frame.sp_el0, 0xFFFF_F000);
+        assert_eq!(frame.sp_el1, 0x8888_0000);
+        assert_eq!(frame.regs[0], 0x1000); // bootfs 表首址
+        assert_eq!(frame.regs[1], 8); // bootfs 条目数
+        assert_eq!(frame.regs[2], 77); // 调用方透传值
+        assert_eq!(frame.regs[3], 0);
+        for i in 4..31 {
+            if i == 30 {
+                assert_eq!(frame.regs[30], thread_exit as usize as u64);
+            } else {
+                assert_eq!(frame.regs[i], 0, "x{i} 必须清零");
+            }
+        }
+        // 执行域归零：TLS 与 FP 状态不得残留上一映像的值。
+        assert_eq!(frame.tpidr_el0, 0);
+        assert!(frame.fpu.v.iter().all(|&v| v == 0));
+        assert_eq!(frame.fpu.fpsr, 0);
+        assert_eq!(frame.fpu.fpcr, 0);
+    }
+
+    /// 提交次序不变量（exec_load 头部注释的可执行化）：成功路径必须是
+    /// Commit → Activate → Destroy → Reset 的严格次序（Activate 先于
+    /// Destroy——svc 直接 eret 不经 dispatch，TTBR0 绝不能指向已释放
+    /// 页表）；失败路径止步于 BuildNewImage，旧地址空间完整保留。
+    #[test]
+    fn exec_stage_plan_orders_activate_before_destroy_and_fails_atomically() {
+        let ok = exec_stage_plan(true);
+        let cmt = ok.iter().position(|s| *s == ExecStage::CommitRebind).unwrap();
+        let act = ok.iter().position(|s| *s == ExecStage::ActivateNew).unwrap();
+        let dst = ok.iter().position(|s| *s == ExecStage::DestroyOld).unwrap();
+        assert!(cmt < act && act < dst, "Commit→Activate→Destroy 次序被破坏");
+        assert_eq!(ok.last(), Some(&ExecStage::ResetFrame));
+        // 失败原子性：构建失败 ⇒ Commit 及以后全部不发生。
+        assert_eq!(exec_stage_plan(false), &[ExecStage::BuildNewImage]);
+    }
 }
 
 #[cfg(test)]
