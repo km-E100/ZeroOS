@@ -84,7 +84,13 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
         SyncExceptionKind::Svc => handle_svc(frame, esr),
         SyncExceptionKind::Brk => {
             let ctx = capture_trap_context();
-            if decoded.from_el0 || ctx.slot.is_some() {
+            // 来源判定（第十刀集成修复）：EC=0x3C 与 SVC/FPU 同理不区分
+            // 来源 EL，SPSR.M 才是权威字段。旧判据 `ctx.slot.is_some()`
+            // 会把「内核在用户进程 syscall 路径中执行的 BRK」误判为
+            // 用户 panic——无辜进程被 SIGTRAP 杀死，kernel_sync_fault
+            // （pstore 持久化 + 复位）永不触达。实机 drill 抓获。
+            let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
+            if from_el0 {
                 crate::info!(
                     "[trap] EL0 breakpoint (panic/udf): elr=0x{:016x} pid={:?}",
                     ctx.elr,
@@ -539,7 +545,11 @@ fn reset_or_halt() -> ! {
     crate::error!("SYSTEM HALT: 内核故障，尝试复位后停机");
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let fid: u64 = 0x8400_0008; // PSCI SYSTEM_RESET
+        // PSCI 0.2 功能 ID（ARM DEN 0022D 表 11）：SYSTEM_RESET =
+        // 0x8400_0009。旧值 0x8400_0008 是 SYSTEM_OFF——"复位"实为
+        // 关机，pstore 双启动链路因此从未真正走通过（第十刀 drill
+        // 实测抓获：QEMU 进程整体退出而非热复位）。
+        let fid: u64 = 0x8400_0009; // PSCI SYSTEM_RESET
         // QEMU virt (TCG) 的 PSCI conduit 是 HVC；SMC 会作为未定义异常
         // 弹回 EL1 自家向量表（实测），故必须用 hvc。
         asm!("hvc #0", in("x0") fid, options(nostack));
