@@ -43,6 +43,10 @@ enum SyncExceptionKind {
     /// BRK 指令（EC=0x3C）：用户态即 Rust panic / 显式陷阱，
     /// 语义对标 Linux SIGTRAP —— 终止进程，绝不 HALT 整机。
     Brk,
+    /// SIMD/FP 访问陷阱（EC=0x07，第十一刀 FPU 惰性保存）：FPEN=00 时
+    /// EL0 首次触碰 FP/SIMD 触发，内核断链装载后重放；EL1 触发即内核
+    /// 违反「内核不使用浮点」约定，按致命错误处置。
+    FpuAccess,
     Other,
 }
 
@@ -69,7 +73,6 @@ struct TrapContext {
 /// 不存在跨函数调用的 Guard（见 scheduler.rs 头部锁纪律注释）。
 #[no_mangle]
 pub extern "C" fn __zero_trap_handler(frame: *mut TrapFrame, kind: u64) -> ! {
-    crate::debug!("trap: kind={} frame={:p}", kind, frame);
     match TrapKind::from(kind) {
         TrapKind::Sync => handle_sync(frame),
         TrapKind::Irq => handle_irq(frame),
@@ -82,6 +85,19 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
     let decoded = decode_esr(esr);
     match decoded.kind {
         SyncExceptionKind::Svc => handle_svc(frame, esr),
+        SyncExceptionKind::FpuAccess => {
+            // 第十一刀 FPU 惰性保存断链入口。EC=0x07 不区分来源 EL，
+            // SPSR.M[3:0]==0b0000（EL0t）才是合法用户态首用陷阱。
+            let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
+            if !from_el0 {
+                kernel_sync_fault(
+                    "FP/SIMD access under FPEN=00 from kernel (kernel-fp ban violated)",
+                    esr,
+                    frame,
+                )
+            }
+            unsafe { crate::arch::fpu_trap_replay(frame) }
+        }
         SyncExceptionKind::Brk => {
             let ctx = capture_trap_context();
             if decoded.from_el0 || ctx.slot.is_some() {
@@ -350,6 +366,11 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         // x1=新 break（0=查询）。ABI 冻结于 zero-abi（Syscall::Brk）。
         24 => Some(Syscall::Brk {
             new_break: regs[1] as usize,
+        }),
+        // 号位 25（Sleepticks，第十一刀）：x1=tick 数。ABI 冻结于
+        // zero-abi（Syscall::Sleepticks）；唤醒侧经陷阱帧回写 elapsed。
+        25 => Some(Syscall::Sleepticks {
+            ticks: regs[1],
         }),
         _ => None,
     }
@@ -630,6 +651,9 @@ fn decode_esr(esr: u64) -> DecodedEsr {
         0x24 | 0x25 => SyncExceptionKind::DataAbort(decode_fault_info(iss)),
         0x20 | 0x21 => SyncExceptionKind::InstructionAbort(decode_fault_info(iss)),
         0x3c => SyncExceptionKind::Brk,
+        // SIMD/FP 访问陷阱（第十一刀）：EC 不区分来源 EL，SPSR.M 才权威
+        // （与 SVC 同一判据哲学），在 handle_sync 臂内校验。
+        0x07 => SyncExceptionKind::FpuAccess,
         _ => SyncExceptionKind::Other,
     };
     DecodedEsr {
@@ -690,6 +714,13 @@ fn format_sync_exception(decoded: &DecodedEsr, ctx: &TrapContext) -> String {
             let _ = write!(
                 msg,
                 "[trap] BRK (panic/udf) from {}: elr=0x{:016x}",
+                origin, ctx.elr
+            );
+        }
+        SyncExceptionKind::FpuAccess => {
+            let _ = write!(
+                msg,
+                "[trap] FP/SIMD access trap (lazy FPU) from {}: elr=0x{:016x}",
                 origin, ctx.elr
             );
         }

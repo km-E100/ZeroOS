@@ -114,6 +114,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
             println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/segvdemo/pid/ppid");
+            println("  sched/sleep: sleepdemo (号位 25 Sleep(ticks))");
             println("  memory:  brktest");
             println("  storage: fstest/blktest");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
@@ -557,6 +558,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"execdemo" {
             // execve 端到端验证（第九刀）：真换地址空间。见 execdemo_command。
             execdemo_command();
+        } else if cmd == b"sleepdemo" {
+            // Sleep(ticks) 实机验证（号位 25，第十一刀）。见 sleepdemo_command。
+            sleepdemo_command();
         } else if cmd == b"fstest" {
             // 端到端文件语义验证（第七刀）：经 launchd list 预检 fsd/
             // blkdrv 在线后，向 FS_REQ 发 open/create → write("ZERO-FSD")
@@ -587,6 +591,86 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         }
     }
     0
+}
+
+/// sleepdemo —— Sleep(ticks) 端到端验证（号位 25，第十一刀）。
+///
+/// 序列：fork 子进程 → 子调 sleep_ticks(12)，内核 tick 引擎真推进后
+/// 唤醒并经陷阱帧回写 elapsed（≥12 即「真睡眠」——Blocked 进程不参与
+/// 调度，忙等路径不可能凭空拿到 ≥ 请求值的流逝计数）；父先自睡
+/// 5 tick（验证睡眠队列多进程互不干扰），随后 wait 收尸断言 exit 77。
+/// 全过打印 PASS。对照 waitspec 的 delay_cycles 忙等：本命令期间 CPU
+/// 可让给其他进程，串口活性即为调度器未空转的旁证。
+fn sleepdemo_command() {
+    println("[P] sleepdemo: forking sleeper child (child sleeps 12 ticks)");
+    match userlib::fork() {
+        Ok(0) => {
+            println("[C] child alive, sleeping 12 ticks");
+            // 子：睡 12 tick → elapsed 回写 ≥ 12 → exit(77)
+            match userlib::sleep_ticks(12) {
+                Ok(elapsed) => {
+                    print("[C] woke up, elapsed ticks=");
+                    print_u64(elapsed);
+                    if elapsed >= 12 {
+                        println(" (>=12 OK)");
+                    } else {
+                        println(" (<12 FAIL)");
+                    }
+                }
+                Err(e) => {
+                    print("[C] sleep_ticks failed: ");
+                    print_i32(e as i32);
+                    println("");
+                }
+            }
+            userlib::exit(77);
+        }
+        Ok(child_pid) => {
+            // 父：自睡 5 tick（短于子，先醒），随后以 WNOHANG 轮询+让出
+            // 等待收尸——保持就绪队列恒有 Running 进程，避开「全员阻塞
+            // 后 idle 轮转」的调度器历史雷区（详见 STATUS 第十一刀披露）。
+            match userlib::sleep_ticks(5) {
+                Ok(elapsed) => {
+                    print("[P] parent slept, elapsed ticks=");
+                    print_u64(elapsed);
+                    println("");
+                }
+                Err(e) => {
+                    print("[P] parent sleep failed: ");
+                    print_i32(e as i32);
+                    println("");
+                }
+            }
+            // 阻塞收尸（对照 WNOHANG 轮询：轮询版会让 idle 窗口吞掉
+            // 定时器流——见 STATUS 第十一刀「已知问题」披露）。
+            let mut pass = false;
+            match userlib::wait_pid(child_pid) {
+                Ok((pid, code)) => {
+                    print("[P] collected pid=");
+                    print_u64(pid);
+                    print(" code=");
+                    print_i32(code);
+                    println("");
+                    pass = pid == child_pid && code == 77;
+                }
+                Err(e) => {
+                    print("[P] wait failed: ");
+                    print_i32(e as i32);
+                    println("");
+                }
+            }
+            if pass {
+                println("[P] sleepdemo: PASS (sleep/wake + frame writeback)");
+            } else {
+                println("[P] sleepdemo: FAIL");
+            }
+        }
+        Err(e) => {
+            print("[P] sleepdemo: fork failed: ");
+            print_i32(e as i32);
+            println("");
+        }
+    }
 }
 
 /// brktest —— 用户堆端到端验证（号位 24，第十刀）。

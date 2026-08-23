@@ -643,6 +643,13 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                 let ap = (pte >> 6) & 0b11;
                 let executable = pte & DESC_UXN == 0;
                 map_physical_page(&mut child, va, dst, ap, executable)?;
+                // ⚠ 第十一刀锁域审计结论（与 process::map_user_elf_segments
+                // 同案）：此处**不得**放行中断。fork 的 syscall 路径依赖
+                // 「内核全程屏蔽 IRQ ⇒ syscall 原子」这一根基不变量——
+                // 实测在克隆循环中途让出会被 tick 打断并触发调度重入，
+                // 子进程以未初始化现场启动（elr=0x340 指令中止，实机
+                // 抓获）。分块让出基础设施保留（SCHED_STARTED 安全闸 +
+                // chunk_yield_point），待未来引入内核抢占框架后重启。
             }
         }
     }

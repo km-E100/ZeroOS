@@ -14,7 +14,7 @@ use spin::Mutex;
 use zero_abi::syscall::SysError;
 use zero_abi::{ProcessId, ThreadEntry};
 
-const MAX_PROCESSES: usize = 64;
+pub(crate) const MAX_PROCESSES: usize = 64;
 
 /// init（launchd）的 pid，孤儿收养的目标（对标 Linux pid==1 /
 /// child_subreaper 的 reparent 目标）。恒为 2 的依据：NEXT_PID 从 2
@@ -94,6 +94,12 @@ pub struct TrapFrame {
     /// FPU/NEON 全量保存区（#288..#815，16 对齐；约定见 FpuState 注释）。
     /// CPACR_EL1.FPEN=0b11 后 EL0 可用 FP/SIMD，现场必须随帧完整保存。
     pub fpu: FpuState,
+    /// 惰性 FPU 帧属主（第十一刀，#816）：本帧最后一次被武装进入用户态时
+    /// 的槽位号。异常入口存根以「FPU_DIRTY == frame.owner_slot」判定
+    /// 活寄存器是否就是本帧用户的 FP 现场——是则入口跳过 32×stp 急切
+    /// 保存（同进程 syscall 往返的零成本快路径）。u64::MAX 表示从未武装。
+    /// 写入点唯一：arch::restore_context（eret 进用户态前的必经之路）。
+    pub owner_slot: u64,
 }
 
 // 布局契约静态断言：汇编按这些立即数访帧，漂移即编译失败。
@@ -105,11 +111,12 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, sp_el1) == 272);
     assert!(core::mem::offset_of!(TrapFrame, tpidr_el0) == 280);
     assert!(core::mem::offset_of!(TrapFrame, fpu) == 288);
+    assert!(core::mem::offset_of!(TrapFrame, owner_slot) == 816);
     assert!(core::mem::offset_of!(FpuState, v) == 0);
     assert!(core::mem::offset_of!(FpuState, fpsr) == 512);
     assert!(core::mem::offset_of!(FpuState, fpcr) == 516);
     assert!(core::mem::size_of::<FpuState>() == 528);
-    assert!(core::mem::size_of::<TrapFrame>() == 816);
+    assert!(core::mem::size_of::<TrapFrame>() == 832);
 };
 
 impl TrapFrame {
@@ -122,6 +129,7 @@ impl TrapFrame {
             sp_el1: 0,
             tpidr_el0: 0,
             fpu: FpuState::new(),
+            owner_slot: u64::MAX,
         }
     }
 
@@ -139,6 +147,8 @@ impl TrapFrame {
         self.sp_el1 = kernel_stack_top as u64;
         // 新进程从零 TLS 与干净 FP 状态起步：TPIDR_EL0/FPCR/FPSR 归零，
         // v 寄存器清零（首次恢复装填确定值而非上一任进程的残留）。
+        // 注意：此处只动**他人/新生儿帧**，不得触碰全局 FPU_DIRTY
+        // （活寄存器属主记账属当前运行进程，见 arch::fpu_discard_live）。
         self.tpidr_el0 = 0;
         self.fpu = FpuState::new();
     }
@@ -596,6 +606,17 @@ pub fn state(pid: ProcessId) -> Option<ProcessState> {
 
 pub unsafe fn trap_frame(slot: usize) -> *mut TrapFrame {
     TRAP_FRAMES[slot].get()
+}
+
+/// idle 专用的异常保存帧（第十一刀）：调度器空转（全员阻塞）期间
+/// TPIDR_EL1 若仍指向最后一个 Blocked 进程的帧，每个定时器中断都会
+/// 把 idle 的 EL1 现场整帧砸进该进程的保存区——唤醒后恢复出的是
+/// 垃圾上下文（实机：sleepdemo 子进程唤醒后凭空消失）。idle 入口
+/// 先把 TPIDR 切到本帧，中断存根即写入无害 scratch。
+static IDLE_FRAME: TrapFrameCell = TrapFrameCell::new();
+
+pub unsafe fn idle_trap_frame() -> *mut TrapFrame {
+    IDLE_FRAME.get()
 }
 
 pub type Context = TrapFrame;
@@ -1340,6 +1361,11 @@ fn map_user_elf_segments(
                 page_va,
                 phys
             );
+            // ⚠ 第十一刀锁域审计结论：此处**不得**放行中断。map_user_elf_
+            // segments 在 spawn/exec 的调用链上游持有 PROCESS_TABLE 锁，
+            // 让出后 tick 处理的优先级提升扫描会再锁同一把锁——单核
+            // 自旋死锁（实机：launchd 静默卡死、服务永不上线）。分块
+            // 让出仅保留在确认无锁的 fork 克隆循环（paging::clone）。
 
             let page_first = page_va;
             let page_last = page_va + PAGE_SIZE;
@@ -1551,6 +1577,9 @@ fn apply_exec_frame(
     frame.sp_el1 = kernel_sp as u64;
     // 新映像从零 TLS 与干净 FP 状态起步（对照 init_user）：上一映像的
     // TPIDR_EL0 / FPCR / FPSR / v 寄存器一律不得泄漏进新执行域。
+    // fpu_discard_live（第十一刀）：先把活寄存器旧现场落账作废，
+    // 再覆写为干净初值——「dirty==owner ⇒ 帧=寄存器」不变式保持。
+    crate::arch::fpu_discard_live(frame);
     frame.tpidr_el0 = 0;
     frame.fpu = FpuState::new();
 }
@@ -1695,6 +1724,7 @@ mod exec_tests {
                 fpsr: 0x7F,
                 fpcr: 0x3,
             },
+            owner_slot: u64::MAX,
         };
         apply_exec_frame(
             &mut frame,
@@ -1703,6 +1733,8 @@ mod exec_tests {
             0x8888_0000,
             [0x1000, 8, 77, 0],
         );
+        // exec 换映像必须作废 FP 属主记账并重置帧属主（第十一刀）
+        assert_eq!(frame.owner_slot, u64::MAX);
         assert_eq!(frame.elr_el1, 0x20_0000);
         assert_eq!(frame.spsr_el1, 0); // EL0t
         assert_eq!(frame.sp_el0, 0xFFFF_F000);

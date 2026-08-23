@@ -423,6 +423,15 @@ pub fn brk(new_break: usize) -> Result<usize, SysError> {
     decode_result(ret).map(|v| v as usize)
 }
 
+/// 睡眠 ticks 个 timer tick（号位 25，第十一刀）。
+///
+/// 成功返回实际流逝的 tick 数（≥ 请求值，实机可断言「真睡眠不忙等」）；
+/// `ticks == 0` 立即返回 Ok(0)。睡眠期间进程 Blocked、不参与调度。
+pub fn sleep_ticks(ticks: u64) -> Result<u64, SysError> {
+    let ret = svc_call(25, [ticks, 0, 0, 0]);
+    decode_result(ret)
+}
+
 /// 以**增量**调整用户堆 break（号位 24 的 POSIX sbrk 语义封装）。
 ///
 /// 成功返回**调用前的旧 break**（对照 POSIX sbrk：返回值指向新分配
