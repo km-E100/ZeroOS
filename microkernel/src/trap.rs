@@ -84,7 +84,13 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
         SyncExceptionKind::Svc => handle_svc(frame, esr),
         SyncExceptionKind::Brk => {
             let ctx = capture_trap_context();
-            if decoded.from_el0 || ctx.slot.is_some() {
+            // 来源判定（第十刀集成修复）：EC=0x3C 与 SVC/FPU 同理不区分
+            // 来源 EL，SPSR.M 才是权威字段。旧判据 `ctx.slot.is_some()`
+            // 会把「内核在用户进程 syscall 路径中执行的 BRK」误判为
+            // 用户 panic——无辜进程被 SIGTRAP 杀死，kernel_sync_fault
+            // （pstore 持久化 + 复位）永不触达。实机 drill 抓获。
+            let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
+            if from_el0 {
                 crate::info!(
                     "[trap] EL0 breakpoint (panic/udf): elr=0x{:016x} pid={:?}",
                     ctx.elr,
@@ -99,6 +105,17 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
             let ctx = capture_trap_context();
             let message = format_sync_exception(&decoded, &ctx);
             if decoded.from_el0 {
+                // ── 第十刀 COW：EL0 写权限故障优先走写时复制断链 ──
+                // PTE 带 DESC_SW_COW ⇒ 分配私有副本/原地恢复可写后
+                // restore_frame，eret 重放同一条访存指令（不杀不重启）。
+                // 非 COW 页原样落入下方 SIGSEGV 路径。
+                if let SyncExceptionKind::DataAbort(info) = decoded.kind {
+                    if info.kind == FaultKind::Permission
+                        && process::handle_cow_write_fault(ctx.far as usize)
+                    {
+                        unsafe { crate::arch::restore_frame(frame) }
+                    }
+                }
                 // 用户态故障：审计行保留 info，然后按默认动作投递信号终止。
                 // 信号归因对标 Linux force_sig_fault 的页故障分类：
                 // 数据访问对齐错误 → SIGBUS；其余页故障（翻译/权限/
@@ -123,6 +140,22 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 dump_user_pte(ctx.far);
                 terminate_faulting_process(&ctx, sig)
             } else {
+                // ── 第十刀 COW：EL1 代用户写落在 COW 共享页上同样可恢复 ──
+                // （fork 后窗口内 copy_to_user 写用户缓冲即此场景）：
+                // 断链成功则 eret 回 EL1 重放踩故障的访存指令，memcpy 无感续行；
+                // PTE 无 COW 位则照旧走下方处置，行为不变。
+                if let SyncExceptionKind::DataAbort(info) = decoded.kind {
+                    if info.kind == FaultKind::Permission
+                        && ctx.slot.is_some()
+                        && process::handle_cow_write_fault(ctx.far as usize)
+                    {
+                        crate::info!(
+                            "[trap] cow break on EL1 user-write far=0x{:016x}",
+                            ctx.far
+                        );
+                        unsafe { crate::arch::restore_frame(frame) }
+                    }
+                }
                 // 穷人版 exception table（对照 Linux __ex_table）：内核在
                 // 代用户拷贝（copy_slice_from/to_user）时踩到坏页 ⇒
                 // 视为 EFAULT 类用户错误：杀调用进程，而非重启整机。
@@ -443,6 +476,9 @@ fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
             crate::error!("  #{i} pc=0x{:016x}{}", fr.pc, fr.note);
         }
     }
+    // 完整故障摘要持久化到 pstore 固定物理窗口：串口之外的第二份现场，
+    // 复位后由 bootloader 在下一启第一屏取回打印（穷人版 pstore 链路）。
+    crate::debug::pstore::log_kernel_fault(reason, esr, far, elr, &trace);
     reset_or_halt()
 }
 
@@ -509,7 +545,11 @@ fn reset_or_halt() -> ! {
     crate::error!("SYSTEM HALT: 内核故障，尝试复位后停机");
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let fid: u64 = 0x8400_0008; // PSCI SYSTEM_RESET
+        // PSCI 0.2 功能 ID（ARM DEN 0022D 表 11）：SYSTEM_RESET =
+        // 0x8400_0009。旧值 0x8400_0008 是 SYSTEM_OFF——"复位"实为
+        // 关机，pstore 双启动链路因此从未真正走通过（第十刀 drill
+        // 实测抓获：QEMU 进程整体退出而非热复位）。
+        let fid: u64 = 0x8400_0009; // PSCI SYSTEM_RESET
         // QEMU virt (TCG) 的 PSCI conduit 是 HVC；SMC 会作为未定义异常
         // 弹回 EL1 自家向量表（实测），故必须用 hvc。
         asm!("hvc #0", in("x0") fid, options(nostack));

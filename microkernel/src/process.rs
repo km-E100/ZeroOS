@@ -1368,6 +1368,25 @@ fn map_user_elf_segments(
     Ok(())
 }
 
+/// 第十刀 COW：EL0/EL1 写权限故障的写时复制断链入口（trap.rs 调用）。
+///
+/// 取当前槽位进程的地址空间，对 far 处 PTE 尝试 COW 断链：
+/// - PTE 带 DESC_SW_COW ⇒ 按引用计数复制/恢复可写，返回 true，
+///   调用方 restore_frame 后 eret 重放同一条指令；
+/// - 否则返回 false，故障走原有信号/终止路径。
+///
+/// EL1 代用户写（copy_to_user 等）落在 COW 页上同样经此恢复：
+/// 断链完成后 eret 回内核重放踩故障的那条访存指令，memcpy 无感续行。
+/// 锁纪律：address_space() 的表锁语句级即放，物理分配器锁在其后获取，
+/// 无反转风险（与 spawn 的 configure 流程同源）。
+pub fn handle_cow_write_fault(far: usize) -> bool {
+    let slot = crate::scheduler::current_slot();
+    let Some(space) = address_space(slot) else {
+        return false;
+    };
+    space.handle_cow_fault(far)
+}
+
 pub fn fork(
     parent_slot: usize,
     parent_frame: &TrapFrame,
@@ -1383,10 +1402,21 @@ pub fn fork(
     let child_slot;
     let child_pid = alloc_pid();
 
-    // 地址空间克隆必须在持锁外进行（分配物理页/可能失败），
-    // 且 clone_space 当前显式失败（见 address_space.rs 注释）。
+    // 地址空间克隆必须在持锁外进行（分配物理页/可能失败）。
+    // 第十刀 COW：clone 不再逐页 memcpy——父子共享数据页（双侧只读 +
+    // DESC_SW_COW），首写 Permission fault 时才断链复制；共享/复制统计
+    // 由 paging::last_clone_stats 快照，copied==0 即零复制 fork 生效。
     let addr_space = if let Some(space) = parent_record.addr_space {
         let cloned = address_space::clone_space(&space).map_err(ProcessError::MapError)?;
+        let (shared, ro_shared, copied) = crate::mm::paging::last_clone_stats();
+        crate::info!(
+            "process: cow fork pid={} -> child pid={} shared_pages={} readonly_shared={} copied={}",
+            parent_record.pid.raw(),
+            child_pid.raw(),
+            shared,
+            ro_shared,
+            copied
+        );
         Some(cloned)
     } else {
         None
