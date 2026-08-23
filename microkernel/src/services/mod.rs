@@ -19,15 +19,30 @@ pub fn launch_core(_info: &BootInfo) {
             essential: true,
             privileged: true, // 作为 init 应当是 privileged
         },
+        ServiceDescriptor {
+            name: "securityd",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-securityd"),
+            // 非核心用户态服务：纯 IPC + 控制台即可运行，无需 MMIO
+            // 租约（privileged=false）。内核只登记不引导——由 launchd
+            // 经 SpawnService 拉起并记账（见 servers/launchd 的
+            // KNOWN_SERVICES 启动对账），否则 launchd 拿不到真实 pid。
+            essential: false,
+            privileged: false,
+        },
     ];
 
     for service in bundled {
         register_service(service);
-        launch_service(service);
+        // 核心服务（launchd）由内核引导期直接拉起；其余仅登记，
+        // 由 launchd 在用户态统一 spawn——生命周期状态（running/
+        // failed/not-installed）才能如实呈现给 `launchd list`。
+        if service.essential {
+            launch_service(service);
+        }
     }
 
     crate::info!(
-        "services::launch_core: finished launching {} service(s)",
+        "services::launch_core: registered {} service(s); kernel launched essential only",
         bundled.len()
     );
 }

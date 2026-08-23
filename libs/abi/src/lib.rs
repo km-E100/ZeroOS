@@ -465,6 +465,8 @@ pub mod ipc {
 /// 号位 0–21 已全部在内核 `trap.rs::decode_syscall` + `syscalls::handle`
 /// 落地；GetPid 已实机验证（shell `pid` 命令返回正确 PID）。
 /// 阻塞语义：号位 1 空队列时挂起进程，send 唤醒（continuation 收尾）。
+/// 号位 22（WaitPid）2026-08 新增：zombie 子进程回收 + 阻塞等待，
+/// decode_syscall / handle / userlib 三处同步落地（见各文件头部设计注释）。
 pub mod syscall {
     use super::ThreadEntry;
 
@@ -565,6 +567,20 @@ pub mod syscall {
         },
         /// (21) 查询当前进程 PID（已实现并实机验证）。
         GetPid,
+        /// (22) 等待子进程退出并收集退出码（POSIX wait4 最小完备集，2026-08 新增）：
+        /// `x1`=目标 pid（**0 = 任意子进程**）。
+        ///
+        /// 返回值编码：成功为 `(child_pid << 32) | (exit_code as u32)`
+        /// （exit_code 按 32 位二进制补码解释，负值可无损还原）。
+        /// 错误语义：
+        /// - 无任何（匹配的）子进程 → [`SysError::NotFound`]（对应 POSIX ECHILD）；
+        ///   含“子早已被收集/回收后再 wait”的重复调用——幂等安全。
+        /// - 有未退出的活子进程 → 内核挂起调用方，待其退出时以
+        ///   continuation 方式带回结果（对照号位 1 的阻塞接收语义）。
+        WaitPid {
+            /// 目标子 pid；0 表示任意子进程。
+            pid: u64,
+        },
     }
 
     /// 系统调用结果：成功返回 `u64`，失败返回 [`SysError`]。

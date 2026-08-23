@@ -7,6 +7,11 @@ cargo run -p xtask -- build-servers
 cargo run -p xtask -- build-installer
 cargo run -p xtask -- build-recovery
 
+# 说明：build-servers 现在会同时产出 zero-launchd 与 zero-securityd 的
+# aarch64-unknown-none 裸机 release ELF，并经 sync_userland_blobs 同步到
+# kernel/rootfs/System/Core/（zero-launchd / zero-securityd），随后的
+# build-rootfs / build-iso 会把它们嵌入内核镜像。
+
 # 构建微内核/裸机内核
 cargo run -p xtask -- build-kernel
 cargo +nightly build \
@@ -31,6 +36,9 @@ cargo run -p zero-installer
 
 # 收集内核、rootfs、工具并打包成 ISO
 cargo run -p xtask -- build-iso
+#   ↑ build-iso 入口已前置 build_baremetal_blobs：自动先编最新
+#   zero-launchd / zero-securityd 裸机版，再 sync → build-rootfs →
+#   installer → 内核嵌入，全自动产出含新服务的 ISO，无手动步骤。
 
 # Zero OS 自研 UEFI Loader 默认 0 秒进入系统，连续失败 3 次自动进入恢复。
 # Zero OS 成功启动后请在系统里执行 `bootctl`
@@ -65,3 +73,25 @@ qemu-system-aarch64 \
 
 # 注意：测试盘必须用专用空盘 target/disk.img；
 # 不要挂 zero-rootfs.img——用户态（如 securityd 的 userdb）会真实写入该盘。
+
+# ---- 用户态服务生命周期（launchd）----
+#
+# 当前内核登记并交由 launchd 拉起的服务：securityd
+# （/System/Core/zero-securityd，纯 IPC + 控制台，无 MMIO 依赖；
+# 无盘环境下 userdb 持久化失败仅告警降级，不影响在线）。
+#
+# 开机自动对账：launchd 启动时逐个向内核 spawn KNOWN_SERVICES——
+# 已登记的服务记为 [running pid=N]，未登记的保持 [not-installed]。
+# 因此启动日志可见：securityd banner（"Zero OS securityd (EL0 service)
+# online"）+ launchd 对账行（"launchd: service online: securityd pid=N"）。
+#
+# shell 验证命令：
+#   launchd list            # 应看到 securityd [running] pid=N
+#   launchd spawn securityd # 已运行 → 友好提示 "already running pid=N"（幂等，不重复拉起）
+#   launchd status          # launchd up; services registered=N
+#
+# 脚本化实机验证（无盘、串口注入两条命令，约 26 秒后看 /tmp/svc.log）：
+#   ( sleep 14; printf 'launchd list\r'; sleep 3; printf 'launchd spawn securityd\r'; sleep 3 ) \
+#     | qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 \
+#       -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+#       -serial mon:stdio -display none -cdrom target/zero-os.iso > /tmp/svc.log 2>&1 &

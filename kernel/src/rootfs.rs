@@ -5,7 +5,7 @@ use zero_abi::boot::{RootFsEntry, RootFsImage};
 #[no_mangle]
 #[used]
 #[link_section = ".rodata.boot"]
-pub static __zero_rootfs_entries: [RootFsEntry; 7] = [
+pub static __zero_rootfs_entries: [RootFsEntry; 8] = [
     RootFsEntry::new(
         "/etc/motd",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs/etc/motd")),
@@ -47,6 +47,16 @@ pub static __zero_rootfs_entries: [RootFsEntry; 7] = [
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/rootfs/Applications/Shell"
+        )),
+    ),
+    // securityd 用户态服务裸机 ELF（由 xtask sync_userland_blobs 从
+    // target/aarch64-unknown-none/release/zero-securityd 同步而来；
+    // 内核侧仅登记路径，spawn 由 launchd 经 SpawnService 触发）。
+    RootFsEntry::new(
+        "/System/Core/zero-securityd",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/rootfs/System/Core/zero-securityd"
         )),
     ),
 ];

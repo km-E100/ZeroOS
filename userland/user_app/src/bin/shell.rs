@@ -77,7 +77,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("bye");
             break;
         } else if cmd == b"help" || cmd == b"?" {
-            println("commands: help info echo whoami pid forktest clear history launchd exit");
+            println("commands: help info echo whoami pid forktest waittest clear history launchd exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"whoami" {
@@ -119,9 +119,74 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                     print("[P] parent: child_pid=");
                     print_u64(child_pid);
                     println("");
+                    // 子已 exit ⇒ 收尸，避免 zombie 占槽（wait4 语义上线后
+                    // 不收尸的 fork 会泄漏进程表槽位）。
+                    match userlib::wait_pid(child_pid) {
+                        Ok((pid, code)) => {
+                            print("[P] forktest: collected pid=");
+                            print_u64(pid);
+                            print(" code=");
+                            print_i32(code);
+                            println("");
+                        }
+                        Err(e) => {
+                            print("[P] forktest: wait failed (");
+                            print_hex(e.code());
+                            println(")");
+                        }
+                    }
                 }
                 Err(e) => {
                     print("[P] forktest: fork failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        } else if cmd == b"waittest" {
+            // wait4 端到端验证：fork 出的子进程 sleep-ish 延时后
+            // exit(42)；父进程 wait_pid 阻塞收集并打印 collected 行。
+            // 子分支绝不回到主循环（同 forktest：防止双 shell 抢终端）。
+            match userlib::fork() {
+                Ok(0) => {
+                    println("[C] waittest: child alive, delaying before exit(42)");
+                    // 用户态无时钟源：易失黑盒递减近似延时（QEMU TCG 下约
+                    // 数百毫秒），期间周期性 yield。目的仅是保证父进程先
+                    // 进入 WaitPid 阻塞（fork→wait 路径仅数微秒），从而覆盖
+                    // “挂起→子退出唤醒”路径；即使时序反转，内核快路径
+                    // （子已成尸直接收集）同样正确。
+                    let mut spin = 25_000_000u64;
+                    while spin > 0 {
+                        spin -= 1;
+                        if spin & 0xFF == 0 {
+                            core::hint::black_box(spin);
+                        }
+                        if spin % (1 << 22) == 0 {
+                            userlib::yield_now();
+                        }
+                    }
+                    userlib::exit(42);
+                }
+                Ok(child_pid) => {
+                    print("[P] waittest: forked child ");
+                    print_u64(child_pid);
+                    println("");
+                    match userlib::wait_pid(child_pid) {
+                        Ok((pid, code)) => {
+                            print("collected pid=");
+                            print_u64(pid);
+                            print(" code=");
+                            print_i32(code);
+                            println("");
+                        }
+                        Err(e) => {
+                            print("[P] waittest: wait failed (");
+                            print_hex(e.code());
+                            println(")");
+                        }
+                    }
+                }
+                Err(e) => {
+                    print("[P] waittest: fork failed (");
                     print_hex(e.code());
                     println(")");
                 }
@@ -305,6 +370,16 @@ fn print_bytes(text: &[u8]) {
 fn println_bytes(text: &[u8]) {
     print_bytes(text);
     let _ = console_write(b"\r\n");
+}
+
+/// 有符号整数打印（退出码可能为负）。
+fn print_i32(v: i32) {
+    if v < 0 {
+        let _ = console_write(b"-");
+        print_u64((-(v as i64)) as u64);
+    } else {
+        print_u64(v as u64);
+    }
 }
 
 fn print_u64(mut v: u64) {

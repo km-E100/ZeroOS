@@ -295,13 +295,27 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 Err(_) => Err(SysError::NotFound),
             }
         }
-        Syscall::Exit { status: _ } => crate::scheduler::exit_current(),
+        // 语义升级（zombie/waitpid 状态机，见 process.rs 头部设计注释）：
+        // Exit 记录退出码并按父子关系决定 Zombie/即时回收，随后
+        // reschedule 收尾——本调用 noreturn，返回值类型仅为签名兼容。
+        Syscall::Exit { status } => crate::process::exit_current_with_status(status),
         Syscall::Yield => crate::scheduler::yield_current(),
         Syscall::GetPid => {
             let caller_slot = crate::scheduler::current_slot();
             let caller_pid =
                 crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
             Ok(caller_pid.raw())
+        }
+        // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
+        // 有活子未退则挂起（pending_wait 登记 + block_current，子退出时
+        // 由其 Exit 路径写父 TrapFrame 并 wake——零侵入 continuation）；
+        // 无任何匹配子进程返回 NotFound（对应 ECHILD，重复 wait 幂等）。
+        Syscall::WaitPid { pid } => {
+            match crate::process::waitpid_step(pid) {
+                Ok(crate::process::WaitStep::Completed(value)) => Ok(value),
+                Ok(crate::process::WaitStep::Blocked) => crate::scheduler::block_current(),
+                Err(e) => Err(e),
+            }
         }
     }
 }

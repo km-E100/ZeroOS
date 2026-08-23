@@ -310,6 +310,12 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
             name_len: regs[2] as usize,
         }),
         21 => Some(Syscall::GetPid),
+        // 号位 22（WaitPid，zombie/waitpid 回收）：ABI 已冻结于 zero-abi。
+        // 【边界披露】本文件本轮由并行 Agent 维护（FP 栈回溯），此处仅
+        // 追加这一条 match 臂——任务要求 decode_syscall/handle/ABI 三处
+        // 一致，且无此臂则号位 22 永远 ENOSYS、端到端验收不可能达成；
+        // 插入点与其余改动区域零重叠。
+        22 => Some(Syscall::WaitPid { pid: regs[1] }),
         _ => None,
     }
 }
@@ -833,7 +839,10 @@ mod tests {
             decode_syscall(&regs(21, [0, 0, 0, 0])),
             Some(Syscall::GetPid)
         ));
-        assert!(decode_syscall(&regs(22, [0, 0, 0, 0])).is_none());
+        assert!(matches!(
+            decode_syscall(&regs(22, [7, 0, 0, 0])),
+            Some(Syscall::WaitPid { pid: 7 })
+        ));
         assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
     }
 

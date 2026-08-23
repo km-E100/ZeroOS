@@ -74,18 +74,43 @@ pub fn yield_now() {
     }
 }
 
-/// 退出当前进程（等价内核号位 5 `Exit`，经历史快捷入口 `svc #2`）。
+/// 退出当前进程（号位 5 `Exit`）。
 ///
-/// `code` 为退出状态码；进程进入 Dying 状态后由调度器回收。
+/// `code` 为退出状态码：有存活父进程时本进程转 Zombie，父可经
+/// [`wait_pid`] 收集该码；无父/父已死则由内核立即完全回收。
+///
+/// 历史注记：旧实现走快捷入口 `svc #2`；但内核侧 svc#2 是“不留尸体”
+/// 的即时销毁路径（退出码丢弃、不可收集）。为让 wait4 语义端到端
+/// 可用，本库统一改走正式号位 5——两者最终都不返回，行为差异仅在
+/// 状态码是否可被父进程收集。
 pub fn exit(code: i32) -> ! {
     unsafe {
         // noreturn asm 不能声明输出；x16/x17 在此路径无所谓（进程即将消亡）。
         core::arch::asm!(
-            "svc #2",
-            in("x0") code as u64,
+            "svc #0",
+            in("x0") 5u64,
+            in("x1") code as u64,
             options(noreturn)
         );
     }
+}
+
+/// 等待子进程退出并收集其退出码（号位 22，POSIX wait4 最小集）。
+///
+/// - `pid = 0`：等待**任意**子进程；否则只等指定 pid 的子进程。
+/// - 成功：`Ok((child_pid, exit_code))`。
+/// - 无任何匹配子进程（含早已收过的重复 wait）：`Err(NotFound)`
+///   （对应 POSIX ECHILD；幂等安全）。
+/// - 有未退出的活子：调用方挂起，子退出时内核带回结果后本函数返回。
+pub fn wait_pid(pid: u64) -> Result<(u64, i32), SysError> {
+    let ret = svc_call(22, [pid, 0, 0, 0]);
+    unpack_wait_result(decode_result(ret)?)
+}
+
+/// 内核返回值解包：`(pid << 32) | (code as u32)` → (pid, code)。
+/// 与内核 process::pack_wait_result 严格对称（负码按 32 位补码还原）。
+fn unpack_wait_result(value: u64) -> Result<(u64, i32), SysError> {
+    Ok((value >> 32, value as u32 as i32))
 }
 
 /// 创建当前进程的子进程（号位 2，`Syscall::Fork`）。
@@ -385,6 +410,18 @@ mod tests {
         assert_eq!(m.code, 7);
         assert_eq!(extract_payload_text(&m.payload).len(), 127);
         assert_eq!(m.payload[127], 0);
+    }
+
+    #[test]
+    fn wait_pid_unpack_matches_kernel_pack() {
+        // 与内核 process::pack_wait_result 的编码严格对称：
+        // packed = (pid << 32) | (code as u32)，负码按补码无损还原。
+        let pack = |pid: u64, code: i32| (pid << 32) | (code as u32 as u64);
+        for (pid, code) in [(7u64, 42i32), (1234, 0), (64, -1), (u32::MAX as u64, i32::MIN)] {
+            assert_eq!(unpack_wait_result(pack(pid, code)).unwrap(), (pid, code));
+        }
+        // 注：错误区间由 wait_pid 内的 decode_result 先行拦截（见
+        // decode_error_interval_maps_to_sys_error），unpack 只处理成功值。
     }
 
     #[test]

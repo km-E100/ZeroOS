@@ -90,7 +90,13 @@ impl ServiceRecord {
     }
 }
 
-/// 状态：4 = not-installed（已规划、二进制尚未部署进 rootfs）。
+/// 状态常量（与 `ServiceRecord.status` 字段注释及
+/// `zero_abi::protocol::service_control::STATUS_*` 对齐）：
+/// 1=starting 2=running 3=failed 4=not-installed（0=idle 暂未使用）。
+const STATUS_STARTING: u8 = 1;
+const STATUS_RUNNING: u8 = 2;
+const STATUS_FAILED: u8 = 3;
+/// 已规划、但内核未登记或二进制尚未嵌入 rootfs。
 const STATUS_NOT_INSTALLED: u8 = 4;
 
 /// 已规划服务清单。二进制就绪并由内核登记前以 [not-installed] 呈现，
@@ -224,10 +230,20 @@ pub extern "C" fn _start() -> ! {
 pub extern "C" fn server_main() -> ! {
     let mut table = ServiceTable::new();
 
-    // 预登记已规划服务（not-installed）：spawn 请求会被内核以 NotFound
-    // 拒绝，这里先行占位让 list/status 有完整视图。
+    // 预登记已规划服务（not-installed），随后逐个向内核发起一次 spawn 对账：
+    // 内核 SERVICE_REGISTRY 已登记且 blob 已嵌入 rootfs 的服务会被真正拉起，
+    // 记为 [running pid=N]；未登记的以 NotFound 拒绝、保持 [not-installed]。
+    // 这样 `launchd list` 无需手动 spawn 即反映系统真实状态，也保证内核与
+    // launchd 之间只有一份实例（记账 pid 唯一）。
     for name in KNOWN_SERVICES {
         table.upsert(name, None, STATUS_NOT_INSTALLED);
+        match service_spawn(name) {
+            Ok(pid) => {
+                table.upsert(name, Some(pid), STATUS_RUNNING);
+                announce_online(name, pid);
+            }
+            Err(_) => {} // 保持 not-installed 占位，如实呈现蓝图
+        }
     }
 
     println("Zero OS launchd (EL0 service) online");
@@ -320,27 +336,53 @@ fn handle_restart(table: &mut ServiceTable, request: &Message, text: &mut TextBu
 
 /// 调用 `SpawnService`（syscall 20）并按结果记账。
 ///
-/// 注意：`name` 必须是内核 `services::SERVICE_REGISTRY` 已登记的名字；
-/// 当前内核仅登记了 `launchd` 自身，其余服务名（如 `zero-ipc-router`）
-/// 需要内核 Agent 补充登记后才能 spawn（协调点见轮次报告）。
+/// - 成功：upsert 为 [running pid=N]；
+/// - NotFound（未在内核 SERVICE_REGISTRY 登记或 blob 未嵌入 rootfs）：
+///   保持 [not-installed]，如实呈现蓝图而非谎报 failed；
+/// - 其他错误：记 [failed] 并回传错误名。
+///
+/// 幂等保护：已在运行/启动中的服务直接友好回报、不重复 spawn
+/// （内核侧无实例去重，重复 spawn 会产生第二份进程）。
 fn spawn_and_record(table: &mut ServiceTable, name: &str, text: &mut TextBuf) -> u32 {
+    if let Some(rec) = table.iter().find(|rec| rec.name() == name) {
+        if rec.pid.is_some() && (rec.status == STATUS_RUNNING || rec.status == STATUS_STARTING) {
+            text.push_str(name);
+            text.push_str(" already running pid=");
+            text.push_u64(rec.pid.unwrap_or(0));
+            return 1;
+        }
+    }
     match service_spawn(name) {
         Ok(pid) => {
-            table.upsert(name, Some(pid), 1);
+            table.upsert(name, Some(pid), STATUS_RUNNING);
             text.push_str("spawning ");
             text.push_str(name);
             text.push_str(" pid=");
             text.push_u64(pid);
             0
         }
+        Err(SysError::NotFound) => {
+            table.upsert(name, None, STATUS_NOT_INSTALLED);
+            text.push_str("spawn failed: not found (not registered in kernel registry)");
+            2
+        }
         Err(err) => {
-            table.upsert(name, None, 3);
+            table.upsert(name, None, STATUS_FAILED);
             text.push_str("spawn failed: ");
             text.push_str(err.as_str());
-            text.push_str(" (service must be registered in kernel registry)");
             2
         }
     }
+}
+
+/// 服务上线横幅（启动对账成功时打印，含内核分配的 pid）。
+fn announce_online(name: &str, pid: u64) {
+    let mut text = TextBuf::new();
+    text.push_str("launchd: service online: ");
+    text.push_str(name);
+    text.push_str(" pid=");
+    text.push_u64(pid);
+    println(text.as_str());
 }
 
 /// 把结果文本应答到 `LAUNCHD_CMD_RESP`（超长自动截断，NUL 收尾）。

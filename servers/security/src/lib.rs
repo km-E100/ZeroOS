@@ -1,12 +1,32 @@
+//! # zero-securityd —— Zero OS 用户与安全策略守护进程（EL0 服务）
+//!
+//! 由 launchd 经系统调用 20（`SpawnService`）从 rootfs
+//! （`/System/Core/zero-securityd`）拉起，监听
+//! `SECURITY_USER_REQ`/`SECURITY_USER_RESP`(0x230/0x231) 通道，
+//! 提供用户增删/密码/校验/列表命令。
+//!
+//! ## 启动数据
+//!
+//! 内核 `spawn_user_from_bootfs` 以 x0/x1 传入本进程私有的 bootfs
+//! 文件表（`UserBootFs`，见 zero-abi::bootfs）：用户数据库默认值从
+//! 表内 `/etc/users` 读取。**不引用内核专属符号**
+//! `__zero_rootfs_image`——那是内核 .rodata.boot 段的符号，用户态
+//! ELF 链接期无法解析（历史遗留缺陷，本轮改为 bootfs 参数契约）。
+//!
+//! ## 持久化
+//!
+//! 用户库落盘到 LBA128 起的 8 个扇区（经 userlib block_read/write
+//! 系统调用 → 内核 virtio-blk）。无盘环境（ISO 直启、未挂 disk.img）
+//! 下读写失败均优雅降级：内存态继续服务，控制台如实告警。
 #![no_std]
 
 use core::cmp::min;
+use core::slice;
 
 use heapless::{String, Vec};
-use log::{info, warn};
 use spin::Mutex;
 use userlib;
-use zero_abi::boot::{RootFsEntry, RootFsImage};
+use zero_abi::bootfs::UserBootFile;
 use zero_abi::channels;
 use zero_abi::ipc::Message;
 use zero_abi::protocol::security;
@@ -94,13 +114,17 @@ impl UserStore {
 
 static USERS: Mutex<UserStore> = Mutex::new(UserStore::new());
 
-extern "C" {
-    static __zero_rootfs_image: RootFsImage;
+/// 控制台横幅/告警（log crate 无 logger 后端时是静默 no-op，
+/// 生命周期关键行必须走 console_write 才能上串口）。
+fn println(text: &str) {
+    let _ = userlib::console_write(text.as_bytes());
+    let _ = userlib::console_write(b"\r\n");
 }
 
-pub extern "C" fn server_main() -> ! {
-    init_user_store();
-    info!("securityd ready for authentication and policy enforcement");
+pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
+    init_user_store(bootfs_ptr, bootfs_len);
+    println("Zero OS securityd (EL0 service) online");
+    println("  channel req=0x230 resp=0x231; auth/userdb ready");
     loop {
         let mut message = Message::empty();
         match userlib::ipc_receive(channels::SECURITY_USER_REQ, &mut message) {
@@ -113,16 +137,17 @@ pub extern "C" fn server_main() -> ! {
     }
 }
 
-fn init_user_store() {
+fn init_user_store(bootfs_ptr: u64, bootfs_len: u64) {
     if load_persisted_records() {
-        info!("securityd: restored users from persistent store");
+        println("securityd: restored users from persistent store");
         return;
     }
-    if load_rootfs_defaults() {
-        info!("securityd: loaded default users");
+    if load_rootfs_defaults(bootfs_ptr, bootfs_len) {
+        println("securityd: loaded default users from /etc/users");
+        // 把默认用户写进持久层；无盘环境下失败仅告警，不影响在线。
         persist_users();
     } else {
-        warn!("securityd: user database empty; provisioning required");
+        println("securityd: warning: user database empty; provisioning required");
     }
 }
 
@@ -139,18 +164,27 @@ fn load_persisted_records() -> bool {
     apply_user_blob(blob)
 }
 
-fn load_rootfs_defaults() -> bool {
-    unsafe {
-        let image = &__zero_rootfs_image;
-        let Some(entries) = rootfs_entries(image) else {
-            return false;
+/// 从本进程 bootfs 文件表读取 `/etc/users` 默认用户库。
+///
+/// 表布局见 `zero_abi::bootfs::UserBootFile`：路径与内容都给出物理/
+/// 虚拟两套地址，用户态一律使用已映射的 `*_ptr` 系列。
+fn load_rootfs_defaults(bootfs_ptr: u64, bootfs_len: u64) -> bool {
+    if bootfs_ptr == 0 || bootfs_len == 0 {
+        return false;
+    }
+    let entries =
+        unsafe { slice::from_raw_parts(bootfs_ptr as *const UserBootFile, bootfs_len as usize) };
+    for entry in entries {
+        let path_bytes =
+            unsafe { slice::from_raw_parts(entry.path_ptr as *const u8, entry.path_len as usize) };
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            continue;
         };
-        for entry in entries {
-            let path = entry.path();
-            if path == "/etc/users" {
-                let data = entry.data();
-                return apply_user_blob(data);
-            }
+        if path == "/etc/users" {
+            let data = unsafe {
+                slice::from_raw_parts(entry.data_ptr as *const u8, entry.data_len as usize)
+            };
+            return apply_user_blob(data);
         }
     }
     false
@@ -348,8 +382,8 @@ fn parse_fields(payload: &[u8]) -> Vec<&str, 4> {
 
 fn persist_users() {
     let store = USERS.lock();
-    if let Err(_) = write_user_blob(&store.records) {
-        warn!("securityd: failed to persist user database");
+    if write_user_blob(&store.records).is_err() {
+        println("securityd: warning: failed to persist user database (no blk device?)");
     }
 }
 
@@ -372,12 +406,4 @@ fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<(), ()> {
         offset += bytes.len();
     }
     userlib::block_write(USERDB_LBA, &buffer).map_err(|_| ())
-}
-
-unsafe fn rootfs_entries(image: &RootFsImage) -> Option<&'static [RootFsEntry]> {
-    if image.entry_count == 0 {
-        None
-    } else {
-        Some(image.as_slice())
-    }
 }

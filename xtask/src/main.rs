@@ -55,10 +55,17 @@ fn main() -> Result<()> {
         Commands::BuildImage => build_image(&sh)?,
         Commands::BuildRootfs => build_rootfs(&sh)?,
         Commands::BuildIso => {
+            // 先把用户态裸机 blob（zero-securityd 等）编到最新，随后的
+            // sync_userland_blobs（build-rootfs 内）才会把新产物嵌入内核。
+            build_baremetal_blobs(&sh)?;
             image::build_full_image(&sh)?;
         }
         Commands::Run { mode } => run(&sh, &mode)?,
-        Commands::TestBoot { expect_shell } => test_boot(&sh, expect_shell)?,
+        Commands::TestBoot { expect_shell } => {
+            // 与 BuildIso 同理：先刷新裸机 blob 再走全链冒烟。
+            build_baremetal_blobs(&sh)?;
+            test_boot(&sh, expect_shell)?;
+        }
         Commands::Purge => purge(&sh)?,
     }
     Ok(())
@@ -118,12 +125,26 @@ fn build_kernel_bare(sh: &Shell) -> Result<()> {
     Ok(())
 }
 
+/// 构建进 rootfs 的用户态裸机 blob（与 build_servers 的裸机部分一致）。
+///
+/// build-iso/test-boot 入口先跑这里：sync_userland_blobs 只搬运已构建
+/// 产物，缺了这步会用仓库里的陈旧 blob（或缺失时回退旧文件），源码
+/// 改动就会"神秘失效"。
+fn build_baremetal_blobs(sh: &Shell) -> Result<()> {
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
+    Ok(())
+}
+
 fn build_servers(sh: &Shell) -> Result<()> {
     // 这些是正常 host 目标，照常用默认 target 编
     cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
 
     // zero-launchd 只编 aarch64-unknown-none 的裸机版本
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
+
+    // zero-securityd 同样只编裸机版本（rootfs 运行物；host 版仅作分析副本）
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
 
     // 一致性核对：
     //   A. ISO 的 userland/ 目录（image.rs）收集的是 target/debug 下的 HOST 版
@@ -156,6 +177,11 @@ fn sync_userland_blobs(sh: &Shell, warn_missing: bool) -> Result<()> {
             "target/aarch64-unknown-none/release/zero-launchd",
             "kernel/rootfs/System/Core/zero-launchd",
             "launchd 服务器",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-securityd",
+            "kernel/rootfs/System/Core/zero-securityd",
+            "securityd 服务器",
         ),
     ];
     for (src_rel, dst_rel, what) in blobs {
