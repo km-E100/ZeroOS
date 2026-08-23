@@ -44,6 +44,11 @@ pub enum IpcError {
     Invalid,
     Empty,
     AccessDenied,
+    /// 通道组策略拒绝（第十三刀）：通道 tx_groups/rx_groups 掩码非 0
+    /// 而调用方有效能力位图与之无交集——与 owner 不符的
+    /// [`IpcError::AccessDenied`] 区分开，主机测试可精确断言两条
+    /// 拒绝路径；对用户态统一映射 PermissionDenied。
+    PolicyDenied,
 }
 
 struct ChannelTable {
@@ -79,6 +84,8 @@ impl ChannelTable {
     /// 发送。成功时返回该通道上**待唤醒的接收者**（如有）——调用方
     /// 必须在释放 CHANNEL_TABLE 锁之后调用 scheduler::wake（锁序：
     /// 通道表 → 就绪队列，绝不反向，也不得持锁进调度器）。
+    ///
+    /// 访问控制两道闸（第十三刀起）：owner 匹配 + tx 组策略。
     fn send(&mut self, caller: ProcessId, chan: u32, msg: Message) -> Result<Option<ProcessId>, IpcError> {
         let channel = self
             .channels
@@ -86,10 +93,12 @@ impl ChannelTable {
             .find(|c| c.in_use && c.id == chan)
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
+        channel.ensure_groups(channel.tx_groups, caller)?;
         channel.queue.push(msg, channel.capacity)?;
         Ok(channel.pop_waiter())
     }
 
+    /// 接收。owner 匹配 + rx 组策略。
     fn receive(&mut self, caller: ProcessId, chan: u32) -> Result<Message, IpcError> {
         let channel = self
             .channels
@@ -97,11 +106,13 @@ impl ChannelTable {
             .find(|c| c.in_use && c.id == chan)
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
+        channel.ensure_groups(channel.rx_groups, caller)?;
         channel.queue.pop()
     }
 
     /// 登记接收等待者（阻塞式接收的挂起点）。容量 4：超出返回 Busy，
     /// 调用方应退化为轮询（与 Mach msg-wait 上限语义同型）。
+    /// 等待即未来接收 ⇒ 同样受 rx 组策略约束（不能绕过掩码占坑）。
     fn register_waiter(&mut self, caller: ProcessId, chan: u32) -> Result<(), IpcError> {
         let channel = self
             .channels
@@ -109,6 +120,7 @@ impl ChannelTable {
             .find(|c| c.in_use && c.id == chan)
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
+        channel.ensure_groups(channel.rx_groups, caller)?;
         if channel
             .waiters
             .iter()
@@ -147,6 +159,10 @@ struct Channel {
     id: u32,
     capacity: usize,
     owner: Option<ProcessId>,
+    /// 发送许可位图（第十三刀；0 = 全通，向后兼容缺省）。
+    tx_groups: u32,
+    /// 接收许可位图（第十三刀；0 = 全通）。
+    rx_groups: u32,
     queue: MessageQueue,
     /// 阻塞接收的等待者队列（send 成功后逐一唤醒）。
     waiters: [Option<ProcessId>; WAITERS_PER_CHANNEL],
@@ -159,6 +175,8 @@ impl Channel {
             id: 0,
             capacity: 0,
             owner: None,
+            tx_groups: 0,
+            rx_groups: 0,
             queue: MessageQueue::new(),
             waiters: [None; WAITERS_PER_CHANNEL],
         }
@@ -169,6 +187,8 @@ impl Channel {
         self.id = 0;
         self.capacity = 0;
         self.owner = None;
+        self.tx_groups = 0;
+        self.rx_groups = 0;
         self.queue.reset();
         self.waiters = [None; WAITERS_PER_CHANNEL];
     }
@@ -178,6 +198,8 @@ impl Channel {
         self.id = desc.id;
         self.capacity = usize::min(desc.capacity as usize, MAX_QUEUE).max(1);
         self.owner = owner;
+        self.tx_groups = desc.tx_groups;
+        self.rx_groups = desc.rx_groups;
         self.queue.reset();
         self.waiters = [None; WAITERS_PER_CHANNEL];
     }
@@ -200,6 +222,23 @@ impl Channel {
         }
         Ok(())
     }
+
+    /// 组策略判定（第十三刀）：掩码 0 = 全通；非 0 要求调用方有效能力
+    /// （静态位图 ∪ 动态授予，见 security::effective_caps）与掩码有
+    /// 交集——"任一组命中即放行"的或语义，最小授权按需配位。
+    fn ensure_groups(&self, mask: u32, caller: ProcessId) -> Result<(), IpcError> {
+        if group_allows(mask, crate::security::effective_caps(caller)) {
+            Ok(())
+        } else {
+            Err(IpcError::PolicyDenied)
+        }
+    }
+}
+
+/// 组许可纯函数（主机单测钉死允许/拒绝矩阵）：掩码为空放行一切
+/// （向后兼容：引导期预建通道全通）；非空时按位与求交。
+fn group_allows(mask: u32, caller_caps: u32) -> bool {
+    mask == 0 || caller_caps & mask != 0
 }
 
 #[derive(Copy, Clone)]
@@ -317,18 +356,128 @@ mod tests {
     fn channel_capacity_floor() {
         // configure 会把容量夹在 [1, MAX_QUEUE]
         let mut c = Channel::new();
-        c.configure(
-            ChannelDesc { id: 1, capacity: 0 },
-            None,
-        );
+        c.configure(ChannelDesc::open(1, 0), None);
         assert_eq!(c.capacity, 1);
-        c.configure(
-            ChannelDesc {
-                id: 1,
-                capacity: 999,
-            },
-            None,
-        );
+        c.configure(ChannelDesc::open(1, 999), None);
         assert_eq!(c.capacity, MAX_QUEUE);
+    }
+
+    // ══ 第十三刀：RX/TX 组许可（允许/拒绝矩阵）══════════════════
+
+    use zero_abi::cap::{CAP_SECURE_IPC, CAP_SPAWN_SVC};
+
+    /// 有状态用例（CHANNEL_TABLE / security 测试覆盖表是全局的）串行化：
+    /// cargo test 默认多线程并行，不锁必竞态。
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn group_allows_matrix() {
+        // 掩码 0 = 全通（向后兼容不变量的纯函数面）
+        assert!(group_allows(0, 0));
+        assert!(group_allows(0, CAP_SECURE_IPC));
+        // 非空掩码：任一命中位放行
+        assert!(group_allows(CAP_SECURE_IPC, CAP_SECURE_IPC));
+        assert!(group_allows(
+            CAP_SECURE_IPC | CAP_SPAWN_SVC,
+            CAP_SECURE_IPC
+        ));
+        assert!(group_allows(CAP_SECURE_IPC | CAP_SPAWN_SVC, CAP_SPAWN_SVC));
+        // 无交集拒绝
+        assert!(!group_allows(CAP_SECURE_IPC, 0));
+        assert!(!group_allows(CAP_SECURE_IPC, CAP_SPAWN_SVC));
+        assert!(!group_allows(CAP_SPAWN_SVC, CAP_SECURE_IPC));
+    }
+
+    /// 建一条 tx=CAP_SECURE_IPC、rx=CAP_SECURE_IPC 的受保护通道，
+    /// 全通对照通道与 owner 型通道各一。
+    fn setup_protected_channels() {
+        CHANNEL_TABLE.lock().reset();
+        create_channel(ChannelDesc {
+            id: 0x270,
+            capacity: 4,
+            tx_groups: CAP_SECURE_IPC,
+            rx_groups: CAP_SECURE_IPC,
+        })
+        .unwrap();
+        create_channel(ChannelDesc::open(0x271, 4)).unwrap();
+    }
+
+    const ALICE: ProcessId = ProcessId::new(11); // 持组位
+    const BOB: ProcessId = ProcessId::new(12); // 无组位
+    const CH: u32 = 0x270;
+    const OPEN_CH: u32 = 0x271;
+
+    fn set_caps(pid: ProcessId, caps: u32) {
+        crate::security::test_set_caps(pid, caps);
+    }
+
+    #[test]
+    fn protected_channel_tx_deny_without_group() {
+        let _serial = TEST_SERIAL.lock();
+        setup_protected_channels();
+        set_caps(ALICE, CAP_SECURE_IPC);
+        set_caps(BOB, 0);
+        // 允许：持组位发送
+        assert!(send(ALICE, CH, &msg(1)).is_ok());
+        // 拒绝：无组位 → PolicyDenied（与 owner 型 AccessDenied 区分）
+        assert!(matches!(send(BOB, CH, &msg(2)), Err(IpcError::PolicyDenied)));
+        // 对照：全通通道对无任何能力的进程也放行（向后兼容）
+        assert!(send(BOB, OPEN_CH, &msg(3)).is_ok());
+        assert!(receive(BOB, OPEN_CH).is_ok());
+    }
+
+    #[test]
+    fn protected_channel_rx_matrix() {
+        let _serial = TEST_SERIAL.lock();
+        setup_protected_channels();
+        set_caps(ALICE, CAP_SECURE_IPC);
+        set_caps(BOB, 0);
+        send(ALICE, CH, &msg(7)).unwrap();
+        // 无组接收者被拒且消息不被消费
+        assert!(matches!(
+            receive(BOB, CH),
+            Err(IpcError::PolicyDenied)
+        ));
+        // 持组接收者取到消息
+        assert_eq!(receive(ALICE, CH).unwrap().code, 7);
+        // 阻塞等待登记同样受 rx 组约束
+        assert!(register_waiter(ALICE, CH).is_ok());
+        assert!(matches!(
+            register_waiter(BOB, CH),
+            Err(IpcError::PolicyDenied)
+        ));
+    }
+
+    #[test]
+    fn dynamic_grant_flips_denial_to_allow() {
+        let _serial = TEST_SERIAL.lock();
+        setup_protected_channels();
+        set_caps(BOB, 0);
+        assert!(matches!(send(BOB, CH, &msg(1)), Err(IpcError::PolicyDenied)));
+        // securityd 动态签发后（测试直接钉住有效能力，等价于授予生效）
+        set_caps(BOB, CAP_SECURE_IPC);
+        assert!(send(BOB, CH, &msg(2)).is_ok());
+        // revoke 后再拒
+        set_caps(BOB, 0);
+        assert!(matches!(send(BOB, CH, &msg(3)), Err(IpcError::PolicyDenied)));
+    }
+
+    #[test]
+    fn policy_denied_distinct_from_owner_denied() {
+        let _serial = TEST_SERIAL.lock();
+        // owner 型拒绝（create_channel_for 指定属主）保持 AccessDenied；
+        // 组策略拒绝是 PolicyDenied——两条路径可精确区分。
+        CHANNEL_TABLE.lock().reset();
+        create_channel_for(
+            ALICE,
+            ChannelDesc::open(0x272, 4),
+        )
+        .unwrap();
+        set_caps(BOB, CAP_SECURE_IPC);
+        // BOB 虽有组位，但不是通道属主 → owner 闸先拦
+        assert!(matches!(
+            send(BOB, 0x272, &msg(1)),
+            Err(IpcError::AccessDenied)
+        ));
     }
 }

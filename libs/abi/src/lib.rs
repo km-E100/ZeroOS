@@ -346,7 +346,12 @@ pub type ThreadEntry = extern "C" fn() -> !;
 /// - `0x24x` 段：launchd 命令总线
 /// - `0x25x` 段：文件系统
 /// - `0x26x` 段：块设备
+/// - `0x27x` 段：动态创建的受保护通道（第十三刀起；经号位 42
+///   `CreateChannel` 运行时创建，引导期不预建）
 pub mod channels {
+    /// secdemo 受保护通道（第十三刀）：tx_groups 门控演示用，
+    /// 由 `secdemo` 命令经号位 42 运行时创建，重复创建返回已存在。
+    pub const SECDEMO_CH: u32 = 0x270;
     /// IPC router 总线：进程间消息汇聚/转发的默认通道。
     pub const IPC_ROUTER_BUS: u32 = 0x220;
     /// 安全服务（securityd）请求通道：客户端发送认证/用户管理命令。
@@ -393,6 +398,298 @@ pub mod protocol {
         pub const CMD_USER_DELETE: u32 = 0x13;
         /// 校验凭据（payload：`name\0password\0`；响应 code==0 表示通过）。
         pub const CMD_USER_VERIFY: u32 = 0x14;
+
+        // ── 第十三刀：capability 动态签发 / 撤销协议 ────────────────
+        //
+        // 全部走 SECURITY_USER_REQ(0x230) → SECURITY_USER_RESP(0x231)，
+        // payload 为十进制文本字段、`\0` 分隔（对齐既有 userdb 协议
+        // 风格；编解码收敛在下方 encode_/parse_ 纯函数，两侧共用杜绝
+        // 漂移）。通用响应约定：code==0 成功、非 0 失败。
+
+        /// 动态签发能力令牌（payload 见 [`encode_cap_issue`]；
+        /// 成功响应 payload：`token\0` 十进制）。安全策略由 securityd
+        /// 自行裁决（当前参考实现按请求放行并披露）；内核侧由号位 40
+        /// CapGrant 落账，签发权 CAP_ISSUER 仅 securityd 静态持有。
+        pub const CMD_CAP_ISSUE: u32 = 0x20;
+        /// 撤销能力令牌（payload：`token\0`；成功 code==0）。
+        pub const CMD_CAP_REVOKE: u32 = 0x21;
+        /// 列出本 securityd 实例的令牌台账（响应 payload：多行文本）。
+        pub const CMD_CAP_LIST: u32 = 0x22;
+        /// 校验令牌在台账中的状态（payload：`token\0`；code==0 有效）。
+        pub const CMD_CAP_VERIFY: u32 = 0x23;
+
+        /// CMD_CAP_ISSUE 请求字段。
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        pub struct CapIssueRequest {
+            /// 目标进程 pid（内核把授予记到该 pid 名下）。
+            ///
+            /// 【信任模型披露】IPC Message 不携带发送者身份，pid 由调用方
+            /// 自报——与既有 userdb/launchd 协议同一信任级别（单机实验
+            /// 内核可接受）；未来引入内核侧消息源戳后收紧。
+            pub target_pid: u64,
+            /// 请求授予的能力位图（[`crate::cap`] 位或组合）。
+            pub caps: u32,
+            /// 有效期（逻辑时钟 tick；每次任意系统调用 +1，见内核
+            /// security 模块文档）。**0 = 不过期**（u64::MAX 封顶）。
+            pub ttl: u64,
+        }
+
+        /// 编码 CMD_CAP_ISSUE 请求：`target_pid\0caps_hex\0ttl\0`。
+        /// payload 必须至少 128 字节（Message.payload 大小）；编码不下
+        /// 返回 false（字段异常超长，调用方报参数错误）。
+        pub fn encode_cap_issue(payload: &mut [u8], req: &CapIssueRequest) -> bool {
+            let mut hex = [0u8; 8];
+            let hex_len = write_u32_hex(&mut hex, req.caps);
+            write_fields(
+                payload,
+                &[
+                    u64_dec(req.target_pid).as_slice(),
+                    &hex[..hex_len],
+                    u64_dec(req.ttl).as_slice(),
+                ],
+            )
+        }
+
+        /// 解析 CMD_CAP_ISSUE 请求（[`encode_cap_issue`] 的逆运算；
+        /// 字段缺失/非数字返回 None）。
+        pub fn parse_cap_issue(payload: &[u8]) -> Option<CapIssueRequest> {
+            let mut fields = Fields3::split(payload);
+            Some(CapIssueRequest {
+                target_pid: fields.next_u64()?,
+                caps: fields.next_hex_u32()?,
+                ttl: fields.next_u64()?,
+            })
+        }
+
+        /// 把令牌编号编码为响应 payload：`token\0`（十进制）。
+        pub fn encode_token(payload: &mut [u8], token: u64) -> bool {
+            write_fields(payload, &[u64_dec(token).as_slice()])
+        }
+
+        /// 解析令牌编号 payload（请求与响应通用）。
+        pub fn parse_token(payload: &[u8]) -> Option<u64> {
+            let mut fields = Fields3::split(payload);
+            fields.next_u64()
+        }
+
+        // ── 文本字段编解码内部件（主机单测钉死格式） ────────────────
+
+        /// u32 小写十六进制（无前导零，全零写 "0"）。返回写入长度。
+        fn write_u32_hex(buf: &mut [u8; 8], value: u32) -> usize {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            if value == 0 {
+                buf[0] = b'0';
+                return 1;
+            }
+            let mut tmp = [0u8; 8];
+            let mut len = 0;
+            let mut v = value;
+            while v > 0 {
+                tmp[len] = HEX[(v & 0xf) as usize];
+                len += 1;
+                v >>= 4;
+            }
+            buf[..len].copy_from_slice(&tmp[..len]);
+            buf[..len].reverse();
+            len
+        }
+
+        /// 栈上十进制缓冲（u64 最大 20 位）。
+        struct DecBuf {
+            buf: [u8; 20],
+            len: usize,
+        }
+
+        impl DecBuf {
+            fn as_slice(&self) -> &[u8] {
+                &self.buf[..self.len]
+            }
+        }
+
+        fn u64_dec(value: u64) -> DecBuf {
+            let mut buf = [0u8; 20];
+            let mut v = value;
+            let mut len = 0;
+            loop {
+                buf[len] = b'0' + (v % 10) as u8;
+                len += 1;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            buf[..len].reverse();
+            DecBuf { buf, len }
+        }
+
+        /// 以 `\0` 连接字段写入 payload（尾部补 `\0` 收尾；越界返回 false，
+        /// payload 保持原样不写半截）。
+        fn write_fields(payload: &mut [u8], fields: &[&[u8]]) -> bool {
+            let mut total = 0usize;
+            for f in fields {
+                total += f.len() + 1;
+            }
+            if total > payload.len() {
+                return false;
+            }
+            let mut off = 0usize;
+            for f in fields {
+                payload[off..off + f.len()].copy_from_slice(f);
+                off += f.len();
+                payload[off] = 0;
+                off += 1;
+            }
+            true
+        }
+
+        /// `\0` 分隔字段游标解析器（最多取 [`FIELDS_MAX`] 个字段）。
+        struct Fields3<'a> {
+            rest: &'a [u8],
+            taken: usize,
+        }
+
+        const FIELDS_MAX: usize = 8;
+
+        impl<'a> Fields3<'a> {
+            fn split(payload: &'a [u8]) -> Self {
+                Self {
+                    rest: payload,
+                    taken: 0,
+                }
+            }
+
+            fn next_raw(&mut self) -> Option<&'a [u8]> {
+                if self.taken >= FIELDS_MAX || self.rest.is_empty() {
+                    return None;
+                }
+                let end = self
+                    .rest
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(self.rest.len());
+                let field = &self.rest[..end];
+                self.rest = if end < self.rest.len() {
+                    &self.rest[end + 1..]
+                } else {
+                    &self.rest[end..]
+                };
+                self.taken += 1;
+                if field.is_empty() {
+                    return None;
+                }
+                Some(field)
+            }
+
+            fn next_u64(&mut self) -> Option<u64> {
+                let text = self.next_raw()?;
+                let mut value: u64 = 0;
+                for &b in text {
+                    if !b.is_ascii_digit() {
+                        return None;
+                    }
+                    value = value.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+                }
+                Some(value)
+            }
+
+            fn next_hex_u32(&mut self) -> Option<u32> {
+                let text = self.next_raw()?;
+                if text.is_empty() || text.len() > 8 {
+                    return None;
+                }
+                let mut value: u32 = 0;
+                for &b in text {
+                    let d = match b {
+                        b'0'..=b'9' => (b - b'0') as u32,
+                        b'a'..=b'f' => (b - b'a') as u32 + 10,
+                        _ => return None,
+                    };
+                    value = value.checked_mul(16)?.checked_add(d)?;
+                }
+                Some(value)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// 测试辅助：取第一个 `\0` 前的字段文本（断言可读性用）。
+            fn first_field(payload: &[u8]) -> &str {
+                let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                core::str::from_utf8(&payload[..end]).unwrap_or("?")
+            }
+
+            #[test]
+            fn cap_issue_roundtrip() {
+                let mut payload = [0u8; 128];
+                let req = CapIssueRequest {
+                    target_pid: 42,
+                    caps: 0x50,
+                    ttl: 1_000_000,
+                };
+                assert!(encode_cap_issue(&mut payload, &req));
+                // 布局钉死：pid 十进制、caps 十六进制、ttl 十进制，`\0` 分隔收尾
+                assert_eq!(&payload[..14], b"42\050\01000000\0");
+                assert_eq!(parse_cap_issue(&payload), Some(req));
+            }
+
+            #[test]
+            fn cap_issue_zero_values_and_huge_ttl() {
+                let mut payload = [0u8; 128];
+                let req = CapIssueRequest {
+                    target_pid: 0,
+                    caps: 0,
+                    ttl: 0,
+                };
+                assert!(encode_cap_issue(&mut payload, &req));
+                assert_eq!(parse_cap_issue(&payload), Some(req));
+                let big = CapIssueRequest {
+                    target_pid: u64::MAX,
+                    caps: u32::MAX,
+                    ttl: u64::MAX,
+                };
+                assert!(encode_cap_issue(&mut payload, &big));
+                assert_eq!(parse_cap_issue(&payload), Some(big));
+            }
+
+            #[test]
+            fn cap_issue_garbage_rejected() {
+                assert_eq!(
+                    parse_cap_issue(b"12\x00zz\x00100\x00"),
+                    None,
+                    "caps 字段非十六进制必须拒绝"
+                );
+                assert_eq!(parse_cap_issue(b"\x00\x00"), None, "空字段拒绝");
+                assert_eq!(parse_cap_issue(&[]), None);
+                // 负数字符混入十进制字段同样拒绝
+                assert_eq!(parse_cap_issue(b"-5\x007\x007\x00"), None);
+            }
+
+            #[test]
+            fn token_roundtrip_and_layout() {
+                let mut payload = [0u8; 128];
+                assert!(encode_token(&mut payload, 7));
+                // 布局钉死：`token\0`，尾部保持零
+                assert_eq!(&payload[..2], b"7\0");
+                assert_eq!(payload[3], 0);
+                assert_eq!(parse_token(&payload), Some(7));
+                assert_eq!(parse_token(&[0u8; 128]), None);
+                assert_eq!(parse_token(b"99x\x00"), None);
+            }
+
+            #[test]
+            fn encode_overflow_keeps_payload_intact() {
+                // 128 字节 payload 装不下四个 41 字节字段：拒绝且不写半截
+                let mut payload = [0xEEu8; 128];
+                let ok = write_fields(
+                    &mut payload,
+                    &[&[b'9'; 40], &[b'9'; 40], &[b'9'; 40], &[b'9'; 40]],
+                );
+                assert!(!ok);
+                assert!(payload.iter().all(|&b| b == 0xEE));
+            }
+        }
     }
 
     /// launchd（系统初始化守护）命令码。
@@ -589,7 +886,25 @@ pub mod cap {
     pub const CAP_BLOCK_DEV: u32 = 1 << 1;
     /// 按名启动内核登记的服务（号位 20 SpawnService）。
     pub const CAP_SPAWN_SVC: u32 = 1 << 2;
+    /// 创建受保护通道（号位 42 CreateChannel 且 desc 带 tx/rx_groups
+    /// 掩码时门控；第十三刀）。全通通道（掩码全 0）无需本位。
+    pub const CAP_CHANNEL_CREATE: u32 = 1 << 3;
+    /// 受保护通道收发组（第十三刀）：通道 tx_groups/rx_groups 掩码的
+    /// 示范组位——持有即落入该通道的许可集合。
+    pub const CAP_SECURE_IPC: u32 = 1 << 4;
+    /// 能力签发权（第十三刀）：号位 40 CapGrant / 41 CapRevoke 仅限
+    /// 本位持有者（当前仅 securityd 引导期静态持有）。**不可经
+    /// CapGrant 转授**（签发权扩散等于策略失效），内核侧强制拒绝。
+    pub const CAP_ISSUER: u32 = 1 << 5;
+    /// 登录会话准入（第十三刀）：securityd 校验凭据后签发的一次性
+    /// 令牌位；目标进程持含本位的有效令牌调号位 43 SessionBegin
+    /// 建立会话，令牌随即消费（防重放）。
+    pub const CAP_SESSION: u32 = 1 << 6;
     /// 全部已定义能力的组合（引导期 privileged 服务的缺省位图）。
+    ///
+    /// 【第十三刀边界】动态管理位（CHANNEL_CREATE/SECURE_IPC/ISSUER/
+    /// SESSION）**不并入 CAP_ALL**：引导期布尔映射不应静默携带签发权
+    /// 或会话准入，这些能力只能显式授予或动态签发，保持最小授权。
     pub const CAP_ALL: u32 = CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC;
 
     #[cfg(test)]
@@ -598,15 +913,33 @@ pub mod cap {
 
         #[test]
         fn bits_are_distinct_and_all_composes() {
-            // 位值即 ABI 契约：bit0/bit1/bit2，冻结后只能追加不能改义。
-            assert_eq!(CAP_MMIO, 0b0001);
-            assert_eq!(CAP_BLOCK_DEV, 0b0010);
-            assert_eq!(CAP_SPAWN_SVC, 0b0100);
+            // 位值即 ABI 契约：bit0..bit2 冻结（第八刀），bit3..bit6
+            // 第十三刀追加；冻结后只能追加不能改义。
+            assert_eq!(CAP_MMIO, 0b0000_0001);
+            assert_eq!(CAP_BLOCK_DEV, 0b0000_0010);
+            assert_eq!(CAP_SPAWN_SVC, 0b0000_0100);
+            assert_eq!(CAP_CHANNEL_CREATE, 0b0000_1000);
+            assert_eq!(CAP_SECURE_IPC, 0b0001_0000);
+            assert_eq!(CAP_ISSUER, 0b0010_0000);
+            assert_eq!(CAP_SESSION, 0b0100_0000);
             assert_eq!(CAP_ALL, 0b0111);
             // 两两不相交：任何能力都不能被其余能力组合伪造出来。
-            assert_eq!(CAP_MMIO & CAP_BLOCK_DEV, 0);
-            assert_eq!(CAP_MMIO & CAP_SPAWN_SVC, 0);
-            assert_eq!(CAP_BLOCK_DEV & CAP_SPAWN_SVC, 0);
+            let all = [
+                CAP_MMIO,
+                CAP_BLOCK_DEV,
+                CAP_SPAWN_SVC,
+                CAP_CHANNEL_CREATE,
+                CAP_SECURE_IPC,
+                CAP_ISSUER,
+                CAP_SESSION,
+            ];
+            for (i, a) in all.iter().enumerate() {
+                for (j, b) in all.iter().enumerate() {
+                    if i != j {
+                        assert_eq!(a & b, 0, "bits {i} and {j} overlap");
+                    }
+                }
+            }
             assert_eq!(CAP_ALL & !(CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC), 0);
         }
     }
@@ -623,14 +956,40 @@ pub mod cap {
 /// 拷贝 132 字节，不解释内容 —— 语义完全由收发双方按 [`protocol`]
 /// 对齐。
 pub mod ipc {
-    /// 通道描述符：内核 `services::init_channels` 建通道时传入。
+    /// 通道描述符（内核建通道时传入；号位 42 `CreateChannel` 运行时
+    /// 建通道复用同一布局）。
+    ///
+    /// 【第十三刀扩展】尾部追加 `tx_groups` / `rx_groups` 许可位图：
+    /// **0 = 不限（全通）**——既有构造方不写新字段即等价旧语义，
+    /// 引导期全部预建通道保持全通，向后兼容成立。非 0 时收发按
+    /// 调用方能力位图（[`crate::cap`]）与掩码求交判定，越权返回
+    /// `IpcError::PolicyDenied`（内核侧映射 PermissionDenied）。
     #[repr(C)]
     #[derive(Copy, Clone)]
     pub struct ChannelDesc {
-        /// 通道 ID（见 [`crate::channels`] 冻结值）。
+        /// 通道 ID（见 [`crate::channels`] 冻结值；0x270 段为运行时动态段）。
         pub id: u32,
         /// 通道队列容量（条消息；内核上限 16，超出按 16 计）。
         pub capacity: u32,
+        /// 发送许可位图（第十三刀）：0=全通；非 0 要求发送方能力位图
+        /// 与本掩码**有交集**（任一位置位即可，最小授权取"或"语义）。
+        pub tx_groups: u32,
+        /// 接收许可位图（第十三刀）：语义同 [`ChannelDesc::tx_groups`]，
+        /// 约束 receive 与阻塞等待登记。
+        pub rx_groups: u32,
+    }
+
+    impl ChannelDesc {
+        /// 全通描述符（历史两字段语义的规范构造器）：引导期预建
+        /// 通道一律经此入口，保证"默认全通"的向后兼容不变量。
+        pub const fn open(id: u32, capacity: u32) -> Self {
+            Self {
+                id,
+                capacity,
+                tx_groups: 0,
+                rx_groups: 0,
+            }
+        }
     }
 
     /// 单条 IPC 消息（132 字节；见模块文档的布局说明）。
@@ -875,6 +1234,77 @@ pub mod syscall {
         Sleepticks {
             /// 睡眠时长（timer tick 数）。
             ticks: u64,
+        },
+        // ═══ 第十三刀（安全模型成型）号位 40-45 ═════════════════════
+        // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展从 40 起。
+        // 内核侧落点：trap.rs::decode_syscall + syscalls::handle +
+        // security 模块（GrantBook 台账）；文档登记见
+        // docs/abi_syscall_reference.md。
+
+        /// (40) 动态签发能力授予：`x1`=目标 pid，`x2`=能力位图
+        /// （[`crate::cap`] 位或），`x3`=有效期 TTL（逻辑 tick，见下；
+        /// 0 = 不过期）。**仅 [`crate::cap::CAP_ISSUER`] 持有者可调**
+        /// （当前仅 securityd 引导期静态持有；其余一律 PermissionDenied）。
+        ///
+        /// 语义：内核记一条 Grant{token, pid, caps, expires_at,
+        /// session}，token 为内核单调分配的 u64 编号。生效规则是**活算**
+        /// （live evaluation）：目标的"有效能力"= 静态位图 ∪ Σ{有效
+        /// 授予的 caps}——授予/撤销/过期都不改写进程表，撤销即时生效、
+        /// fork 不继承动态授予（子 pid 名下无台账）。约束：
+        /// - caps 含 [`crate::cap::CAP_ISSUER`] → InvalidArgument
+        ///   （签发权不可转授）；
+        /// - caps == 0 → InvalidArgument；
+        /// - 目标 pid 无进程记录仍可签发（先签后 spawn 的编排自由度），
+        ///   但目标消亡时授予随之清除。
+        ///
+        /// 成功返回 token（u64）。TTL 单位为**逻辑时钟 tick**：单核实验
+        /// 内核无墙钟，以全局逻辑时钟近似单调时间——每次任意系统调用
+        /// 步进 1（内核 security 模块维护），过期惰性判定（被查询时才
+        /// 失效，不占中断预算）。
+        CapGrant {
+            target_pid: u64,
+        },
+        /// (41) 撤销能力授予：`x1`=token。仅 CAP_ISSUER 持有者可调。
+        /// 撤销即时生效（活算模型无需回写目标位图）；未知/已撤销的
+        /// token 返回 NotFound（幂等安全的重复撤销报错不静默）。
+        CapRevoke {
+            /// 内核在号位 40 返回的令牌编号。
+            token: u64,
+        },
+        /// (42) 创建 IPC 通道：`x1`=&ChannelDesc（用户指针，长度必须
+        /// 等于 sizeof(ChannelDesc)=16）。通道 id 冲突返回
+        /// ChannelUnavailable（对照既有 create 语义的对外映射）；表满
+        /// 返回 NoMemory。
+        ///
+        /// 门控（第十三刀）：desc 的 tx_groups/rx_groups 任一非 0
+        /// （即创建**受保护通道**）要求调用方持有效
+        /// [`crate::cap::CAP_CHANNEL_CREATE`]（含动态授予），否则
+        /// PermissionDenied。全通通道（掩码全 0）无门控——与引导期
+        /// 预建通道同一信任级别。
+        CreateChannel {
+            user_desc: usize,
+        },
+        /// (43) 建立登录会话：`x1`=登录令牌 token。令牌必须是本进程
+        /// 名下、未消费、未过期且含 [`crate::cap::CAP_SESSION`] 的授予
+        /// （由 securityd 校验凭据后经号位 40 签发）；校验通过即**一次性
+        /// 消费**该令牌并完成：
+        /// - 分配新 session id（≥1；0 保留为"无会话"）；
+        /// - 调用方会话字段置为新 sid；fork 子进程继承、exec 保持；
+        /// - 若调用方此前已领有会话（su 场景）：旧会话整体注销——其名下
+        ///   全部成员进程的会话清零、绑定旧会话的授予全部失效（跨会话
+        ///   重放防线）。
+        /// 令牌无效/不属于本进程/已过期 → PermissionDenied 或 NotFound。
+        SessionBegin {
+            login_token: u64,
+        },
+        /// (44) 查询当前进程会话 id。返回值即 sid（无会话返回 0）。
+        GetSession,
+        /// (45) 列出全部存活会话：`x1`=&buf，`x2`=len。内核把文本行集
+        /// `sid=N leader=P\n` 写入用户缓冲区（截断到 len），返回实际
+        /// 写入字节数。供 shell `sessions` 命令使用。
+        SessionList {
+            user_buffer: usize,
+            len: usize,
         },
     }
 

@@ -31,6 +31,22 @@
 | 19 | MmioUnmap | index, -, -, - | 0 | | ✔特权 |
 | 20 | SpawnService | name_ptr, len, -, - | 新 PID | 内核注册表查找 | ✔特权 |
 | 21 | GetPid | -,-,-,- | PID | 已实机验证 | - |
+| 22 | WaitPid | pid, -, flags(x3), - | (pid<<32)\|code | 空队列挂起/收尸唤醒；WNOHANG 轮询回 0 | - |
+| 23 | GetPpid | -,-,-,- | PPID（孤儿=收养者 2 / 根=0） | 已实机验证 | - |
+| 24 | Brk | new_break(0=查询), -, -, - | 生效后 break | 页粒度增长/收缩；上限 64MiB | - |
+| 40 | CapGrant | target_pid, caps, ttl, - | token | 动态签发能力授予（TTL=逻辑 tick，0=不过期）；仅 CAP_ISSUER 持有者；caps 含 CAP_ISSUER 拒绝 | ✔CAP_ISSUER |
+| 41 | CapRevoke | token, -, -, - | 0 | 撤销即时生效（活算模型）；未知 token → NotFound | ✔CAP_ISSUER |
+| 42 | CreateChannel | &ChannelDesc(16B), -, -, - | 0 | desc.tx/rx_groups 非 0（受保护通道）需 CAP_CHANNEL_CREATE；id 冲突 → ChannelUnavailable | 受保护创建需能力 |
+| 43 | SessionBegin | login_token, -, -, - | 新 sid | 一次性消费本进程名下含 CAP_SESSION 的令牌建会话；su 换会话注销旧会话 | 令牌即授权 |
+| 44 | GetSession | -,-,-,- | sid（无会话=0） | - | - |
+| 45 | SessionList | &buf, len, -, - | 写入字节数 | 行集 `sid=N leader=P\n` 截断到 len | - |
+
+### 第十三刀补充说明（号位 40-45）
+
+- **逻辑时钟**：单核实验内核无墙钟，CapGrant 的 TTL 以全局逻辑时钟计——每次任意系统调用步进 1（`security::advance_clock`）；过期惰性判定。
+- **活算模型**：授予/撤销不改写进程表静态位图；有效能力 = 静态位图 ∪ Σ有效授予，门控时现算（SpawnService/CreateChannel/IPC 组校验统一走 `security::effective_caps`）。fork 不继承动态授予（子 pid 名下无台账）。
+- **会话绑定**：授予签发时记目标当前会话；会话注销（su 换会话 / 会话领袖消亡）时绑定该会话的授予一并失效——跨会话重放防线。session=0 视为未绑定。
+- **号位占用披露**：25=Sleep、26+=文件系统由并行刀预留，安全扩展自 40 起。
 
 ## 错误码（k = u64::MAX - x0）
 

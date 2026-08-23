@@ -22,15 +22,20 @@
 
 use core::panic::PanicInfo;
 use userlib::{
-    cause_segv, console_read, console_write, encode_message, exec, exit, extract_payload_text,
-    wait_pid, wait_pid_flags, WAIT_NOHANG,
+    cause_segv, console_read, console_write, create_channel, encode_message,
+    exec, exit, extract_payload_text, get_session, session_begin, session_list, wait_pid,
+    wait_pid_flags, WAIT_NOHANG,
 };
-use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP};
-use zero_abi::ipc::Message;
+use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP, SECURITY_USER_REQ, SECURITY_USER_RESP};
+use zero_abi::ipc::{ChannelDesc, Message};
 use zero_abi::protocol::fs as fs_proto;
 use zero_abi::protocol::fs::vtable as fs_vt;
 use zero_abi::protocol::launchd::{CMD_LIST_SERVICES, CMD_RESTART_SERVICE, CMD_STATUS};
+use zero_abi::protocol::security::{
+    self as sec_proto, parse_token, CapIssueRequest,
+};
 use zero_abi::syscall::SysError;
+use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_SECURE_IPC, CAP_SESSION};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -87,6 +92,13 @@ static mut HIST_LEN: [usize; 8] = [0; 8];
 static mut HIST_HEAD: usize = 0;
 static mut HIST_TOTAL: usize = 0;
 
+/// 登录会话状态（第十三刀）：`login`/`su` 成功后记录当前用户名与会话 id。
+/// 会话 id 的权威在内核（security 台账），这里只是 whoami 显示用的缓存。
+/// 单核 shell 独占执行，静态可变安全；fork 子进程继承副本（POSIX 语义）。
+static mut SESSION_USER: [u8; 16] = [0; 16];
+static mut SESSION_USER_LEN: usize = 0;
+static mut SESSION_ID: u64 = 0;
+
 /// 主循环：回显键盘输入，支持内建命令。
 pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
     println("\r\nZero OS console (user shell)");
@@ -118,11 +130,10 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  memory:  brktest");
             println("  storage: fstest/fsdemo/blktest");
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
+            println("  security: login/su/whoami/sessions/secdemo");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
-        } else if cmd == b"whoami" {
-            println("console");
         } else if cmd == b"pid" {
             match userlib::getpid() {
                 Ok(p) => {
@@ -598,6 +609,19 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println(" x3=0x0");
         } else if cmd == b"launchd" || cmd.starts_with(b"launchd ") {
             launchd_command(cmd);
+        } else if cmd == b"login" || cmd == b"su" {
+            // 第十三刀：登录 / 切换会话（命令链末尾追加，最小化并行
+            // 冲突面；help 文案同步补一行）。
+            let mode = if cmd == b"login" { "login" } else { "su" };
+            login_flow(mode);
+        } else if cmd == b"whoami" {
+            whoami_command();
+        } else if cmd == b"sessions" {
+            sessions_command();
+        } else if cmd == b"secdemo" {
+            // 实机验收（第十三刀）：无权 send 被拒 → securityd 签发 cap
+            // → 重发成功 → revoke 再拒 → PASS。
+            secdemo_command();
         } else if cmd.len() > 0 {
             print_bytes(b"unknown command: ");
             println_bytes(cmd);
@@ -1719,4 +1743,380 @@ fn fsdemo_command() {
     }
     println("[9/9] post-rmdir ls: gone");
     println("fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 第十三刀「安全模型成型」：登录会话与 secdemo 实机验收。
+// 全部命令追加在命令链末尾（最小化并行刀冲突面）；协议对齐
+// zero_abi::protocol::security（0x230/0x231 通道，编解码共用 abi 纯函数）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 向 securityd 发一条请求并等待响应（单客户端纪律：请求/响应各占
+/// 一条通道，同一时刻只允许一个客户端在途——与 fstest 的 fs_exchange
+/// 同一约定）。失败返回 None 并打印提示。
+fn sec_exchange(code: u32, payload: &[u8]) -> Option<Message> {
+    let message = encode_message(code, payload);
+    match userlib::ipc_send(SECURITY_USER_REQ, &message) {
+        Ok(_) => {}
+        Err(SysError::ChannelUnavailable) => {
+            println("securityd: request queue full");
+            return None;
+        }
+        Err(_) => {
+            println("securityd: send failed (is securityd online?)");
+            return None;
+        }
+    }
+    loop {
+        let mut response = Message::empty();
+        match userlib::ipc_receive(SECURITY_USER_RESP, &mut response) {
+            Ok(_) => return Some(response),
+            Err(SysError::WouldBlock) => userlib::yield_now(),
+            Err(_) => {
+                println("securityd: receive failed");
+                return None;
+            }
+        }
+    }
+}
+
+/// 读取一行并去掉 CR/LF 尾（复用交互 read_line；密码明文回显——实验
+/// 内核串口单用户场景可接受，与既有 fstest 风格一致）。
+fn read_line_trimmed(buf: &mut [u8]) -> &[u8] {
+    let n = read_line(buf);
+    let mut end = n;
+    while end > 0 && (buf[end - 1] == b'\r' || buf[end - 1] == b'\n') {
+        end -= 1;
+    }
+    &buf[..end]
+}
+
+/// `login` / `su` 共用流程：
+///   ① CMD_USER_VERIFY 校验凭据；
+///   ② CMD_CAP_ISSUE 申请一枚本进程名下的 CAP_SESSION 登录令牌；
+///   ③ 号位 43 SessionBegin 消费令牌建立会话（su 场景旧会话整体注销，
+///     绑定旧会话的能力授予一并失效——跨会话重放防线由内核保证）。
+/// 默认账户见 rootfs /etc/users：root/zero（admin）、guest/guest（user）。
+fn login_flow(mode: &str) {
+    print(mode);
+    print(" username: ");
+    let mut ubuf = [0u8; 64];
+    let user = read_line_trimmed(&mut ubuf);
+    print("password: ");
+    let mut pbuf = [0u8; 64];
+    let password = read_line_trimmed(&mut pbuf);
+
+    // ---- ① 凭据校验 ----
+    let mut payload = [0u8; 128];
+    if user.len() + password.len() + 3 > payload.len() {
+        println("login: credentials too long");
+        return;
+    }
+    payload[..user.len()].copy_from_slice(user);
+    payload[user.len() + 1..user.len() + 1 + password.len()].copy_from_slice(password);
+    let Some(resp) = sec_exchange(sec_proto::CMD_USER_VERIFY, &payload[..user.len() + password.len() + 2]) else {
+        return;
+    };
+    if resp.code != 0 {
+        println("login: invalid credentials");
+        return;
+    }
+
+    // ---- ② 申请登录令牌（CAP_SESSION，一次性消费）----
+    let Ok(my_pid) = userlib::getpid() else {
+        println("login: getpid failed");
+        return;
+    };
+    let req = CapIssueRequest {
+        target_pid: my_pid,
+        caps: CAP_SESSION,
+        ttl: 0, // 不过期：会话生命周期即凭证有效期（su/退出时注销）
+    };
+    let mut issue_buf = [0u8; 128];
+    if !sec_proto::encode_cap_issue(&mut issue_buf, &req) {
+        println("login: encode issue failed");
+        return;
+    }
+    let Some(resp) = sec_exchange(sec_proto::CMD_CAP_ISSUE, &issue_buf) else {
+        return;
+    };
+    if resp.code != 0 {
+        println("login: cap issuance denied by securityd");
+        return;
+    }
+    let Some(token) = parse_token(&resp.payload) else {
+        println("login: malformed token response");
+        return;
+    };
+
+    // ---- ③ 建立会话 ----
+    match session_begin(token) {
+        Ok(sid) => {
+            unsafe {
+                // 容量取常量而非 &STATIC.len()（避免对 mutable static
+                // 建共享引用的新版 lint 告警；HISTORY 旧代码保持原样）。
+                const SESSION_USER_CAP: usize = 16;
+                let n = user.len().min(SESSION_USER_CAP);
+                SESSION_USER[..n].copy_from_slice(&user[..n]);
+                SESSION_USER_LEN = n;
+                SESSION_ID = sid;
+            }
+            print(mode);
+            print(": welcome ");
+            print_bytes(user);
+            print(" (session id=");
+            print_u64(sid);
+            println(")");
+            if mode == "su" {
+                println("su: old session dissolved (its capability grants revoked)");
+            }
+        }
+        Err(e) => {
+            print("login: session_begin failed (");
+            print_hex(e.code());
+            println(")");
+        }
+    }
+}
+
+/// `whoami`：已登录显示用户名，未登录保持历史输出 "console"。
+fn whoami_command() {
+    unsafe {
+        if SESSION_USER_LEN > 0 {
+            println_bytes(&SESSION_USER[..SESSION_USER_LEN]);
+        } else {
+            println("console");
+        }
+    }
+}
+
+/// `sessions`：列出全部存活会话（号位 45 SessionList）。
+fn sessions_command() {
+    let mut buf = [0u8; 512];
+    match session_list(&mut buf) {
+        Ok(n) if n > 0 => {
+            // 行集逐行打印（内核写入的是 \n 分隔文本）
+            let text = extract_payload_text(&buf[..n]);
+            print("sessions:\n");
+            for line in text.split('\n') {
+                if !line.is_empty() {
+                    print("  ");
+                    println(line);
+                }
+            }
+        }
+        Ok(_) => println("sessions: none"),
+        Err(e) => {
+            print("sessions: syscall failed (");
+            print_hex(e.code());
+            println(")");
+        }
+    }
+    // 本进程自己的会话视图（号位 44）
+    match get_session() {
+        Ok(sid) => {
+            print("current session id=");
+            println_u64(sid);
+        }
+        Err(_) => {}
+    }
+}
+
+fn println_u64(v: u64) {
+    print_u64(v);
+    println("");
+}
+
+/// secdemo —— 第十三刀实机验收：受保护通道 RX/TX 组策略 + capability
+/// 动态签发/撤销全生命周期。六步证据链：
+///   [1] 无权创建受保护通道 → PermissionDenied（门控先于一切）
+///   [2] securityd 签发 CAP_CHANNEL_CREATE|CAP_SECURE_IPC（绑定本进程）
+///   [3] 创建受保护通道 SECDEMO_CH(tx=CAP_SECURE_IPC) 成功
+///   fork 子进程（动态授予**不**随 fork 继承 ⇒ 子进程从零能力起步）：
+///   [4] 子无权 send → PolicyDenied(PermissionDenied)
+///   [5] 子向 securityd 申请 CAP_SECURE_IPC → 重发成功
+///       （fork 不继承动态授予、按 pid 授予的最小授权在此得证）
+///   [6] securityd 撤销该授予 → 再发被拒
+/// 三次发送的"拒-许-拒"全部符合预期 → PASS。
+///
+/// 注：步骤 [2][5] 的目标 pid 由调用方自报（Message 无发送者身份，
+/// 信任模型披露见 zero_abi::protocol::security）。
+fn secdemo_command() {
+    const CH: u32 = zero_abi::channels::SECDEMO_CH;
+
+    // ---- [1] 无权创建受保护通道：必须被拒 ----
+    let desc = ChannelDesc {
+        id: CH,
+        capacity: 4,
+        tx_groups: CAP_SECURE_IPC,
+        rx_groups: 0,
+    };
+    print("[1/6] create protected channel WITHOUT cap: ");
+    match create_channel(&desc) {
+        Err(SysError::PermissionDenied) => println("denied as expected"),
+        Err(e) => {
+            print("unexpected error (");
+            print_hex(e.code());
+            println(")");
+            println("secdemo: FAIL at step 1");
+            return;
+        }
+        Ok(()) => {
+            println("allowed (unexpected!)");
+            println("secdemo: FAIL at step 1");
+            return;
+        }
+    }
+
+    // ---- [2] 向 securityd 申请签发 ----
+    let Ok(my_pid) = userlib::getpid() else {
+        println("secdemo: getpid failed");
+        return;
+    };
+    let Some(token) = request_cap(my_pid, CAP_CHANNEL_CREATE | CAP_SECURE_IPC) else {
+        println("secdemo: FAIL at step 2 (issuance)");
+        return;
+    };
+    println("[2/6] securityd issued cap token (create+secure-ipc)");
+
+    // ---- [3] 创建受保护通道：放行 ----
+    print("[3/6] create protected channel WITH cap: ");
+    match create_channel(&desc) {
+        Ok(()) => println("ok"),
+        Err(SysError::ChannelUnavailable) => {
+            // 重复运行 secdemo：通道已在（id 冲突如实回报），继续演示。
+            println("already exists (continuing)");
+        }
+        Err(e) => {
+            print("failed (");
+            print_hex(e.code());
+            println(")");
+            println("secdemo: FAIL at step 3");
+            return;
+        }
+    }
+
+    // ---- [4][5][6] 子进程三连击：拒-许-拒 ----
+    match userlib::fork() {
+        Ok(0) => {
+            // 子进程：动态授予不随 fork 继承 ⇒ 有效能力为空。
+            let mut pass = true;
+
+            print("[C][4/6] child send WITHOUT grant: ");
+            let m = encode_message(0x1, b"probe-1");
+            match userlib::ipc_send(CH, &m) {
+                Err(SysError::PermissionDenied) => println("denied as expected"),
+                _ => {
+                    println("NOT denied (FAIL)");
+                    pass = false;
+                }
+            }
+
+            print("[C][5/6] child requests own grant then sends: ");
+            let child_pid = userlib::getpid().unwrap_or(0);
+            let Some(child_token) = request_cap(child_pid, CAP_SECURE_IPC) else {
+                println("issuance failed (FAIL)");
+                userlib::exit(5);
+            };
+            let m2 = encode_message(0x2, b"probe-2");
+            match userlib::ipc_send(CH, &m2) {
+                Ok(()) => println("accepted"),
+                Err(e) => {
+                    print("send failed (");
+                    print_hex(e.code());
+                    println(") (FAIL)");
+                    pass = false;
+                }
+            }
+
+            print("[C][6/6] after revoke, send again: ");
+            // 撤销必须经签发者（securityd 协议 CMD_CAP_REVOKE）：子进程
+            // 不持 CAP_ISSUER，直接调号位 41 会被内核拒绝——撤销权与
+            // 签发权同源是本协议的刻意设计。
+            if !request_revoke(child_token) {
+                println("revoke via securityd failed (FAIL)");
+                pass = false;
+            }
+            let m3 = encode_message(0x3, b"probe-3");
+            match userlib::ipc_send(CH, &m3) {
+                Err(SysError::PermissionDenied) => println("denied as expected"),
+                _ => {
+                    println("NOT denied (FAIL)");
+                    pass = false;
+                }
+            }
+
+            if pass {
+                println("[C] secdemo: deny-grant-revoke chain PASS");
+                exit(0); // -> ! ：子进程到此终结，绝不回主循环抢终端
+            } else {
+                println("[C] secdemo: FAIL");
+                exit(5);
+            }
+        }
+        Ok(child_pid) => {
+            print("[P] secdemo: forked child ");
+            print_u64(child_pid);
+            println("");
+            match wait_pid(child_pid) {
+                Ok((pid, code)) => {
+                    print("[P] secdemo: collected pid=");
+                    print_u64(pid);
+                    print(" code=");
+                    print_i32(code);
+                    println("");
+                    // 收尾：父进程自身的演示授予也经 securityd 撤销
+                    //（不留悬空权柄；失败仅提示，不影响判定）。
+                    if request_revoke(token) {
+                        println("[P] secdemo: parent demo grant revoked");
+                    }
+                    if code == 0 {
+                        println("[P] secdemo: PASS - RX/TX policy + dynamic capability lifecycle verified");
+                    } else {
+                        println("[P] secdemo: FAIL (child reported failure)");
+                    }
+                }
+                Err(e) => {
+                    print("[P] secdemo: wait failed (");
+                    print_hex(e.code());
+                    println(")");
+                }
+            }
+        }
+        Err(e) => {
+            print("[P] secdemo: fork failed (");
+            print_hex(e.code());
+            println(")");
+        }
+    }
+}
+
+/// 向 securityd 请求撤销一枚令牌（CMD_CAP_REVOKE；权威在内核台账）。
+fn request_revoke(token: u64) -> bool {
+    let mut buf = [0u8; 128];
+    if !sec_proto::encode_token(&mut buf, token) {
+        return false;
+    }
+    match sec_exchange(sec_proto::CMD_CAP_REVOKE, &buf) {
+        Some(resp) => resp.code == 0,
+        None => false,
+    }
+}
+
+/// 向 securityd 申请为目标 pid 签发 `caps`，成功返回令牌编号。
+fn request_cap(target_pid: u64, caps: u32) -> Option<u64> {
+    let req = CapIssueRequest {
+        target_pid,
+        caps,
+        ttl: 1_000_000, // 逻辑 tick 计的长有效期；演示结束即显式 revoke
+    };
+    let mut buf = [0u8; 128];
+    if !sec_proto::encode_cap_issue(&mut buf, &req) {
+        return None;
+    }
+    let resp = sec_exchange(sec_proto::CMD_CAP_ISSUE, &buf)?;
+    if resp.code != 0 {
+        return None;
+    }
+    parse_token(&resp.payload)
 }

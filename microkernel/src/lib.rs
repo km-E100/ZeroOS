@@ -18,6 +18,7 @@ pub mod process;
 pub mod rootfs;
 pub mod runtime;
 pub mod scheduler;
+pub mod security;
 pub mod services;
 pub mod shm;
 pub mod syscalls;
@@ -57,6 +58,9 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     info!("kernel_main: drivers ready");
     ipc::init();
     process::init();
+    // 安全台账（第十三刀）：先于一切用户态进程——CapGrant/SessionBegin
+    // 的簿记依赖此初始化。
+    security::init();
     scheduler::init();
 
     info!("Zero OS microkernel ready; launching userland servers");

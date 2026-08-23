@@ -2,11 +2,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr;
-use core::str;
 use spin::Mutex;
-use zero_abi::cap::{CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
-use zero_abi::ipc::Message;
+use zero_abi::cap::{CAP_BLOCK_DEV, CAP_CHANNEL_CREATE, CAP_ISSUER, CAP_MMIO, CAP_SPAWN_SVC};
+use zero_abi::ipc::{ChannelDesc, Message};
 use zero_abi::syscall::{SysError, Syscall, SyscallResult};
+use zero_abi::ProcessId;
 
 use crate::mm::address_space::{USER_HEAP_BASE, USER_HEAP_MAX_LEN};
 use crate::mm::table_walk::{WalkOutcome, PAGE_SIZE};
@@ -152,6 +152,9 @@ pub fn complete_receive(slot: usize, chan: u32) {
 }
 
 pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
+    // 逻辑时钟步进（第十三刀）：security 模块的 TTL 以本计数近似单调
+    // 时间（每次任意系统调用 +1，见 security.rs 模块文档第 2 点）。
+    crate::security::advance_clock();
     match syscall {
         Syscall::SendMessage {
             channel,
@@ -363,11 +366,20 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         }
         Syscall::SpawnService { name_ptr, name_len } => {
             let caller_slot = crate::scheduler::current_slot();
-            ensure_capability(caller_slot, CAP_SPAWN_SVC)?;
+            // 第十三刀门控升级：静态位图 ∪ 动态授予（securityd 签发的
+            // 令牌）共同参与判定——持有效 cap 才能拉起受保护服务。
+            ensure_effective_capability(caller_slot, CAP_SPAWN_SVC)?;
             let name = copy_string_from_user(name_ptr, name_len)?;
             match crate::services::spawn_service_by_name(name.as_str()) {
                 Ok(pid) => {
                     crate::scheduler::enqueue(pid);
+                    // 会话记账（第十三刀）：registry spawn 的服务继承
+                    // 发起者的登录会话（fork 路径在 process::fork 内
+                    // 继承；这里是另一条 spawn 入口的对齐语义）。
+                    let caller_session = crate::process::session_of_slot(caller_slot);
+                    if caller_session != 0 {
+                        crate::process::set_session(pid, caller_session);
+                    }
                     Ok(pid.raw())
                 }
                 Err(_) => Err(SysError::NotFound),
@@ -420,6 +432,84 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 }
                 crate::scheduler::sleep_current(ticks)
             }
+        }
+        // ═══ 号位 40-45：capability 动态签发 / 会话（第十三刀）═════
+        // ABI 冻结于 zero-abi（Syscall::CapGrant 等变体文档）；台账与
+        // 活算模型见 crate::security 模块文档。
+        Syscall::CapGrant { target_pid } => {
+            let caller_slot = crate::scheduler::current_slot();
+            ensure_effective_capability(caller_slot, CAP_ISSUER)?;
+            let target = ProcessId::new(target_pid);
+            let caps = unsafe { (*frame).regs[2] } as u32;
+            let ttl = unsafe { (*frame).regs[3] };
+            crate::security::issue_grant(target, caps, ttl).map_err(map_issue_error)
+        }
+        Syscall::CapRevoke { token } => {
+            let caller_slot = crate::scheduler::current_slot();
+            ensure_effective_capability(caller_slot, CAP_ISSUER)?;
+            match crate::security::revoke_grant(token) {
+                Some(()) => Ok(0),
+                None => Err(SysError::NotFound),
+            }
+        }
+        Syscall::CreateChannel { user_desc } => {
+            let caller_slot = crate::scheduler::current_slot();
+            if user_desc % core::mem::align_of::<ChannelDesc>() != 0 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut desc = ChannelDesc::open(0, 0);
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (&mut desc as *mut ChannelDesc).cast::<u8>(),
+                    core::mem::size_of::<ChannelDesc>(),
+                )
+            };
+            unsafe {
+                copy_slice_from_user(user_desc, bytes)?;
+            }
+            // 受保护通道创建门控（第十三刀）：tx/rx 任一掩码非 0 即要求
+            // CAP_CHANNEL_CREATE（含动态授予）。全通通道无门控——与
+            // 引导期预建通道同一信任级别。
+            if desc.tx_groups != 0 || desc.rx_groups != 0 {
+                ensure_effective_capability(caller_slot, CAP_CHANNEL_CREATE)?;
+            }
+            match crate::ipc::create_channel(desc) {
+                Ok(()) => Ok(0),
+                Err(crate::ipc::IpcError::Invalid) => {
+                    // id 冲突（重复创建）：如实报通道不可用，secdemo 等
+                    // 调用方按"已存在"处理。
+                    Err(SysError::ChannelUnavailable)
+                }
+                Err(crate::ipc::IpcError::ChannelBusy) => Err(SysError::NoMemory),
+                Err(_) => Err(SysError::InvalidArgument),
+            }
+        }
+        Syscall::SessionBegin { login_token } => {
+            let caller_slot = crate::scheduler::current_slot();
+            let caller_pid =
+                crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
+            // 授权内嵌于令牌：token 必须属于本进程且含 CAP_SESSION，
+            // 无需额外能力位（见 security::begin_session）。
+            crate::security::begin_session(caller_pid, login_token).map_err(map_session_error)
+        }
+        Syscall::GetSession => {
+            let caller_slot = crate::scheduler::current_slot();
+            Ok(crate::process::session_of_slot(caller_slot))
+        }
+        Syscall::SessionList { user_buffer, len } => {
+            // 文本行集 `sid=N leader=P\n` 截断到 len 写入用户缓冲区；
+            // 返回实际写入字节数。会话数 ≤8，行集最长 ~8×40 字节。
+            let sessions = crate::security::sessions_snapshot();
+            let mut text = alloc::string::String::new();
+            for (sid, leader) in sessions.iter() {
+                use core::fmt::Write as _;
+                let _ = write!(text, "sid={} leader={}\n", sid, leader.raw());
+            }
+            let out_len = (text.len() as u64).min(len as u64) as usize;
+            unsafe {
+                copy_slice_to_user(user_buffer, &text.as_bytes()[..out_len])?;
+            }
+            Ok(out_len as u64)
         }
         // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
         // 有活子未退则挂起（登记精确等待目标 wait_target + block_current，
@@ -536,6 +626,29 @@ fn map_ipc_error(err: crate::ipc::IpcError) -> SysError {
         crate::ipc::IpcError::Invalid => SysError::InvalidArgument,
         crate::ipc::IpcError::Empty => SysError::WouldBlock,
         crate::ipc::IpcError::AccessDenied => SysError::PermissionDenied,
+        // 组策略拒绝与 owner 不符对用户态同一编码（PermissionDenied）；
+        // 内核侧区分两个变体只为测试与审计精度。
+        crate::ipc::IpcError::PolicyDenied => SysError::PermissionDenied,
+    }
+}
+
+/// 签发失败映射（号位 40）：InvalidScope=参数非法（空/含签发权）、
+/// TableFull=台账满（资源耗尽语义）。
+fn map_issue_error(err: crate::security::IssueError) -> SysError {
+    match err {
+        crate::security::IssueError::InvalidScope => SysError::InvalidArgument,
+        crate::security::IssueError::TableFull => SysError::NoMemory,
+    }
+}
+
+/// 会话失败映射（号位 43）：令牌无效/非本人 → NotFound/PermissionDenied、
+/// 过期 → InvalidArgument（对照"凭据过期须重新获取"的调用方重试语义）。
+fn map_session_error(err: crate::security::SessionError) -> SysError {
+    match err {
+        crate::security::SessionError::NoSuchToken => SysError::NotFound,
+        crate::security::SessionError::NotYours => SysError::PermissionDenied,
+        crate::security::SessionError::Expired => SysError::InvalidArgument,
+        crate::security::SessionError::TableFull => SysError::NoMemory,
     }
 }
 
@@ -575,6 +688,15 @@ fn ensure_caps(caps: u32, required: u32) -> Result<(), SysError> {
 /// "能拉起服务但不能摸块设备"这类最小授权）。
 fn ensure_capability(slot: usize, required: u32) -> Result<(), SysError> {
     ensure_caps(crate::process::slot_capabilities(slot), required)
+}
+
+/// 有效能力门控（第十三刀）：静态位图 ∪ securityd 动态签发的有效授予。
+/// 仅用于本轮纳管的受保护资源（SpawnService / CreateChannel 受保护
+/// 创建 / IPC 组校验走 ipc 内部同源路径）；块设备与 MMIO 维持纯静态
+/// 门控——动态权柄不应触及硬件数据面（最小授权边界，见 abi::cap 注释）。
+fn ensure_effective_capability(slot: usize, required: u32) -> Result<(), SysError> {
+    let pid = crate::process::pid_at_slot(slot).ok_or(SysError::PermissionDenied)?;
+    ensure_caps(crate::security::effective_caps(pid), required)
 }
 
 /// 块 IO 长度校验（BlockRead/BlockWrite 共用）：非零 + 512 对齐 +
