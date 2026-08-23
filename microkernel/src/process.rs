@@ -28,15 +28,87 @@ fn init_pid() -> ProcessId {
 /// XNU kernel_stack 16K——我们无中断栈分离，所有 EL1 工作（含 IPC 拷贝、
 /// 页表操作）都在本栈，取 4 倍余量防深层调用链溢出。
 const KERNEL_STACK_SIZE: usize = 0x1_0000;
+/// FPU/NEON 全量保存区：v0–v31（32×16B）+ FPSR/FPCR，align(16) 把
+/// sizeof 从 520 补齐到 528。布局被 arch/aarch64.rs 的 SAVE_TRAP_AND_CALL
+/// 存根与 restore_context 按帧内偏移 #288 起硬编码访问——两侧必须同步。
+///
+/// 【内核态浮点使用约定】内核代码（core/alloc 及全部子系统）不持有跨
+/// 调度点的 FP/SIMD 状态，因此异常入口的**全量急切保存**已完备：存根在
+/// 任何 Rust 代码运行前抢先落盘 v 寄存器与 FPSR/FPCR，恢复路径 eret 前
+/// 对称装回。即便未来某处内核代码意外动用 NEON（如 memcpy 向量化），
+/// 用户现场也不会被污染——入口即保存，内核中间怎么折腾都无所谓；
+/// 且内核从不在 eret 边界携带自己的活跃 FP 状态 ⇒ 无需"内核侧保存"。
+///
+/// 【未来优化路径：lazy save】CPACR_EL1.FPEN 改 0b01（EL0 访问 FP 即
+/// 陷阱），首次陷阱时把本结构换入帧内并置 FPEN=0b11；调度换出时若目标
+/// 进程从未用过 FP 则跳过这 528B 的 stp/ldp 搬运。当前全量方案每帧固定
+/// ~40 条访存指令，正确性优先、开销可测再优化。
+#[repr(C, align(16))]
+#[derive(Copy, Clone)]
+pub struct FpuState {
+    /// v0–v31 的 128 位视图（Q 寄存器）。S/D/H 视图是低位别名，
+    /// 保存 Q 视图即覆盖全部 SIMD/FP 寄存器状态。
+    pub v: [u128; 32],
+    /// 浮点状态寄存器（N/Z/C/V、舍入不精确累计标志等）。
+    pub fpsr: u32,
+    /// 浮点控制寄存器（舍入模式、FZ、trap 使能等）。
+    pub fpcr: u32,
+}
+
+impl FpuState {
+    pub const fn new() -> Self {
+        Self {
+            v: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+}
+
+impl Default for FpuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 异常现场帧。
+///
+/// ⚠ 偏移契约：#[0..#280] 是历史布局，SAVE_TRAP_AND_CALL 存根与
+/// restore_context 以立即数硬编码这些偏移，**绝不可移动**；新字段一律
+/// 尾部追加（tpidr_el0=#280，fpu=#288..#815，16 对齐）。下方静态断言
+/// 钉死每个偏移与总大小——汇编/Rust 布局漂移即编译失败。
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TrapFrame {
-    pub regs: [u64; 31], // x0 - x30
-    pub sp_el0: u64,
-    pub elr_el1: u64,
-    pub spsr_el1: u64,
-    pub sp_el1: u64,
+    pub regs: [u64; 31], // x0 - x30   #0..#247
+    pub sp_el0: u64,     // #248
+    pub elr_el1: u64,    // #256
+    pub spsr_el1: u64,   // #264
+    pub sp_el1: u64,     // #272 —— 既有 280 字节到此为止
+    /// 用户 TLS 寄存器 TPIDR_EL0（#280）。此前从不保存 ⇒ 跨上下文切换
+    /// TLS 损坏（严苛评审结论之一）；fork 经整帧拷贝自然继承子进程 TLS
+    /// （POSIX fork 语义）。用户态设置接口（set_tls 类 syscall）属后续。
+    pub tpidr_el0: u64,
+    /// FPU/NEON 全量保存区（#288..#815，16 对齐；约定见 FpuState 注释）。
+    /// CPACR_EL1.FPEN=0b11 后 EL0 可用 FP/SIMD，现场必须随帧完整保存。
+    pub fpu: FpuState,
 }
+
+// 布局契约静态断言：汇编按这些立即数访帧，漂移即编译失败。
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, regs) == 0);
+    assert!(core::mem::offset_of!(TrapFrame, sp_el0) == 248);
+    assert!(core::mem::offset_of!(TrapFrame, elr_el1) == 256);
+    assert!(core::mem::offset_of!(TrapFrame, spsr_el1) == 264);
+    assert!(core::mem::offset_of!(TrapFrame, sp_el1) == 272);
+    assert!(core::mem::offset_of!(TrapFrame, tpidr_el0) == 280);
+    assert!(core::mem::offset_of!(TrapFrame, fpu) == 288);
+    assert!(core::mem::offset_of!(FpuState, v) == 0);
+    assert!(core::mem::offset_of!(FpuState, fpsr) == 512);
+    assert!(core::mem::offset_of!(FpuState, fpcr) == 516);
+    assert!(core::mem::size_of::<FpuState>() == 528);
+    assert!(core::mem::size_of::<TrapFrame>() == 816);
+};
 
 impl TrapFrame {
     pub const fn new() -> Self {
@@ -46,6 +118,8 @@ impl TrapFrame {
             elr_el1: 0,
             spsr_el1: 0,
             sp_el1: 0,
+            tpidr_el0: 0,
+            fpu: FpuState::new(),
         }
     }
 
@@ -61,6 +135,10 @@ impl TrapFrame {
         self.elr_el1 = entry as usize as u64;
         self.spsr_el1 = 0; // EL0t, interrupts enabled
         self.sp_el1 = kernel_stack_top as u64;
+        // 新进程从零 TLS 与干净 FP 状态起步：TPIDR_EL0/FPCR/FPSR 归零，
+        // v 寄存器清零（首次恢复装填确定值而非上一任进程的残留）。
+        self.tpidr_el0 = 0;
+        self.fpu = FpuState::new();
     }
 }
 
