@@ -15,9 +15,14 @@
 //!
 //! ## 持久化
 //!
-//! 用户库落盘到 LBA128 起的 8 个扇区（经 userlib block_read/write
-//! 系统调用 → 内核 virtio-blk）。无盘环境（ISO 直启、未挂 disk.img）
-//! 下读写失败均优雅降级：内存态继续服务，控制台如实告警。
+//! 用户库落盘为固定布局（跨启动 ABI，编解码在 [`zero_abi::userdb`]）：
+//! LBA 4096 起头部扇区（magic `SUD1` + 版本 + 记录区扇区数），随后是
+//! 记录扇区（`name:password:role\n` 行集）。写入顺序**先记录后头部**
+//! （头部即提交标记）；写后读回逐字节自检。加载时 magic 校验失败
+//! ⇒ 视为首启/损坏，用内置默认表播种并写回。选址避开 virtio-blk
+//! 自检扇区（LBA 2048）与旧版 userdb 区（LBA 128），依据见
+//! `zero_abi::userdb` 模块文档。无盘环境下读写失败均优雅降级：
+//! 内存态继续服务，控制台如实告警。
 #![no_std]
 
 use core::cmp::min;
@@ -35,10 +40,34 @@ const USERNAME_MAX: usize = 16;
 const PASSWORD_MAX: usize = 32;
 const USER_CAPACITY: usize = 8;
 const LIST_BUFFER: usize = 256;
-const USERDB_LBA: u64 = 128;
-const USERDB_SECTOR_SIZE: usize = 512;
-const USERDB_SECTORS: usize = 8;
-const USERDB_CAPACITY: usize = USERDB_SECTOR_SIZE * USERDB_SECTORS;
+
+// ── userdb 磁盘布局（第七刀，编解码契约在 zero_abi::userdb）────────
+//   LBA 4096      头部扇区：magic "SUD1" | version | 记录区扇区数
+//   LBA 4097..    记录区：USERDB_RECORD_SECTORS 个扇区的文本行集
+// 选址依据（避开三方数据，详见 zero_abi::userdb 模块文档）：
+//   MBR/GPT 区 < LBA 2048（驱动自检扇区）< LBA 4096（本区）。
+//   旧版布局（LBA 128 起、无头部裸文本）废弃；旧数据区不迁移——
+//   首启时本区无有效 magic，自动走默认表播种 + 写回。
+const USERDB_HDR_LBA: u64 = zero_abi::userdb::HDR_LBA;
+const USERDB_RECORD_LBA: u64 = USERDB_HDR_LBA + 1;
+const USERDB_SECTOR_SIZE: usize = zero_abi::userdb::SECTOR;
+/// 记录区扇区数（容量 4KiB ≈ 百余条用户记录，远超 USER_CAPACITY）。
+const USERDB_RECORD_SECTORS: usize = 8;
+/// 记录区字节容量。
+const USERDB_RECORD_BYTES: usize = USERDB_SECTOR_SIZE * USERDB_RECORD_SECTORS;
+
+/// 512 字节对齐缓冲：块层传输缓冲必须按扇区对齐（当前内核经弹跳区
+/// 拷贝，用户侧对齐属纵深防御——未来直通 DMA 时调用方无需改动）。
+#[repr(C, align(512))]
+struct SectorAligned<const N: usize> {
+    bytes: [u8; N],
+}
+
+impl<const N: usize> SectorAligned<N> {
+    fn zeroed() -> Self {
+        Self { bytes: [0; N] }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UserRole {
@@ -137,13 +166,37 @@ pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
     }
 }
 
+/// 启动期用户库装载结果（决定横幅文案与是否回写默认表）。
+enum RestoreOutcome {
+    /// 从盘恢复成功：携带 (记录数, 用户名清单) 供横幅展示——清单
+    /// 直接证明数据来自盘而非默认表（跨启动持久化的实机验收点）。
+    Restored { count: usize, names: String<LIST_BUFFER> },
+    /// 块设备在但无有效 SUD1 头部（首启/旧布局/损坏）→ 播种默认表。
+    NoValidHeader,
+    /// 块设备不可用（ISO 直启、未挂盘）→ 降级为内存态并告警。
+    IoUnavailable,
+}
+
 fn init_user_store(bootfs_ptr: u64, bootfs_len: u64) {
-    if load_persisted_records() {
-        println("securityd: restored users from persistent store");
-        return;
+    match load_persisted_records() {
+        RestoreOutcome::Restored { count, names } => {
+            println("securityd: userdb restored from persistent store");
+            // names 来自盘上记录区——若默认表已不含其中某个名字而它仍在，
+            // 即为跨启动持久化成立的直接证据（第七刀实机验证项）。
+            println("  LBA=4096 records; users:");
+            println(names.as_str());
+            let _ = count;
+            return;
+        }
+        RestoreOutcome::NoValidHeader => {
+            println("securityd: no valid userdb header on blk (first boot?)");
+        }
+        RestoreOutcome::IoUnavailable => {
+            println("securityd: warning: block device unavailable for userdb");
+        }
     }
     if load_rootfs_defaults(bootfs_ptr, bootfs_len) {
-        println("securityd: loaded default users from /etc/users");
+        println("securityd: seeded default users from /etc/users");
         // 把默认用户写进持久层；无盘环境下失败仅告警，不影响在线。
         persist_users();
     } else {
@@ -151,17 +204,42 @@ fn init_user_store(bootfs_ptr: u64, bootfs_len: u64) {
     }
 }
 
-fn load_persisted_records() -> bool {
-    let mut buffer = [0u8; USERDB_CAPACITY];
-    if userlib::block_read(USERDB_LBA, &mut buffer).is_err() {
-        return false;
+/// 从块设备加载用户库：校验头部 magic/版本 → 读记录区 → 解析入内存。
+fn load_persisted_records() -> RestoreOutcome {
+    let mut header = SectorAligned::<{ USERDB_SECTOR_SIZE }>::zeroed();
+    if userlib::block_read(USERDB_HDR_LBA, &mut header.bytes).is_err() {
+        return RestoreOutcome::IoUnavailable;
     }
-    let used = match buffer.iter().rposition(|byte| *byte != 0) {
-        Some(pos) => pos + 1,
-        None => return false,
+    let Some(record_sectors) = zero_abi::userdb::parse_header(&header.bytes) else {
+        return RestoreOutcome::NoValidHeader;
     };
-    let blob = &buffer[..used];
-    apply_user_blob(blob)
+    // 头部声明超出本进程布局上限 ⇒ 视为损坏（不信任外来计数越界读）。
+    if record_sectors as usize > USERDB_RECORD_SECTORS {
+        return RestoreOutcome::NoValidHeader;
+    }
+    let region_len = record_sectors as usize * USERDB_SECTOR_SIZE;
+    let mut data = SectorAligned::<USERDB_RECORD_BYTES>::zeroed();
+    if userlib::block_read(USERDB_RECORD_LBA, &mut data.bytes[..region_len]).is_err() {
+        return RestoreOutcome::IoUnavailable;
+    }
+    let used = match data.bytes[..region_len].iter().rposition(|byte| *byte != 0) {
+        Some(pos) => pos + 1,
+        None => return RestoreOutcome::NoValidHeader,
+    };
+    if !apply_user_blob(&data.bytes[..used]) {
+        return RestoreOutcome::NoValidHeader;
+    }
+    let store = USERS.lock();
+    let mut names = String::<LIST_BUFFER>::new();
+    for record in store.records.iter() {
+        if !names.is_empty() {
+            let _ = names.push_str(", ");
+        }
+        let _ = names.push_str(record.username.as_str());
+    }
+    let count = store.records.len();
+    drop(store);
+    RestoreOutcome::Restored { count, names }
 }
 
 /// 从本进程 bootfs 文件表读取 `/etc/users` 默认用户库。
@@ -380,15 +458,31 @@ fn parse_fields(payload: &[u8]) -> Vec<&str, 4> {
     fields
 }
 
-fn persist_users() {
+/// 持久化用户库并做写后读自检；成功/失败都上控制台（生命周期关键行
+/// 必须可见，log 后端缺失时 println 才能上串口）。返回是否落盘成功。
+fn persist_users() -> bool {
     let store = USERS.lock();
-    if write_user_blob(&store.records).is_err() {
-        println("securityd: warning: failed to persist user database (no blk device?)");
+    match write_user_blob(&store.records) {
+        Ok(bytes) => {
+            println("securityd: userdb persisted to blk (verify ok)");
+            let _ = bytes; // 细节在 write_user_blob 内部自检，横幅保持一行
+            true
+        }
+        Err(()) => {
+            println("securityd: warning: failed to persist user database (no blk device?)");
+            false
+        }
     }
 }
 
-fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<(), ()> {
-    let mut buffer = [0u8; USERDB_CAPACITY];
+/// 序列化 + 落盘 + 读回校验：
+/// 1. 记录文本写入记录区缓冲（512 对齐、整扇区长度）；
+/// 2. **先写记录区、后写头部**——头部是提交标记（zero_abi::userdb 布局
+///    约定）：中途失败只留旧头部/无头部，下次启动按 magic 失败回退
+///    默认表重播，绝不读到半截新数据；
+/// 3. 写后读回头部与已写记录区逐字节比对，不一致视为失败。
+fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<usize, ()> {
+    let mut data = SectorAligned::<USERDB_RECORD_BYTES>::zeroed();
     let mut offset = 0;
     for record in records.iter() {
         let mut line = String::<{ USERNAME_MAX + PASSWORD_MAX + 8 }>::new();
@@ -399,11 +493,35 @@ fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<(), ()> {
         line.push_str(record.role.as_str()).map_err(|_| ())?;
         line.push('\n').map_err(|_| ())?;
         let bytes = line.as_bytes();
-        if offset + bytes.len() > buffer.len() {
+        if offset + bytes.len() > data.bytes.len() {
             return Err(());
         }
-        buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+        data.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
         offset += bytes.len();
     }
-    userlib::block_write(USERDB_LBA, &buffer).map_err(|_| ())
+    // 整扇区写：尾部零填充到扇区边界（至少 1 扇区，空库也有合法记录区）。
+    let used_sectors = core::cmp::max(
+        offset.div_ceil(USERDB_SECTOR_SIZE),
+        1,
+    );
+    let write_len = used_sectors * USERDB_SECTOR_SIZE;
+    userlib::block_write(USERDB_RECORD_LBA, &data.bytes[..write_len]).map_err(|_| ())?;
+
+    // 提交标记：头部最后写。
+    let mut header = SectorAligned::<{ USERDB_SECTOR_SIZE }>::zeroed();
+    zero_abi::userdb::encode_header(&mut header.bytes, USERDB_RECORD_SECTORS as u32);
+    userlib::block_write(USERDB_HDR_LBA, &header.bytes).map_err(|_| ())?;
+
+    // ── 写后读自检 ────────────────────────────────────────────────
+    let mut rheader = SectorAligned::<{ USERDB_SECTOR_SIZE }>::zeroed();
+    userlib::block_read(USERDB_HDR_LBA, &mut rheader.bytes).map_err(|_| ())?;
+    if rheader.bytes != header.bytes {
+        return Err(());
+    }
+    let mut rdata = SectorAligned::<USERDB_RECORD_BYTES>::zeroed();
+    userlib::block_read(USERDB_RECORD_LBA, &mut rdata.bytes[..write_len]).map_err(|_| ())?;
+    if rdata.bytes[..write_len] != data.bytes[..write_len] {
+        return Err(());
+    }
+    Ok(write_len)
 }

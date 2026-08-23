@@ -367,6 +367,12 @@ pub mod protocol {
     }
 
     /// 文件系统服务器命令码（fs 线 Agent 的契约，勿改）。
+    ///
+    /// 第七刀起 fsd 由“只读 rootfs 镜像服务”升级为**块设备卷文件服务**
+    /// （数据落 virtio-blk，见本模块 `fs::vtable` 子协议）。上方
+    /// 0x01..0x0C 旧码保持冻结：fsd 对 0x01/0x02/0x03/0x04 做兼容映射
+    /// （语义与 vtable 同名命令一致，OPEN 无 mode 字节时按
+    /// `fs::vtable::OPEN_EXISTING` 处理），其余旧码回 ERR_INVALID。
     pub mod fs {
         pub const CMD_OPEN: u32 = 0x01;
         pub const CMD_READ: u32 = 0x02;
@@ -385,9 +391,51 @@ pub mod protocol {
         pub const ERR_INVALID: u32 = 2;
         pub const ERR_NO_DESCRIPTOR: u32 = 3;
         pub const ERR_DEVICE: u32 = 4;
+
+        /// 块设备卷文件协议（fsd 第七刀新增，**冻结**）。
+        ///
+        /// fsd 维护一张内存版文件表（固定槽位：名字→LBA 映射），元数据
+        /// 持久化于卷超级块（LBA 布局见 servers/fsd/src/lib.rs 头注），
+        /// 文件数据按固定容量槽位落盘。所有请求走 FS_REQ/FS_RESP，
+        /// Message.code 取下列命令码；错误复用上层 ERR_*。
+        ///
+        /// payload 约定（小端；\\0 表示 NUL 字节，\\n 表示换行）：
+        /// - OPEN：`[path\0][mode u8]`（mode 可省略=EXISTING）；
+        ///   成功响应 payload[0..4] = fd。
+        /// - WRITE：`[fd u32][len u32][data..]`（len+8 ≤ 128）；
+        ///   成功响应 payload[0..4] = 实写入字节数。
+        /// - READ：`[fd u32][len u32]`（单条消息最多回 128 字节）；
+        ///   成功响应 payload = 数据本身（有效长度由请求 len 与文件剩余量推知）。
+        /// - CLOSE：`[fd u32]`。
+        /// - LIST：空；响应 payload = `name\n` 串（NUL 收尾）。
+        pub mod vtable {
+            /// 打开（可创建）文件。
+            pub const CMD_OPEN: u32 = 0x20;
+            /// 按 fd 当前偏移写入并推进偏移。
+            pub const CMD_WRITE: u32 = 0x21;
+            /// 按 fd 当前偏移读取并推进偏移。
+            pub const CMD_READ: u32 = 0x22;
+            /// 关闭 fd（文件与数据保留）。
+            pub const CMD_CLOSE: u32 = 0x23;
+            /// 列出卷内全部文件名。
+            pub const CMD_LIST: u32 = 0x24;
+
+            /// OPEN mode：仅打开已存在文件（不存在 → ERR_NOT_FOUND）。
+            pub const OPEN_EXISTING: u8 = 0;
+            /// OPEN mode：不存在则创建空文件，存在则原样打开（续写）。
+            pub const OPEN_CREATE: u8 = 1;
+        }
     }
 
     /// 块设备服务器命令码（fs 线 Agent 的契约，勿改）。
+    ///
+    /// 第七刀起 blkdrv 的数据面改为**内核直通委托**（号位 7/8
+    /// BlockRead/BlockWrite，内核 virtio-blk 驱动保持设备唯一属主），
+    /// 原生 MMIO 队列路径暂缓：内核与用户双驱动会争用同一 virtqueue，
+    /// 且内核 shm 缓冲位于恒等映射区、对 EL0 不可见（详见
+    /// servers/blkdrv/src/lib.rs 头注）。上方 shm 句柄版 CMD_READ/
+    /// CMD_WRITE 回 STATUS_UNSUPPORTED；分块直通协议见
+    /// `blk::passthrough`。
     pub mod blk {
         pub const CMD_INFO: u32 = 0x01;
         pub const CMD_LIST: u32 = 0x02;
@@ -408,6 +456,32 @@ pub mod protocol {
 
         pub const EVENT_DEVICE_ADDED: u8 = 0x01;
         pub const EVENT_DEVICE_REMOVED: u8 = 0x02;
+
+        /// 直通分块 IO 协议（blkdrv 第七刀新增，**冻结**）。
+        ///
+        /// 走 BLKDRV_REQ/BLKDRV_RESP。单条消息载荷上限 128 字节，大块 IO
+        /// 由调用方（fsd）按**单扇区内字节块**分片：每次请求的
+        /// [offset, offset+len) 必须落在同一 512B 扇区内；blkdrv 对写做
+        /// “读-改-写整扇区”，对读直接回数据分片。
+        ///
+        /// READ_CHUNK 请求 payload（小端）：
+        /// [0]=device u8，[1..4]=0，[4..12]=lba u64，[12..16]=offset u32，
+        /// [16..20]=len u32（≤124 且 offset+len ≤ 512）。
+        /// 成功响应 code=STATUS_OK，payload = len 字节数据。
+        ///
+        /// WRITE_CHUNK 请求 payload（小端）：
+        /// [0]=device u8，[1..4]=0，[4..12]=lba u64，[12..16]=offset u32，
+        /// [16..20]=len u32（≤104 且 offset+len ≤ 512），[20..20+len]=data。
+        /// 成功响应 code=STATUS_OK，payload[0..4] = 受理字节数。
+        pub mod passthrough {
+            /// 读单扇区内字节块。
+            pub const CMD_READ_CHUNK: u32 = 0x30;
+            /// 写单扇区内字节块（内部读-改-写）。
+            pub const CMD_WRITE_CHUNK: u32 = 0x31;
+
+            /// 后端无可用块设备（未挂盘/驱动未就绪）。
+            pub const STATUS_NODEVICE: u32 = 4;
+        }
     }
 }
 
@@ -567,21 +641,40 @@ pub mod syscall {
         },
         /// (21) 查询当前进程 PID（已实现并实机验证）。
         GetPid,
-        /// (22) 等待子进程退出并收集退出码（POSIX wait4 最小完备集，2026-08 新增）：
-        /// `x1`=目标 pid（**0 = 任意子进程**）。
+        /// (22) 等待子进程退出并收集退出码（POSIX wait4 最小完备集，2026-08 新增；
+        /// 2026-08 第七刀扩展 WNOHANG）：`x1`=目标 pid（**0 = 任意子进程**）、
+        /// `x3`=flags（bit0 = [`WAIT_NOHANG`]，其余位保留必须清零）。
         ///
         /// 返回值编码：成功为 `(child_pid << 32) | (exit_code as u32)`
-        /// （exit_code 按 32 位二进制补码解释，负值可无损还原）。
+        /// （exit_code 按 32 位二进制补码解释，负值可无损还原）；
+        /// **WNOHANG 置位且“有活子但无尸可收”时返回 0**——不挂起、立即
+        /// 返回（对照 Linux `wait4(..., WNOHANG)` 对未退出子进程返回 0
+        /// 的约定；pid≥2 恒非 0，与收尸成功值天然无歧义）。
         /// 错误语义：
         /// - 无任何（匹配的）子进程 → [`SysError::NotFound`]（对应 POSIX ECHILD）；
         ///   含“子早已被收集/回收后再 wait”的重复调用——幂等安全。
-        /// - 有未退出的活子进程 → 内核挂起调用方，待其退出时以
-        ///   continuation 方式带回结果（对照号位 1 的阻塞接收语义）。
+        ///   该错误**不受 WNOHANG 影响**（无子就是无子，两种模式一致）。
+        /// - 有未退出的活子进程且未置 WNOHANG → 内核挂起调用方，待其
+        ///   退出时以 continuation 方式带回结果（对照号位 1 的阻塞接收语义）。
+        ///
+        /// 实现注记：flags 走 x3 但不经 `trap.rs::decode_syscall` 解包
+        /// （该函数对号位 22 只取 x1=pid，保持冻结），由内核
+        /// `syscalls::handle` 直接从 TrapFrame 读 x3 —— ABI 契约以此处
+        /// 文档为准。userlib 侧对应封装见 `userlib::wait_pid_flags`。
         WaitPid {
             /// 目标子 pid；0 表示任意子进程。
             pid: u64,
         },
     }
+
+    /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。
+    ///
+    /// - bit0 = WNOHANG：无尸可收但有活子时不挂起，立即返回 0；
+    /// - bit1..63：保留，调用方必须清零（内核当前忽略未知位，
+    ///   未来启用新位前会先改为拒绝，避免静默语义漂移）。
+    pub const WAIT_NOHANG: u64 = 1 << 0;
+    /// 全部已定义的 WaitPid flags 位掩码（供校验用）。
+    pub const WAIT_FLAGS_MASK: u64 = WAIT_NOHANG;
 
     /// 系统调用结果：成功返回 `u64`，失败返回 [`SysError`]。
     ///
@@ -649,6 +742,130 @@ pub mod syscall {
             val if val == SysError::DeviceError.code() => Err(SysError::DeviceError),
             val if val == SysError::Busy.code() => Err(SysError::Busy),
             other => Ok(other),
+        }
+    }
+}
+
+/// securityd 用户数据库的**磁盘持久化布局**（跨启动 ABI，第七刀冻结）。
+///
+/// 固定扇区布局（512B/扇区，小端编码）：
+///
+/// ```text
+///   LBA 4096            头部扇区（见 [`userdb::encode_header`]）：
+///                       [0..4)   magic b"SUD1"
+///                       [4..8)   version u32（当前 1）
+///                       [8..12)  记录区扇区数 u32
+///                       [12..16) 预留 0
+///                       [16..512) 预留 0
+///   LBA 4097 .. 4096+N  用户记录文本（`name:password:role\n` 行集，
+///                       尾部零填充；N = 头部记录的扇区数）
+/// ```
+///
+/// 选址依据：LBA 4096 = 2MiB 偏移——避开 MBR/GPT 区、驱动上电自检扇区
+/// （virtio-blk SELF_TEST_LBA=2048，1MiB）与历史 userdb 区（LBA 128），
+/// 三者互不相交，任何一方写坏都不会殃及其他数据。
+///
+/// 提交顺序约定：**先写记录区、后写头部**——头部是提交标记；写入中途
+/// 断电只会留下旧头部/无头部，加载方按 magic 校验失败回退默认表重播，
+/// 不会读到半截新数据。
+pub mod userdb {
+    /// 头部扇区所在 LBA（2MiB 偏移，选址依据见模块文档）。
+    pub const HDR_LBA: u64 = 4096;
+    /// 扇区大小：块设备语义 + DMA 对齐下限。
+    pub const SECTOR: usize = 512;
+    /// 魔数 "SUD1"（Security User DB v1）。
+    pub const MAGIC: [u8; 4] = *b"SUD1";
+    /// 当前头部版本。
+    pub const VERSION: u32 = 1;
+
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn get_u32(buf: &[u8], off: usize) -> u32 {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&buf[off..off + 4]);
+        u32::from_le_bytes(raw)
+    }
+
+    /// 把头部扇区编码进 `buf`（整扇区清零后写前 12 字节）。
+    /// `record_sectors` 必须落在 1..=4095（防御性上限：2MiB 记录区足够
+    /// 任何可预见规模；调用方按自身容量再收紧）。
+    pub fn encode_header(buf: &mut [u8; SECTOR], record_sectors: u32) {
+        assert!(
+            record_sectors >= 1 && record_sectors <= 4095,
+            "record_sectors out of range"
+        );
+        *buf = [0u8; SECTOR];
+        buf[0..4].copy_from_slice(&MAGIC);
+        put_u32(buf, 4, VERSION);
+        put_u32(buf, 8, record_sectors);
+    }
+
+    /// 校验并解析头部扇区：magic/版本/扇区数全部合法才返回
+    /// `Some(record_sectors)`；否则 None（加载方应回退内置默认表）。
+    pub fn parse_header(buf: &[u8; SECTOR]) -> Option<u32> {
+        if buf[0..4] != MAGIC {
+            return None;
+        }
+        if get_u32(buf, 4) != VERSION {
+            return None;
+        }
+        let sectors = get_u32(buf, 8);
+        if sectors == 0 || sectors > 4095 {
+            return None;
+        }
+        Some(sectors)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn header_roundtrip() {
+            let mut buf = [0u8; SECTOR];
+            encode_header(&mut buf, 8);
+            assert_eq!(&buf[0..4], b"SUD1");
+            assert_eq!(parse_header(&buf), Some(8));
+            // 编码是幂等的全扇区格式：尾部保持零
+            assert!(buf[16..].iter().all(|&b| b == 0));
+        }
+
+        #[test]
+        fn zeroed_sector_is_rejected() {
+            // 出厂盘全零：必须走“无有效头部 → 默认表”路径
+            assert_eq!(parse_header(&[0u8; SECTOR]), None);
+        }
+
+        #[test]
+        fn bad_magic_or_version_or_count_rejected() {
+            let mut buf = [0u8; SECTOR];
+            encode_header(&mut buf, 1);
+
+            let mut bad_magic = buf;
+            bad_magic[0] = b'X';
+            assert_eq!(parse_header(&bad_magic), None);
+
+            let mut bad_ver = buf;
+            bad_ver[4] = 0xFF; // version 0x000000FF != 1
+            assert_eq!(parse_header(&bad_ver), None);
+
+            for count in [0u32, 4096, u32::MAX] {
+                let mut bad_cnt = buf;
+                bad_cnt[8..12].copy_from_slice(&count.to_le_bytes());
+                assert_eq!(parse_header(&bad_cnt), None, "count={count}");
+            }
+        }
+
+        #[test]
+        fn little_endian_layout_is_frozen() {
+            // 跨启动 ABI 冻结检查：字段偏移与字节序固定
+            let mut buf = [0u8; SECTOR];
+            encode_header(&mut buf, 3);
+            assert_eq!(&buf[0..4], b"SUD1");
+            assert_eq!(&buf[4..8], &[0x01, 0x00, 0x00, 0x00]);
+            assert_eq!(&buf[8..12], &[0x03, 0x00, 0x00, 0x00]);
         }
     }
 }

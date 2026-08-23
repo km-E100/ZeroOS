@@ -13,6 +13,17 @@ use zero_abi::syscall::SysError;
 use zero_abi::{ProcessId, ThreadEntry};
 
 const MAX_PROCESSES: usize = 64;
+
+/// init（launchd）的 pid，孤儿收养的目标（对标 Linux pid==1 /
+/// child_subreaper 的 reparent 目标）。恒为 2 的依据：NEXT_PID 从 2
+/// 起分配，而 services::launch_core 引导期第一个拉起的就是 essential
+/// 的 launchd（见 services/mod.rs bundled[0]）——顺序先于一切 fork/
+/// SpawnService。若未来引导顺序改变，必须同步改这里并加启动期断言。
+const INIT_PID: u64 = 2;
+
+fn init_pid() -> ProcessId {
+    ProcessId::new(INIT_PID)
+}
 /// 内核栈 64KiB（×64 槽 = 4MiB 静态区）：对照 Linux THREAD_SIZE 16K/
 /// XNU kernel_stack 16K——我们无中断栈分离，所有 EL1 工作（含 IPC 拷贝、
 /// 页表操作）都在本栈，取 4 倍余量防深层调用链溢出。
@@ -84,9 +95,14 @@ struct ProcessRecord {
     /// 重入用户态前完成该系统调用的收尾（continuation 语义，对照 XNU）。
     pending_recv: Option<u32>,
     /// 父进程 pid：仅 Fork 出的子进程持有（内核直接 spawn 的根进程为
-    /// None ⇒ 其退出走“无存活父”路径，立即完全回收，见文件尾部
-    /// zombie/waitpid 状态机的设计注释）。
+    /// None）。父死后孤儿被收养：parent 重定向为 INIT_PID（见文件头部
+    /// 【孤儿策略】）。
     parent: Option<ProcessId>,
+    /// 孤儿收养标记：本进程的 parent 曾被 full_reap 从死者重定向为
+    /// INIT_PID。收养者（launchd）尚未实现 wait 收割循环 ⇒ 被收养孤儿
+    /// 若再退出将无人收尸、尸体永久占槽（fork 泄漏），因此其退出按
+    /// 过渡策略直接完全回收（见 exit_disposition 防御分支）。
+    adopted: bool,
     /// 退出码：Exit 系统调用记录；Zombie 态期间由父经 WaitPid 读走。
     exit_code: Option<i32>,
     /// 挂起的 WaitPid：父在“无可收子但有活子”时置位并阻塞；子 Exit
@@ -191,6 +207,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         started: true,
         pending_recv: None,
         parent: None, // 内核直生的根进程：无父，退出即完全回收
+        adopted: false,
         exit_code: None,
         pending_wait: false,
     });
@@ -415,14 +432,19 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
 //               地址空间销毁（锁外）+ 孤儿级联（见 full_reap）。
 //   Zombie ──父 WaitPid──▶ 完全回收，返回 (pid<<32)|exit_code。
 //
-// 【孤儿策略】（任务给定二选一：选“立即回收”，不重定向给初始进程）
-//   父先死时：活子就地 parent=None（成为孤儿），此后它退出时因
-//   “无存活父”直接完全回收；死者名下若已有 Zombie 尸体，随父死亡
-//   **级联回收**（full_reap 的显式栈迭代，非递归）。
-//   理由：本内核没有 init 常驻收割循环，把孤儿 parent 重定向给初始
-//   进程只会让尸体挂在无人认领的槽位上直到表满（fork 泄漏）；
-//   “死亡即级联清理 + 孤儿自灭”与 Linux 中 init 收割孤儿的最终效果
-//   等价（资源必然释放），却不需要任何守护进程与族谱 reparent。
+// 【孤儿策略：init 收养 + 过渡期防御回收】（第七刀，对标 Linux
+//   child_subreaper / pid==1 reparent）
+//   父先死时：活子的 parent **重定向为 INIT_PID=2（launchd）** 并置
+//   adopted=true（族谱不断链，收养关系对调试/未来 getppid 可见）；
+//   死者名下已有的 Zombie 尸体仍随父死亡**级联回收**（full_reap 显式
+//   栈迭代，非递归）——尸体无人认领也无法复活，留着只会占槽。
+//   ⚠ 过渡策略：launchd 尚未实现 wait 收割循环 ⇒ 被收养孤儿退出后
+//   没有人会来收尸，尸体将永久滞留进程表（fork 泄漏）。防御：
+//   adopted==true 的进程退出时**跳过 Zombie 态直接完全回收**
+//   （exit_disposition 的防御分支）。代价是这类退出的退出码不可收集——
+//   在 launchd 落地 wait 循环前这是正确性（防泄漏）对可观测性的取舍。
+//   launchd 实现 wait 循环后，删除该防御分支即恢复 POSIX 收养语义，
+//   届时被收养孤儿的尸体可被 launchd 正常 WaitPid 收集。
 //
 // 【挂起恢复 = 零侵入 continuation】（对照 pending_recv 模式，选最小
 //   侵入方案：平行的 pending_wait 单标记，不改 scheduler.rs/trap.rs）
@@ -451,14 +473,23 @@ pub(crate) fn pack_wait_result(pid: ProcessId, code: i32) -> u64 {
 pub(crate) enum ExitDisposition {
     /// 有存活父：转 Zombie 留尸待收。
     BecomeZombie,
-    /// 无父 / 父已死 / 父已僵：立即完全回收。
+    /// 无父 / 父已死 / 父已僵 / **被收养孤儿（过渡防御）**：立即完全回收。
     ReapImmediately,
 }
 
+/// `adopted` = 本进程是父死后被收养给 INIT_PID 的孤儿。收养者
+/// （launchd）当前没有 wait 收割循环，若让它走 Zombie 路径，尸体将
+/// 无人认领、永久占槽 ⇒ 防御性直接回收（过渡策略，见文件头部
+/// 【孤儿策略】；对标 Linux 中 init 收割孤儿的最终效果——资源必然
+/// 释放，只是我们提前到退出瞬间）。
 pub(crate) fn exit_disposition(
     parent: Option<ProcessId>,
     parent_alive: bool,
+    adopted: bool,
 ) -> ExitDisposition {
+    if adopted {
+        return ExitDisposition::ReapImmediately;
+    }
     match parent {
         Some(_) if parent_alive => ExitDisposition::BecomeZombie,
         _ => ExitDisposition::ReapImmediately,
@@ -528,8 +559,10 @@ pub(crate) fn wait_scan(
 pub(crate) enum OrphanAction {
     /// 子已是 Zombie 尸体：随父死亡级联回收。
     CascadeReap,
-    /// 子还活着：摘除父链（parent=None）成为孤儿，此后自灭。
-    Detach,
+    /// 子还活着：**init 收养**——parent 重定向为 INIT_PID 并置 adopted
+    /// （第七刀策略变更：旧实现是摘链自灭 parent=None；现对标 Linux
+    /// child_subreaper 的 reparent-to-init，族谱保持可见）。
+    AdoptToInit,
     /// 与死者无关。
     Ignore,
 }
@@ -544,12 +577,26 @@ pub(crate) fn orphan_action(
             if state == ProcessState::Zombie {
                 OrphanAction::CascadeReap
             } else {
-                OrphanAction::Detach
+                OrphanAction::AdoptToInit
             }
         }
         _ => OrphanAction::Ignore,
     }
 }
+
+/// 进程表回收路径的审计日志（主机测试安全版）。
+///
+/// `crate::warn!` 直写 PL011 MMIO（0x0900_0000），在宿主机 cargo test
+/// 里等于野指针写 → 段错误。而收养/级联回收是**表变更**而非纯函数，
+/// 主机单测必须真实执行 full_reap 才有意义（只测纯决策函数测不出
+/// 表状态机的回归）。故本文件内 full_reap 路径统一经此 shim：裸机 =
+/// 正常 Warn 级输出；cfg(test) = 静默丢弃。新增表变更日志请走这里。
+#[cfg(not(test))]
+fn audit_warn(args: core::fmt::Arguments<'_>) {
+    crate::runtime::logger::log_at(crate::runtime::logger::Level::Warn, args);
+}
+#[cfg(test)]
+fn audit_warn(_args: core::fmt::Arguments<'_>) {}
 
 /// 完全回收 seed 槽，并级联处理其 Zombie 后代（显式栈迭代，非递归）。
 /// 锁外销毁地址空间；全程零堆分配。槽已空则幂等跳过。
@@ -584,14 +631,19 @@ fn full_reap(seed: usize) {
                                 n += 1;
                                 *entry = None;
                             }
-                            OrphanAction::Detach => {
-                                crate::warn!(
-                                    "process {} (pid={}) orphaned: parent {} died",
+                            OrphanAction::AdoptToInit => {
+                                audit_warn(format_args!(
+                                    "process {} (pid={}) orphaned: parent {} died, adopted by init(pid={})",
                                     rec.name,
                                     rec.pid.raw(),
-                                    dying.raw()
-                                );
-                                rec.parent = None;
+                                    dying.raw(),
+                                    INIT_PID
+                                ));
+                                // init 收养：族谱重定向到 launchd。adopted 置位后
+                                // 该孤儿再退出时走防御回收（launchd 暂无 wait 循环，
+                                // 留尸必滞留——见 exit_disposition / 文件头部策略）。
+                                rec.parent = Some(init_pid());
+                                rec.adopted = true;
                             }
                             OrphanAction::Ignore => {}
                         }
@@ -611,12 +663,12 @@ fn full_reap(seed: usize) {
                 space.destroy();
             }
         }
-        crate::warn!(
+        audit_warn(format_args!(
             "process {} (pid={} slot={}) fully reaped: slot reclaimed",
             record.name,
             record.pid.raw(),
             s
-        );
+        ));
         for k in 0..n {
             // 防御：级联对象是 Zombie，addr_space 正常已在 zombify 时清空。
             if let Some(space) = casc_spaces[k] {
@@ -624,11 +676,11 @@ fn full_reap(seed: usize) {
                     space.destroy();
                 }
             }
-            crate::warn!(
+            audit_warn(format_args!(
                 "cascade reap: zombie pid={} slot={} (parent died)",
                 casc_pids[k],
                 casc_slots[k]
-            );
+            ));
             if top < MAX_PROCESSES {
                 stack[top] = casc_slots[k];
                 top += 1;
@@ -682,6 +734,7 @@ pub fn exit_current_with_status(status: i32) -> ! {
         };
         let my_pid = me_read.pid;
         let parent = me_read.parent;
+        let adopted = me_read.adopted;
         let parent_view: Option<ProcView> = parent.and_then(|pp| {
             table.iter().enumerate().find_map(|(i, e)| {
                 let r = e.as_ref()?;
@@ -699,7 +752,7 @@ pub fn exit_current_with_status(status: i32) -> ! {
         let parent_alive = matches!(parent_view, Some(pv) if pv.state != ProcessState::Zombie);
 
         // —— 阶段 2（独占写）：定处置 / 写退出码 / 转 Zombie / 取走父等待标记 ——
-        match exit_disposition(parent, parent_alive) {
+        match exit_disposition(parent, parent_alive, adopted) {
             ExitDisposition::BecomeZombie => {
                 // 单核 + 表锁内：刚才读到的记录必然仍在（不可能被并发移除）。
                 let me = table[slot].as_mut().expect("record vanished under lock");
@@ -735,21 +788,37 @@ pub fn exit_current_with_status(status: i32) -> ! {
                     space.destroy(); // 锁外销毁（纪律第 3 条）
                 }
             }
-            crate::info!(
-                "process slot={} became zombie (status={}, waiter={:?})",
-                slot,
-                status,
-                zp.wake_parent.map(|(_, p)| p.raw())
-            );
             if let Some((parent_slot, parent_pid)) = zp.wake_parent {
-                // 结果先写进父 TrapFrame 再唤醒：父被 dispatch 恢复现场时
-                // x0 已是最终返回值，无需 dispatch 侧任何改动。单核 +
-                // 父处于 Blocked ⇒ 写帧无竞争。
+                // —— continuation 交付路径：结果直接写父 TrapFrame 再唤醒。
+                // 父被 dispatch 恢复现场时 x0 已是最终返回值，无需 dispatch
+                // 侧任何改动；单核 + 父处于 Blocked ⇒ 写帧无竞争。
                 unsafe {
                     (*TRAP_FRAMES[parent_slot].get()).regs[0] =
                         crate::trap::encode_result(Ok(zp.packed));
                 }
+                // ⚠ 消费一次语义（实机回归：nohangtest 首轮轮询收到上一条
+                // waittest 的陈旧尸体 pid=7/42）：continuation 已经把收尸
+                // 结果交付给等待者，本尸体必须随交付即时摘除——否则记录
+                // 残留为 Zombie，父的下一次 wait(任意) 会二次收集同一死
+                // 子（返回陈旧数据；pid 复用后更是张冠李戴），违反 POSIX
+                // wait 恰好消费一次的契约。与 waitpid_step 的 Collect 分支
+                // （父事后补收路径）在此收敛为同一条不变量：
+                // 「僵尸记录存在 ⇒ 尚无人收到结果」。
+                let delivered = { PROCESS_TABLE.lock()[slot].take().is_some() };
+                crate::debug!(
+                    "process slot={} exit result delivered to pid={} (record consumed={})",
+                    slot,
+                    parent_pid.raw(),
+                    delivered
+                );
                 crate::scheduler::wake(parent_pid);
+            } else {
+                // 无等待者：留尸待父将来 wait 补收（快路径 Collect 分支）。
+                crate::info!(
+                    "process slot={} became zombie (status={})",
+                    slot,
+                    status
+                );
             }
         }
         Plan::ReapNow => full_reap(slot),
@@ -765,9 +834,45 @@ pub enum WaitStep {
     Completed(u64),
     /// 有活子未退：调用方应立即 block_current()（pending_wait 已置位）。
     Blocked,
+    /// WNOHANG 置位且“有活子但无尸可收”：不挂起、不登记 pending_wait，
+    /// 调用方立即返回 0（对照 Linux wait4 WNOHANG 约定，见 zero-abi）。
+    WouldBlock,
 }
 
-pub fn waitpid_step(target_pid: u64) -> Result<WaitStep, SysError> {
+/// 扫描决策 → 等待动作的映射（纯函数，主机单测覆盖 WNOHANG 语义）：
+/// flags bit0（[`zero_abi::syscall::WAIT_NOHANG`]）置位时“有活子无尸”
+/// 从 Sleep 改判 PollMiss；Collect / NoChild 不受 flags 影响
+/// （ECHILD 在两种模式下一致——无子就是无子）。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WaitAction {
+    /// 收尸：携带 (槽位, 编码返回值)。
+    Collect { slot: usize, packed: u64 },
+    /// 挂起等待（登记 pending_wait 后阻塞）。
+    Sleep,
+    /// WNOHANG 轮询落空：立即返回 0。
+    PollMiss,
+    /// 无匹配子进程：ECHILD（NotFound）。
+    NoChild,
+}
+
+pub(crate) fn wait_plan(caller: ProcessId, target: u64, flags: u64, procs: &[Option<ProcView>]) -> WaitAction {
+    match wait_scan(caller, target, procs) {
+        WaitDecision::Collect { slot, pid, code } => WaitAction::Collect {
+            slot,
+            packed: pack_wait_result(pid, code),
+        },
+        WaitDecision::Block => {
+            if flags & zero_abi::syscall::WAIT_NOHANG != 0 {
+                WaitAction::PollMiss
+            } else {
+                WaitAction::Sleep
+            }
+        }
+        WaitDecision::NoChild => WaitAction::NoChild,
+    }
+}
+
+pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
     let caller_slot = crate::scheduler::current_slot();
 
     enum Act {
@@ -790,23 +895,27 @@ pub fn waitpid_step(target_pid: u64) -> Result<WaitStep, SysError> {
                 exit_code: r.exit_code,
             });
         }
-        match wait_scan(me.pid, target_pid, &views) {
-            WaitDecision::Collect { slot, pid, code } => {
+        match wait_plan(me.pid, target_pid, flags, &views) {
+            WaitAction::Collect { slot, packed } => {
                 // 摘除尸体记录。不变量：addr_space 已在 zombify 时清空，
                 // 此处防御式带出以防万一。
                 let record = table[slot].take().ok_or(SysError::NotFound)?;
                 Act::Collect {
-                    packed: pack_wait_result(pid, code),
+                    packed,
                     space: record.addr_space,
                 }
             }
-            WaitDecision::Block => {
+            WaitAction::Sleep => {
                 if let Some(me) = table[caller_slot].as_mut() {
                     me.pending_wait = true;
                 }
                 Act::Block
             }
-            WaitDecision::NoChild => return Err(SysError::NotFound), // ECHILD
+            // 关键：WNOHANG 落空**绝不**置 pending_wait——否则本次轮询的
+            // 登记会与后续真正的阻塞 wait 语义互相污染（父没睡却带着
+            // “有人在等”的标记，子退出时会白写一次帧 + 白唤醒一次）。
+            WaitAction::PollMiss => return Ok(WaitStep::WouldBlock),
+            WaitAction::NoChild => return Err(SysError::NotFound), // ECHILD
         }
     }; // 表锁已释放
 
@@ -1013,6 +1122,9 @@ pub fn fork(
             pending_recv: None,
             // 族谱：Fork 是唯一产生父子关系的入口（POSIX fork 对齐）。
             parent: Some(parent_record.pid),
+            // 收养标记不随 Fork 遗传：被收养孤儿 fork 出的孙辈是“收养者
+            // 的孙进程”而非收养孤儿本身，其退出语义与普通子一致。
+            adopted: false,
             exit_code: None,
             pending_wait: false,
         });
@@ -1106,15 +1218,24 @@ mod state_machine_tests {
     #[test]
     fn exit_becomes_zombie_only_with_live_parent() {
         assert_eq!(
-            exit_disposition(Some(ProcessId::new(9)), true),
+            exit_disposition(Some(ProcessId::new(9)), true, false),
             ExitDisposition::BecomeZombie
         );
         // 无父 / 父已死 / 父已僵 → 立即完全回收
-        assert_eq!(exit_disposition(None, false), ExitDisposition::ReapImmediately);
+        assert_eq!(exit_disposition(None, false, false), ExitDisposition::ReapImmediately);
         assert_eq!(
-            exit_disposition(Some(ProcessId::new(9)), false),
+            exit_disposition(Some(ProcessId::new(9)), false, false),
             ExitDisposition::ReapImmediately
         );
+    }
+
+    #[test]
+    fn init_pid_is_frozen_at_two() {
+        // 收养目标的 ABI 级约定（见 INIT_PID 注释）：launchd 引导期首个
+        // spawn，NEXT_PID 自 2 起分配。此值一旦漂移，孤儿会被“收养”给
+        // 无关进程——用测试钉死，改引导顺序时必须显式更新这里。
+        assert_eq!(INIT_PID, 2);
+        assert_eq!(init_pid(), ProcessId::new(2));
     }
 
     #[test]
@@ -1182,12 +1303,13 @@ mod state_machine_tests {
             orphan_action(Some(dying), ProcessState::Zombie, dying),
             OrphanAction::CascadeReap
         );
-        // 活儿子摘除父链成为孤儿
+        // 活儿子：init 收养（parent 重定向 INIT_PID，第七刀策略）
         assert_eq!(
             orphan_action(Some(dying), ProcessState::Runnable, dying),
-            OrphanAction::Detach
+            OrphanAction::AdoptToInit
         );
-        // 孙子的父是被 Detach 的儿子（21），不是死者 → Ignore
+        // 孙子的父是活着的中间儿子（21），不是死者 → Ignore（收养单层，
+        // 中间儿子死后孙子才轮到被收养）
         assert_eq!(
             orphan_action(Some(ProcessId::new(21)), ProcessState::Runnable, dying),
             OrphanAction::Ignore
@@ -1204,5 +1326,149 @@ mod state_machine_tests {
             let packed = pack_wait_result(ProcessId::new(raw), code);
             assert_eq!((packed >> 32, (packed as u32) as i32), (raw, code));
         }
+    }
+
+    // ── 第七刀新增：WNOHANG 与 init 收养 ─────────────────────────────
+
+    #[test]
+    fn wnohang_maps_live_child_block_to_poll_miss() {
+        let t = table_of(&[
+            pv(0, P, None, ProcessState::Running, None),
+            pv(1, 11, Some(P), ProcessState::Running, None),
+        ]);
+        // 阻塞模式（flags=0）：有活子无尸可收 → Sleep
+        assert_eq!(wait_plan(caller(), 0, 0, &t), WaitAction::Sleep);
+        // WNOHANG 置位：同一张表 → PollMiss（不挂起，立即返回 0）
+        let nohang = zero_abi::syscall::WAIT_NOHANG;
+        assert_eq!(
+            wait_plan(caller(), 0, nohang, &t),
+            WaitAction::PollMiss
+        );
+        // 未定义位被忽略：只有 bit0 参与判定
+        assert_eq!(
+            wait_plan(caller(), 0, nohang | 0b1111_1110, &t),
+            WaitAction::PollMiss
+        );
+        assert_eq!(wait_plan(caller(), 0, 0b10, &t), WaitAction::Sleep);
+    }
+
+    #[test]
+    fn wnohang_leaves_collect_and_echild_untouched() {
+        let zombie_t = table_of(&[
+            pv(0, P, None, ProcessState::Running, None),
+            pv(1, 11, Some(P), ProcessState::Zombie, Some(42)),
+        ]);
+        let nohang = zero_abi::syscall::WAIT_NOHANG;
+        // 有尸可收：两种模式都立即收尸（WNOHANG 不改变 Collect）
+        for flags in [0u64, nohang] {
+            assert_eq!(
+                wait_plan(caller(), 0, flags, &zombie_t),
+                WaitAction::Collect { slot: 1, packed: pack_wait_result(ProcessId::new(11), 42) }
+            );
+        }
+        // 无任何子：ECHILD 不受 WNOHANG 影响（Linux 同款语义）
+        let lonely = table_of(&[pv(0, P, None, ProcessState::Running, None)]);
+        for flags in [0u64, nohang] {
+            assert_eq!(wait_plan(caller(), 0, flags, &lonely), WaitAction::NoChild);
+        }
+    }
+
+    #[test]
+    fn adopted_orphan_exit_is_reaped_not_zombified() {
+        // 路径 B（过渡防御）：被收养孤儿再退出。launchd 尚无 wait 循环，
+        // 若按常规转 Zombie，尸体无人认领 ⇒ 进程表泄漏。防御分支要求
+        // adopted=true 时无论收养者死活都直接完全回收。
+        assert_eq!(
+            exit_disposition(Some(init_pid()), true, true),
+            ExitDisposition::ReapImmediately
+        );
+        assert_eq!(
+            exit_disposition(Some(init_pid()), false, true),
+            ExitDisposition::ReapImmediately
+        );
+        // 对照组：非收养子、launchd 在世 → 正常留尸可收集（语义不变）。
+        assert_eq!(
+            exit_disposition(Some(init_pid()), true, false),
+            ExitDisposition::BecomeZombie
+        );
+    }
+
+    /// 表级测试的互斥哨兵：PROCESS_TABLE 是全局静态，而 cargo test
+    /// 默认多线程并行。凡直接改真实表的测试都必须持锁。
+    static TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_record(pid_raw: u64, slot: usize, parent: Option<u64>) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId::new(pid_raw),
+            name: "test-proc",
+            entry: thread_exit,
+            state: ProcessState::Runnable,
+            slot,
+            addr_space: None, // 测试绝不触发 AddressSpace::destroy
+            privileged: false,
+            entry_point: None,
+            user_stack_top: None,
+            started: true,
+            pending_recv: None,
+            parent: parent.map(ProcessId::new),
+            adopted: false,
+            exit_code: None,
+            pending_wait: false,
+        }
+    }
+
+    #[test]
+    fn full_reap_adopts_live_children_to_init() {
+        // 路径 A：父死亡瞬间，活子 parent 重定向 INIT_PID 且置 adopted；
+        // 孙辈不受牵连（收养单层），其父链仍指向活着的中间儿子。
+        let _g = TABLE_GUARD.lock().unwrap();
+        {
+            let mut table = PROCESS_TABLE.lock();
+            *table = [const { None }; MAX_PROCESSES];
+            table[3] = Some(make_record(20, 3, None)); // 将死的父
+            table[5] = Some(make_record(21, 5, Some(20))); // 活子
+            table[7] = Some(make_record(22, 7, Some(21))); // 孙辈
+        }
+        full_reap(3); // 父“死亡”
+
+        let table = PROCESS_TABLE.lock();
+        assert!(table[3].is_none(), "dying parent must be fully reaped");
+        let child = table[5].as_ref().expect("live child survives");
+        assert_eq!(child.pid, ProcessId::new(21));
+        assert_eq!(child.parent, Some(init_pid()), "orphan adopted by init");
+        assert!(child.adopted, "adoption flag must be set");
+        // 孙辈：父链仍指中间儿子（21），未被越级改写
+        let grand = table[7].as_ref().expect("grandchild untouched");
+        assert_eq!(grand.parent, Some(ProcessId::new(21)));
+        assert!(!grand.adopted);
+        // 清场：把全局表还原为空，避免影响其他测试对表状态的假设。
+        drop(table);
+        let mut table = PROCESS_TABLE.lock();
+        *table = [const { None }; MAX_PROCESSES];
+    }
+
+    #[test]
+    fn adopted_child_death_passes_adoption_to_grandchildren() {
+        // 收养链传递：被收养孤儿死后，它自己的子女轮到被 init 收养；
+        // 同时验证 adopted 标记只随 full_reap 的显式重定向置位，不随
+        // 族谱自动扩散。
+        let _g = TABLE_GUARD.lock().unwrap();
+        {
+            let mut table = PROCESS_TABLE.lock();
+            *table = [const { None }; MAX_PROCESSES];
+            table[5] = Some(make_record(21, 5, Some(INIT_PID))); // 已被收养的子
+            table[5].as_mut().unwrap().adopted = true;
+            table[7] = Some(make_record(22, 7, Some(21))); // 它的娃
+        }
+        full_reap(5); // 被收养孤儿退出（防御回收路径的表级效果）
+
+        let table = PROCESS_TABLE.lock();
+        assert!(table[5].is_none());
+        let grand = table[7].as_ref().expect("grandchild survives");
+        assert_eq!(grand.parent, Some(init_pid()));
+        assert!(grand.adopted);
+        drop(table);
+        let mut table = PROCESS_TABLE.lock();
+        *table = [const { None }; MAX_PROCESSES];
     }
 }

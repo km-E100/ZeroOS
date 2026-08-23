@@ -310,10 +310,19 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         // 有活子未退则挂起（pending_wait 登记 + block_current，子退出时
         // 由其 Exit 路径写父 TrapFrame 并 wake——零侵入 continuation）；
         // 无任何匹配子进程返回 NotFound（对应 ECHILD，重复 wait 幂等）。
+        //
+        // 第七刀 WNOHANG 扩展：x3 = flags（bit0 = WAIT_NOHANG）。flags
+        // 不经 trap.rs::decode_syscall 解包（该处对号位 22 冻结为只取
+        // x1=pid），在此直接从调用方 TrapFrame 读 x3 —— ABI 契约见
+        // zero-abi Syscall::WaitPid 文档。置位 WNOHANG 且“有活子无尸”
+        // 时不挂起、立即 Ok(0)；pending_wait 保持清零（见 process.rs
+        // WaitAction::PollMiss 注释）。
         Syscall::WaitPid { pid } => {
-            match crate::process::waitpid_step(pid) {
+            let flags = unsafe { (*frame).regs[3] };
+            match crate::process::waitpid_step(pid, flags) {
                 Ok(crate::process::WaitStep::Completed(value)) => Ok(value),
                 Ok(crate::process::WaitStep::Blocked) => crate::scheduler::block_current(),
+                Ok(crate::process::WaitStep::WouldBlock) => Ok(0),
                 Err(e) => Err(e),
             }
         }

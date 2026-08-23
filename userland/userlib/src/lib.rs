@@ -95,16 +95,48 @@ pub fn exit(code: i32) -> ! {
     }
 }
 
-/// 等待子进程退出并收集其退出码（号位 22，POSIX wait4 最小集）。
+/// 等待子进程退出并收集其退出码（号位 22，POSIX wait4 最小集；阻塞版）。
 ///
 /// - `pid = 0`：等待**任意**子进程；否则只等指定 pid 的子进程。
 /// - 成功：`Ok((child_pid, exit_code))`。
 /// - 无任何匹配子进程（含早已收过的重复 wait）：`Err(NotFound)`
 ///   （对应 POSIX ECHILD；幂等安全）。
 /// - 有未退出的活子：调用方挂起，子退出时内核带回结果后本函数返回。
+///
+/// 非阻塞轮询请用 [`wait_pid_flags`] + [`WAIT_NOHANG`]。
 pub fn wait_pid(pid: u64) -> Result<(u64, i32), SysError> {
-    let ret = svc_call(22, [pid, 0, 0, 0]);
-    unpack_wait_result(decode_result(ret)?)
+    match wait_pid_flags(pid, 0)? {
+        Some(pair) => Ok(pair),
+        // flags=0 时内核不可能返回轮询落空（0 值只在 WNOHANG 下出现），
+        // 此分支纯防御：视作无效结果而非静默错误。
+        None => Err(SysError::InvalidArgument),
+    }
+}
+
+/// [`Syscall::WaitPid`] 的 x3 flags 位（与 `zero_abi::syscall::WAIT_NOHANG`
+/// 同值；此处再导出方便用户态只依赖 userlib 的场景）。
+pub use zero_abi::syscall::WAIT_NOHANG;
+
+/// 等待子进程（号位 22）的 **flags 扩展版**（第七刀）：
+///
+/// - `flags = 0`：与 [`wait_pid`] 完全一致（阻塞等待）。
+/// - `flags` 含 [`WAIT_NOHANG`]（bit0）：无尸可收但有活子时**不挂起**，
+///   立即返回 `Ok(None)`（内核侧返回 0；对照 Linux `wait4(..., WNOHANG)`
+///   对未退出子进程返回 0 的约定）。pid≥2 恒非 0，故 0 值无歧义。
+/// - 无任何匹配子进程：两种模式一致返回 `Err(NotFound)`（ECHILD）。
+/// - 有尸可收：两种模式一致返回 `Ok(Some((pid, code)))` 并完成回收。
+pub fn wait_pid_flags(pid: u64, flags: u64) -> Result<Option<(u64, i32)>, SysError> {
+    let ret = svc_call(22, [pid, 0, flags, 0]);
+    map_wait_value(decode_result(ret)?, flags)
+}
+
+/// 内核返回值 → 用户结果的纯映射（主机单测覆盖 WNOHANG 判定段；
+/// 真实 svc 路径无法在宿主执行，判定逻辑收敛于此函数避免测试漂移）。
+fn map_wait_value(value: u64, flags: u64) -> Result<Option<(u64, i32)>, SysError> {
+    if value == 0 && flags & WAIT_NOHANG != 0 {
+        return Ok(None); // 轮询落空：有活子、无尸可收
+    }
+    Ok(Some(unpack_wait_result(value)?))
 }
 
 /// 内核返回值解包：`(pid << 32) | (code as u32)` → (pid, code)。
@@ -422,6 +454,20 @@ mod tests {
         }
         // 注：错误区间由 wait_pid 内的 decode_result 先行拦截（见
         // decode_error_interval_maps_to_sys_error），unpack 只处理成功值。
+    }
+
+    #[test]
+    fn wnohang_zero_result_maps_to_none_only_when_flagged() {
+        // 内核 WNOHANG 落空返回 0：flags 带 bit0 ⇒ Ok(None)（不挂起）。
+        assert_eq!(map_wait_value(0, WAIT_NOHANG), Ok(None));
+        // flags=0 时的 0 值：收尸结果恒含 pid≥2，0 不是合法收尸值，
+        // 但映射层不做二次判读——原样透传 Some((0,0))，绝不吞异常返回。
+        assert_eq!(map_wait_value(0, 0), Ok(Some((0, 0))));
+        // 未定义位不参与判定：bit1 置位但无 bit0 ≠ WNOHANG
+        assert_eq!(map_wait_value(0, 0b10), Ok(Some((0, 0))));
+        // 正常收尸值在 WNOHANG 模式下照常解包
+        let packed = (7u64 << 32) | 42u32 as u64;
+        assert_eq!(map_wait_value(packed, WAIT_NOHANG), Ok(Some((7, 42))));
     }
 
     #[test]
