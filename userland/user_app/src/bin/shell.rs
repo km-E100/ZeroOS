@@ -1,10 +1,11 @@
 //! zero-shell —— 交互式用户态控制台（ELF 基址 0x200000，见 link-user.ld）。
 //!
-//! 全部 syscall 均在 0-22 号位内：`ConsoleWrite`(9)、`ConsoleRead`(6)、
+//! 全部 syscall 均在已冻结号位内：`ConsoleWrite`(9)、`ConsoleRead`(6)、
 //! `Yield`(svc #1 快捷入口)、`Exit`(svc #2 快捷入口)、`SendMessage`(0)、
 //! `ReceiveMessage`(1)、`BlockRead`(7)/`BlockWrite`(8，仅 blktest
-//! 的 raw 扇区回环验证使用)、`Exec`(3，execdemo 经 fork 子进程使用)。
-//! 禁止 MMIO（用户态无 MMIO 权限）。
+//! 的 raw 扇区回环验证使用)、`Exec`(3，execdemo 经 fork 子进程使用)、
+//! `GetPid`(21)/`GetPpid`(23)、`WaitPid`(22)、`Brk`(24，仅 brktest
+//! 的用户堆增长/收缩验证使用)。禁止 MMIO（用户态无 MMIO 权限）。
 //!
 //! 【exec 自检协议】本二进制同时是 execdemo 的重载目标：内核 exec 把调用方
 //! 透传值放在 x2——非 0 即"被 exec 启动的演示实例"，打印新地址空间证据行
@@ -113,6 +114,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             // 分组总览：process（进程语义）/ storage（块与文件）/ system（其余）。
             println("commands:");
             println("  process: forktest/waittest/nohangtest/orphantest/waitspec/execdemo/segvdemo/pid/ppid");
+            println("  memory:  brktest");
             println("  storage: fstest/blktest");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
         } else if cmd.starts_with(b"echo ") {
@@ -148,6 +150,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                     println(")");
                 }
             }
+        } else if cmd == b"brktest" {
+            // 号位 24 端到端：用户堆 sbrk 增长/写入回读/收缩归位。
+            brktest_command();
         } else if cmd == b"forktest" {
             // 端到端 fork 验证：svc #0 / x0=2。
             // 返回值区分父子：父=Ok(child_pid)，子=Ok(0)。
@@ -582,6 +587,115 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         }
     }
     0
+}
+
+/// brktest —— 用户堆端到端验证（号位 24，第十刀）。
+///
+/// 序列：sbrk(0) 取初始 break → sbrk(8192) 增长两页（返回旧 break，
+/// POSIX 语义）→ 在新堆区写入特征图案并回读校验（证明页真实映射、
+/// EL0 可写且内容跨页正确）→ sbrk(-8192) 收缩 → 复查 break 归位。
+/// 各阶段打印 break 值；全过打印 PASS。任何一步失败即中止并指明阶段
+/// 与错误码，绝不 panic（panic_handler 只是最后防线）。
+fn brktest_command() {
+    const GROW: i64 = 8192; // 两页
+
+    println("brktest: heap grow/shrink round-trip (syscall 24)");
+    // ---- 1) 初始 break ----
+    let b0 = match userlib::sbrk(0) {
+        Ok(v) => v,
+        Err(e) => return print_brk_fail("sbrk(0) query", e),
+    };
+    print("[1/5] sbrk(0): initial break=0x");
+    print_hex(b0 as u64);
+    println("");
+
+    // ---- 2) 增长两页：必须返回增长前的旧 break ----
+    let grown_old = match userlib::sbrk(GROW) {
+        Ok(v) => v,
+        Err(e) => return print_brk_fail("sbrk(+8192)", e),
+    };
+    print("[2/5] sbrk(+8192): old break=0x");
+    print_hex(grown_old as u64);
+    println("");
+    if grown_old != b0 {
+        println("brktest: FAIL - sbrk did not return pre-grow break");
+        return;
+    }
+
+    // ---- 3) 新值复查 + 特征图案写入/回读 ----
+    let b1 = match userlib::sbrk(0) {
+        Ok(v) => v,
+        Err(e) => return print_brk_fail("sbrk(0) after grow", e),
+    };
+    print("[3/5] after grow break=0x");
+    print_hex(b1 as u64);
+    println("");
+    if b1 != b0 + GROW as usize {
+        println("brktest: FAIL - break did not advance by 8192");
+        return;
+    }
+    unsafe {
+        let words = GROW as usize / 8;
+        let base = b0 as *mut u64;
+        for i in 0..words {
+            core::ptr::write_volatile(base.add(i), heap_pattern(i));
+        }
+        for i in 0..words {
+            let got = core::ptr::read_volatile(base.add(i));
+            if got != heap_pattern(i) {
+                print("brktest: FAIL - readback mismatch at offset ");
+                print_u64((i * 8) as u64);
+                println("");
+                return;
+            }
+        }
+    }
+    println("      pattern write/readback: MATCH");
+
+    // ---- 4) 收缩两页：必须返回收缩前的旧 break ----
+    let shrunk_old = match userlib::sbrk(-GROW) {
+        Ok(v) => v,
+        Err(e) => return print_brk_fail("sbrk(-8192)", e),
+    };
+    print("[4/5] sbrk(-8192): old break=0x");
+    print_hex(shrunk_old as u64);
+    println("");
+    if shrunk_old != b1 {
+        println("brktest: FAIL - shrink did not report pre-shrink break");
+        return;
+    }
+
+    // ---- 5) 终态归位 ----
+    let b2 = match userlib::sbrk(0) {
+        Ok(v) => v,
+        Err(e) => return print_brk_fail("sbrk(0) final", e),
+    };
+    print("[5/5] final break=0x");
+    print_hex(b2 as u64);
+    println("");
+    if b2 != b0 {
+        println("brktest: FAIL - break did not return to initial value");
+        return;
+    }
+    println("brktest: PASS - user heap grow/shrink verified end-to-end");
+}
+
+/// brktest 堆区特征图案：位置相关的确定性 64 位字。写入与校验共用同一
+/// 函数重算期望值（不依赖读缓冲自身——与 blktest fill_block_pattern
+/// 同一设计纪律），常数取自 "ZEROHEAP" 的 ASCII 编码。
+fn heap_pattern(i: usize) -> u64 {
+    (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5A45_524F_4845_4150
+}
+
+/// brktest 单步失败统一打印：阶段 + 错误名 + 编码，然后返回。
+fn print_brk_fail(step: &str, e: SysError) {
+    print("brktest: FAIL at ");
+    print(step);
+    print(" (");
+    print(e.as_str());
+    print(" code=0x");
+    print_hex(e.code());
+    println(")");
 }
 
 /// 用户态近似延时（易失黑盒递减 + 周期性 yield）。环境无时钟源，

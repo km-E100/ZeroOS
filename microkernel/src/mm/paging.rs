@@ -652,3 +652,207 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
     );
     Ok(child)
 }
+
+// ═══ 号位 24 Brk：用户堆收缩的解除映射助手（第十刀新增，仅此一节）═══
+
+/// 解除 `[start, end)` 内全部有效叶子页映射（纯表遍历核心）。
+/// 物理页归还经 `on_free` 回调、BBM 屏障经 `barrier` 回调注入——host 单测
+/// 传 no-op/记录闭包即可覆盖遍历/跳过/计数逻辑（⚠ host 也是 aarch64，
+/// 真实 tlbi 指令在 EL0 属非法异常，故屏障必须可注入，与
+/// table_walk::Barrier / map_kernel_page 的既有模式同源），生产路径由
+/// [`unmap_user_range`] 绑定真实屏障与物理分配器。返回回收的物理页数。
+///
+/// - 只清 L3 有效**页**描述符（bits[1:0]=0b11）；L2 block（继承自内核
+///   恒等映射快照 / MMIO 的 2MiB 窗口）与任一级断链一律跳过——brk 增长
+///   从未分配过它们（map_physical_page 走 ensure_*_table 全部建 L3）；
+/// - ⛔ 防御：`KERNEL_SHARED_L1` 槽位（[1GiB,2GiB) 内核共享表本体）
+///   无条件跳过，与 destroy/clone 同一条铁律；
+/// - **BBM 次序**：写无效（break）→ `kbbm_barrier`（dsb ishst /
+///   tlbi vaae1is / dsb ish / isb，host 下 no-op）→ 屏障完成后才回调
+///   `on_free` 归还物理页。次序保证不存在“陈旧 TLB 条目仍可写已达
+///   分配器自由表的物理页”的窗口（否则后续 alloc 复用该页会被旧翻译
+///   静默改写——内存撕裂级事故）；
+/// - 清空后的 L3/L2 表页**不**就地回收：destroy_user_address_space 对
+///   整树兜底，而堆上限 64MiB ⇒ 残留空表至多 ~33 页，换取实现简单与
+///   无父槽回写竞态。
+///
+/// # Safety
+/// `root` 必须是有效地址空间的根表，且调用点保证无并发修改者
+/// （单核 + svc 上下文满足；与 map_physical_page 同一信任级别）。
+unsafe fn clear_user_leaf_range(
+    root: *mut PageTable,
+    start: usize,
+    end: usize,
+    barrier: &mut dyn FnMut(usize),
+    mut on_free: impl FnMut(usize),
+) -> usize {
+    assert!(
+        start <= end && start & (PAGE_SIZE - 1) == 0 && end & (PAGE_SIZE - 1) == 0,
+        "clear_user_leaf_range: range must be page-aligned (start={:#x} end={:#x})",
+        start,
+        end
+    );
+    let mut freed = 0usize;
+    let mut va = start;
+    while va < end {
+        let [i0, i1, i2, i3] = page_table_indices(va);
+        if i1 != KERNEL_SHARED_L1 {
+            let e0 = (*root).0[i0];
+            if is_valid(e0) && is_table(e0) {
+                let l1 = descriptor_to_table(e0) as *mut PageTable;
+                let e1 = (*l1).0[i1];
+                if is_valid(e1) && is_table(e1) {
+                    let l2 = descriptor_to_table(e1) as *mut PageTable;
+                    let e2 = (*l2).0[i2];
+                    if is_valid(e2) && is_table(e2) {
+                        let l3 = descriptor_to_table(e2) as *mut PageTable;
+                        let pte = (*l3).0[i3];
+                        if is_valid(pte) && pte & DESC_TYPE_TABLE != 0 {
+                            // break：先清叶子描述符，再走完整屏障序列。
+                            (*l3).0[i3] = 0;
+                            barrier(va);
+                            // 屏障完成后才归还物理页（理由见函数头注释）。
+                            on_free((pte & PHYS_ADDR_MASK) as usize);
+                            freed += 1;
+                        }
+                    }
+                    // e2 为 block：继承的恒等/MMIO 窗口，页属内核或设备，
+                    // 私有 L2 副本只是“引用”——绝不 free、绝不清除。
+                }
+            }
+        }
+        va += PAGE_SIZE;
+    }
+    freed
+}
+
+/// 解除用户地址空间 `[start, end)` 的 4KiB 页映射并归还物理页
+/// （号位 24 Brk 收缩路径的内核入口；start/end 必须页对齐）。
+/// 返回回收的物理页数；遍历/BBM/防御语义见 [`clear_user_leaf_range`]。
+pub unsafe fn unmap_user_range(space: &AddressSpace, start: usize, end: usize) -> usize {
+    // 生产绑定：真实 BBM 屏障（dsb ishst / tlbi vaae1is / dsb ish / isb）。
+    let mut b = |va: usize| kbbm_barrier(va);
+    unsafe { clear_user_leaf_range(space.root_table, start, end, &mut b, |pa| phys::free_page(pa)) }
+}
+
+#[cfg(test)]
+mod unmap_tests {
+    use super::*;
+    use crate::mm::table_walk::WalkOutcome;
+
+    /// 4K 对齐伪页表（地址即“物理地址”，与 table_walk 单测同一手法）。
+    #[repr(C, align(4096))]
+    struct FakeTables {
+        l0: [u64; 512],
+        l1: [u64; 512],
+        l2: [u64; 512],
+        l3_a: [u64; 512],
+        l3_b: [u64; 512],
+        l3_shared: [u64; 512],
+        l2_shared: [u64; 512],
+    }
+
+    impl FakeTables {
+        fn new() -> Self {
+            Self {
+                l0: [0; 512],
+                l1: [0; 512],
+                l2: [0; 512],
+                l3_a: [0; 512],
+                l3_b: [0; 512],
+                l3_shared: [0; 512],
+                l2_shared: [0; 512],
+            }
+        }
+
+        /// L0[0]→L1；L1[0]→L2（用户私有区）；L1[1]→L2_shared（模拟内核
+        /// 共享表 KERNEL_SHARED_L1=1，[1GiB,2GiB)）。
+        fn link_default(&mut self) {
+            self.l0[0] = make_table_descriptor(self.l1.as_ptr() as u64);
+            self.l1[0] = make_table_descriptor(self.l2.as_ptr() as u64);
+            self.l1[KERNEL_SHARED_L1] = make_table_descriptor(self.l2_shared.as_ptr() as u64);
+        }
+
+        fn space(&self) -> AddressSpace {
+            AddressSpace {
+                root_table: self.l0.as_ptr() as *mut PageTable,
+                root_phys: 0,
+            }
+        }
+
+        fn root(&self) -> *mut u64 {
+            self.l0.as_ptr() as *mut u64
+        }
+    }
+
+    #[test]
+    fn unmap_clears_leaps_blocks_and_kernel_shared() {
+        let mut t = FakeTables::new();
+        t.link_default();
+        // 窗口 A：VA 0x1000_0000（L2[128]）挂 L3_a，两页有效 + 一槽空洞。
+        t.l2[128] = make_table_descriptor(t.l3_a.as_ptr() as u64);
+        t.l3_a[0] = make_leaf_descriptor(0x9000_0000, USER_AP_RW, false);
+        t.l3_a[1] = make_leaf_descriptor(0x9000_1000, USER_AP_RW, false);
+        // t.l3_a[2] 保持 0（未映射槽位，unmap 必须幂等跳过）。
+        // 窗口 B：VA 0x1020_0000（L2[129]）是继承来的 2MiB block 快照。
+        t.l2[129] = (0x1020_0000u64) | DESC_VALID | DESC_AF;
+        // 内核共享区：VA 0x4000_0000（L1[1]）挂一页，unmap 绝不许碰。
+        t.l2_shared[0] = make_table_descriptor(t.l3_shared.as_ptr() as u64);
+        t.l3_shared[0] = make_leaf_descriptor(0xDEAD_B000, AP_EL1_RW_EL0_NONE, false);
+
+        let space = t.space();
+        let mut freed = [0usize; 8];
+        let mut freed_n = 0usize;
+        let mut barrier_count = 0usize;
+        let mut barrier = |_: usize| barrier_count += 1; // host：no-op + 计数
+        let n = unsafe {
+            clear_user_leaf_range(
+                space.root_table,
+                0x1000_0000,
+                0x1040_0000,
+                &mut barrier,
+                |pa| {
+                    freed[freed_n] = pa;
+                    freed_n += 1;
+                },
+            )
+        };
+        assert_eq!(barrier_count, 2, "每张被清的页必须各走一次 BBM 屏障");
+        // 仅两张有效用户页被回收；空洞/block/共享区一个都不能多。
+        assert_eq!(n, 2);
+        assert_eq!(&freed[..freed_n], &[0x9000_0000, 0x9000_1000]);
+        // 已清页走表必须 Unmapped（含原本就空的槽位）。
+        for va in [0x1000_0000, 0x1000_1000, 0x1000_2000] {
+            assert_eq!(unsafe { walk(t.root(), va) }, WalkOutcome::Unmapped);
+        }
+        // block 窗口原样保留（内核恒等快照不受 brk 收缩影响）。
+        assert!(matches!(
+            unsafe { walk(t.root(), 0x1020_1234) },
+            WalkOutcome::Block { .. }
+        ));
+        // 内核共享表内容分毫未动（⛔ 铁律回归）。
+        assert_eq!(
+            unsafe { walk(t.root(), 0x4000_0000) },
+            WalkOutcome::Page {
+                desc: t.l3_shared[0],
+                phys: 0xDEAD_B000,
+            }
+        );
+    }
+
+    #[test]
+    fn unmap_is_idempotent_and_counts_zero_on_empty_range() {
+        let mut t = FakeTables::new();
+        t.link_default();
+        let space = t.space();
+        let mut barrier = |_: usize| {};
+        let n = unsafe {
+            clear_user_leaf_range(space.root_table, 0x1000_0000, 0x1000_3000, &mut barrier, |_| {})
+        };
+        assert_eq!(n, 0, "全空范围必须零回收");
+    }
+
+    // 注：不写 #[should_panic] 对齐断言测试——workspace dev profile 为
+    // panic=abort，should_panic 会以 SIGILL 击沉整个测试进程。对齐契约
+    // 由 clear_user_leaf_range 入口 assert! 兜底（内核编程错误响亮失败）。
+}

@@ -1,5 +1,7 @@
 use crate::elf::{PF_W, PF_X};
-use crate::mm::address_space::{self, AddressSpace, MapError, USER_STACK_LEN, USER_STACK_TOP};
+use crate::mm::address_space::{
+    self, AddressSpace, MapError, USER_HEAP_BASE, USER_STACK_LEN, USER_STACK_TOP,
+};
 // PAGE_SIZE 由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
 use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
@@ -202,6 +204,12 @@ struct ProcessRecord {
     /// 登记原样保留——堵住第七刀已知缺口“父 wait(A) 期间子 B 先退出被
     /// 误投递”。
     wait_target: Option<WaitSpec>,
+    /// 用户堆当前 break（号位 24 Brk，第十刀）：堆区域为
+    /// `[USER_HEAP_BASE, brk)`，值恒为页对齐（初始 == USER_HEAP_BASE，
+    /// 即 0 字节堆）。spawn/exec 重置为基址；fork 原样继承——子进程的
+    /// 堆物理页由 eager-copy 克隆（clone_space）自然带上，无需额外搬运。
+    /// 读写只经本文件底部 heap_view / store_brk 助手（表锁纪律同源）。
+    brk: usize,
 }
 
 /// 挂起 WaitPid 的等待目标（目标集合化的集合元素），对标 POSIX wait4
@@ -390,6 +398,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> ProcessId {
         adopted: false,
         exit_code: None,
         wait_target: None,
+        // 新进程 0 字节堆（号位 24）：break 固定从 USER_HEAP_BASE 起步。
+        brk: USER_HEAP_BASE,
     });
 
     pid
@@ -653,6 +663,29 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
 pub fn get_parent_pid(slot: usize) -> Option<Option<ProcessId>> {
     let table = PROCESS_TABLE.lock();
     table[slot].map(|record| record.parent)
+}
+
+// ── 用户堆 break（号位 24 Brk）读写助手 ──────────────────────────────
+// 与 GetPpid 只读助手同一模式：语句级 Guard、锁内零分配零打印。
+// 页表操作在 syscalls.rs 的引擎里锁外进行（表锁→分配器锁反转纪律）。
+
+/// 读槽位的 (地址空间副本, 当前 brk)。地址空间缺失（内核直生占位）或
+/// 槽位无效返回 None，由调用方 fail-closed。AddressSpace 是 Copy——
+/// 拷贝出锁后做页操作是既有模式（fork/exec 同款）。
+pub(crate) fn heap_view(slot: usize) -> Option<(AddressSpace, usize)> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .get(slot)
+        .and_then(|entry| entry.as_ref())
+        .and_then(|record| record.addr_space.map(|space| (space, record.brk)))
+}
+
+/// 提交新 break 值（页表操作完成后的第二阶段；纯字段写，无分配）。
+pub(crate) fn store_brk(slot: usize, value: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(record) = table.get_mut(slot).and_then(|entry| entry.as_mut()) {
+        record.brk = value;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1382,6 +1415,10 @@ pub fn fork(
             adopted: false,
             exit_code: None,
             wait_target: None,
+            // POSIX fork：子进程 break 继承父值；[BASE, brk) 的堆物理页
+            // 已由上方 clone_space eager-copy 复制进子地址空间，值与页
+            // 天然一致，无需额外同步。
+            brk: parent_record.brk,
         });
     }
 
@@ -1532,6 +1569,9 @@ fn rebind_address_space(
             // enter_user_mode 与 switch_to 最终都从同一 TrapFrame 恢复，
             // TTBR0 已由 dispatch 的 activate 分支现读现切）。
             record.started = false;
+            // 号位 24：exec 重置用户堆——新映像从 0 字节堆起步（旧空间
+            // 连同其堆页随 old 空间销毁回收），与“新映像首启”语义一致。
+            record.brk = USER_HEAP_BASE;
             (old, true)
         }
         _ => (None, false),
@@ -1928,6 +1968,7 @@ mod state_machine_tests {
             adopted: false,
             exit_code: None,
             wait_target: None,
+            brk: USER_HEAP_BASE,
         }
     }
 

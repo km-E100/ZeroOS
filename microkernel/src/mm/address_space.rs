@@ -1,6 +1,17 @@
+use super::phys;
 use super::paging;
+use super::table_walk::PAGE_SIZE;
 
 pub use super::paging::{MapError, USER_STACK_LEN, USER_STACK_TOP};
+
+/// 用户堆基址（号位 24 Brk 布局契约，zero-abi Syscall::Brk 文档同步冻结）。
+/// 选址依据：ELF 链接区在 [0x20_0000, ~4MiB)、bootfs 在 2GiB、栈顶
+/// 0xFFFF_F000——0x1000_0000（256 MiB）与三者皆不相交，且天然 2 MiB
+/// 对齐；整个堆窗口 [BASE, BASE+64MiB) 落在用户私有 L1[0] 区间
+/// （< KERNEL_REGION_START=1GiB），绝不触碰内核共享表 L1[1]。
+pub const USER_HEAP_BASE: usize = 0x1000_0000;
+/// 用户堆总量上限：64 MiB（超出按 POSIX ENOMEM 报 NoMemory）。
+pub const USER_HEAP_MAX_LEN: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct AddressSpace {
@@ -40,6 +51,62 @@ impl AddressSpace {
         executable: bool,
     ) -> Result<(), MapError> {
         paging::map_user_phys_page(&mut self.inner, virt, phys, writable, executable)
+    }
+
+    /// brk 增长路径（号位 24）：为 `[start, end)`（页对齐）逐页分配零页并以
+    /// USER_AP_RW / UXN=1 映入本地址空间。新堆页**必须清零**——否则上一任
+    /// 进程的数据会经分配器复用泄漏进新堆（跨进程信息流事故）。
+    ///
+    /// 原子性：任一页失败（OOM / AlreadyMapped）即回滚本次调用已映射的
+    /// 全部页（unmap + 归还），地址空间保持调用前状态——半成品堆绝不
+    /// 暴露给用户，调用方只需把 break 留在原值即可。
+    ///
+    /// # Safety
+    /// 与 [`AddressSpace::map_page_phys`] 同一信任级别；须在无并发修改者
+    /// 的上下文调用（单核 svc 上下文满足）。
+    pub unsafe fn map_heap_region(&mut self, start: usize, end: usize) -> Result<(), MapError> {
+        assert!(
+            start <= end && start & (PAGE_SIZE - 1) == 0 && end & (PAGE_SIZE - 1) == 0,
+            "map_heap_region: range must be page-aligned (start={:#x} end={:#x})",
+            start,
+            end
+        );
+        let mut mapped = start;
+        while mapped < end {
+            let Some(page) = phys::alloc_page() else {
+                // OOM 回滚：撤销本次已映射的页后报错。
+                unsafe {
+                    paging::unmap_user_range(&self.inner, start, mapped);
+                }
+                return Err(MapError::OutOfMemory);
+            };
+            // 恒等映射下物理页可直接按 PA 清零，无需临时映射（同 ELF/bss 路径）。
+            unsafe {
+                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            }
+            if let Err(err) = self.map_page_phys(mapped, page, true, false) {
+                // 映射失败：刚分配的页先归还，再回滚此前已建好的映射。
+                unsafe {
+                    phys::free_page(page);
+                    if mapped > start {
+                        paging::unmap_user_range(&self.inner, start, mapped);
+                    }
+                }
+                return Err(err);
+            }
+            mapped += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// brk 收缩路径（号位 24）：解除 `[start, end)`（页对齐）的映射并归还
+    /// 物理页。BBM 次序（清 PTE → dsb ishst/tlbi vaae1is/dsb ish/isb →
+    /// 屏障后才 free）由 [`paging::unmap_user_range`] 保证。返回回收页数。
+    ///
+    /// # Safety
+    /// 同上：无并发修改者上下文。
+    pub unsafe fn unmap_heap_region(&self, start: usize, end: usize) -> usize {
+        unsafe { paging::unmap_user_range(&self.inner, start, end) }
     }
 
     pub fn ttbr0_phys(&self) -> u64 {

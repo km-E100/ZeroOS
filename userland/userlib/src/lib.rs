@@ -408,6 +408,44 @@ pub fn getppid() -> Result<u64, SysError> {
     decode_result(ret)
 }
 
+/// 调整用户堆 break（号位 24，POSIX brk 最小集）。
+///
+/// - `new_break = 0`：查询——返回当前 break（堆区域为
+///   `[USER_HEAP_BASE=0x1000_0000, break)`，初始 break == 基址）；
+/// - `new_break > 当前`：内核按页分配零页映入增长区间；
+/// - `new_break < 当前`：解除映射并归还物理页；
+/// - 成功返回**生效后的新 break**（内核向上对齐到 4KiB 页界后的规范值，
+///   与 Linux 返回原始请求值的差异见 ABI 冻结注释披露）；
+/// - 越过堆基址下界 → `Err(InvalidArgument)`；越过 64 MiB 上限或物理
+///   内存不足 → `Err(NoMemory)`（对应 POSIX ENOMEM）。
+pub fn brk(new_break: usize) -> Result<usize, SysError> {
+    let ret = svc_call(24, [new_break as u64, 0, 0, 0]);
+    decode_result(ret).map(|v| v as usize)
+}
+
+/// 以**增量**调整用户堆 break（号位 24 的 POSIX sbrk 语义封装）。
+///
+/// 成功返回**调用前的旧 break**（对照 POSIX sbrk：返回值指向新分配
+/// 区域的起点，`旧break .. 旧break+delta` 即本次到手的内存）。`delta
+/// = 0` 等价于查询当前 break。
+///
+/// 失败返回 `Err` 且 break 保持不变（正增量 OOM 回滚由内核保证原子性）。
+pub fn sbrk(delta: i64) -> Result<usize, SysError> {
+    let cur = brk(0)?;
+    let target = sbrk_next(cur, delta).ok_or(SysError::InvalidArgument)?;
+    brk(target)?;
+    Ok(cur)
+}
+
+/// sbrk 目标值纯计算（主机单测钉死；溢出一律 None → 上层报错且不动堆）。
+fn sbrk_next(cur: usize, delta: i64) -> Option<usize> {
+    if delta >= 0 {
+        cur.checked_add(delta as usize)
+    } else {
+        cur.checked_sub(delta.unsigned_abs() as usize)
+    }
+}
+
 /// 把 `code` 与文本载荷编码为一条 IPC `Message`。
 ///
 /// `text` 最多 127 字节（payload 128 字节，末字节保持 0，
@@ -528,5 +566,21 @@ mod tests {
         // 冻结布局：code@0，payload@4，总大小 132 字节
         assert_eq!(core::mem::size_of::<Message>(), 132);
         assert_eq!(core::mem::align_of::<Message>(), 4);
+    }
+
+    #[test]
+    fn sbrk_target_math_and_overflow_guards() {
+        const HB: usize = 0x1000_0000;
+        // 正增量：旧 break + delta。
+        assert_eq!(sbrk_next(HB, 0), Some(HB));
+        assert_eq!(sbrk_next(HB, 8192), Some(HB + 8192));
+        // 负增量：收缩到旧 break - |delta|（i64::MIN 的 unsigned_abs 无溢出）。
+        assert_eq!(sbrk_next(HB + 8192, -4096), Some(HB + 4096));
+        assert_eq!(sbrk_next(HB, -(HB as i64)), Some(0));
+        // 溢出防御：上溢/下溢一律 None（上层转 InvalidArgument，不动堆）。
+        assert_eq!(sbrk_next(usize::MAX, 1), None);
+        assert_eq!(sbrk_next(0, -1), None);
+        // i64::MIN：unsigned_abs 无溢出，但收缩量超过当前 break ⇒ 下溢 None。
+        assert_eq!(sbrk_next(HB, i64::MIN), None);
     }
 }
