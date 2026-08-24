@@ -158,6 +158,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  memory:  brktest");
             println("  storage: fstest/fsdemo/blktest");
             println("  threads: threaddemo/mutextest (futex-backed UserMutex)");
+            println("  pkg:      pkg ls [dir] / pkg rename <old> <new>");
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  security: login/su/whoami/sessions/secdemo");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
@@ -622,6 +623,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"fsdemo" {
             // 目录树端到端验证（第十二刀）。见 fsdemo_command。
             fsdemo_command();
+        } else if cmd == b"pkg" || cmd.starts_with(b"pkg ") {
+            // 包管理命令面（第十八刀 ZeroPkg 设备内 MVP）。见 pkg_command。
+            pkg_command(cmd);
         } else if cmd == b"mutextest" {
             // 线程同步原语验证（号位27/28，第十五刀二期）。见 mutextest_command。
             mutextest_command();
@@ -2358,5 +2362,96 @@ fn mutextest_command() {
         println("mutextest: PASS (futex-backed mutex, exact count)");
     } else {
         println("mutextest: FAIL");
+    }
+}
+
+// ═══════════════ 第十八刀：ZeroPkg 设备内命令面（MVP）══════════════
+
+/// pkg —— 包管理入口（MVP）。
+/// `pkg ls [dir]`   列目录（默认 /Applications，安装目标区）
+/// `pkg rename A B` 同卷原子改名（安装事务的提交动作）
+/// 完整 install 流（临时名写入→哈希校验→rename 上线）待 WS-B 后续，
+/// 本命令面先行打通 fsd 树语义的管理通路。
+fn pkg_command(cmd: &[u8]) {
+    let arg = cmd_arg(cmd);
+    if arg == b"ls" || arg.starts_with(b"ls ") {
+        let dir = if arg.len() > 2 { &arg[3..] } else { b"/Applications" };
+        let dir = if dir.starts_with(b"/") { &dir[1..] } else { dir };
+        let request = path_request(fs_vt::CMD_LIST, dir, None);
+        print("pkg> ");
+        let Some(response) = fs_exchange(&request) else {
+            return;
+        };
+        match response.code {
+            0 => {
+                let mut line_start = 0usize;
+                for i in 0..response.payload.len() {
+                    if response.payload[i] == 0 {
+                        break;
+                    }
+                    if response.payload[i] == b'\n' {
+                        println_bytes(&response.payload[line_start..i]);
+                        line_start = i + 1;
+                    }
+                }
+            }
+            _ => print_fs_fail("pkg ls", response.code),
+        }
+    } else if arg.starts_with(b"rename ") {
+        // rename <old> <new>
+        let rest = &arg[7..];
+        let sp = match rest.iter().position(|&b| b == b' ') {
+            Some(p) => p,
+            None => {
+                println("usage: pkg rename <old> <new>");
+                return;
+            }
+        };
+        let old = &rest[..sp];
+        let mut ns = sp + 1;
+        while ns < rest.len() && (rest[ns] == b' ' || rest[ns] == b'\t') {
+            ns += 1;
+        }
+        let new = &rest[ns..];
+        if old.is_empty() || new.is_empty() {
+            println("usage: pkg rename <old> <new>");
+            return;
+        }
+        fn strip<'a>(p: &[u8], out: &'a mut [u8; 64]) -> &'a [u8] {
+            let body = if p.first() == Some(&b'/') { &p[1..] } else { p };
+            let take = body.len().min(out.len());
+            out[..take].copy_from_slice(&body[..take]);
+            &out[..take]
+        }
+        let mut o_buf = [0u8; 64];
+        let mut n_buf = [0u8; 64];
+        let o = strip(old, &mut o_buf);
+        let n = strip(new, &mut n_buf);
+        let mut request = Message::empty();
+        request.code = fs_vt::CMD_RENAME;
+        let mut pos = 0usize;
+        for part in [&o[..], &[0u8][..], &n[..], &[0u8][..]] {
+            if pos + part.len() > request.payload.len() {
+                println("pkg rename: paths too long");
+                return;
+            }
+            request.payload[pos..pos + part.len()].copy_from_slice(part);
+            pos += part.len();
+        }
+        let Some(response) = fs_exchange(&request) else {
+            return;
+        };
+        match response.code {
+            0 => {
+                print("pkg rename ");
+                print_bytes(&o);
+                print(" -> ");
+                print_bytes(&n);
+                println(": ok");
+            }
+            _ => print_fs_fail("pkg rename", response.code),
+        }
+    } else {
+        println("usage: pkg ls [dir] | pkg rename <old> <new>");
     }
 }

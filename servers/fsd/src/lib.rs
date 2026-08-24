@@ -244,6 +244,7 @@ fn handle_request(message: &Message) {
         // 第十二刀：目录树语义
         vt::CMD_MKDIR => cmd_mkdir(&message.payload),
         vt::CMD_RMDIR => cmd_rmdir(&message.payload),
+        vt::CMD_RENAME => cmd_rename(&message.payload),
         vt::CMD_UNLINK | fs_proto::CMD_DELETE_FILE => cmd_unlink(&message.payload),
         // 旧码兼容映射（ABI 冻结值，见 protocol::fs 注释）：
         fs_proto::CMD_OPEN => cmd_open(&message.payload), // 无 mode 字节 → EXISTING
@@ -697,6 +698,63 @@ fn cmd_rmdir(payload: &[u8]) {
     respond(0, &[]);
 }
 
+/// 解析 [old\0new\0] 双路径载荷；两条均规整合法才返回 Some。
+fn parse_rename(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let first = payload.iter().position(|&b| b == 0)?;
+    let rest = &payload[first + 1..];
+    let second = rest.iter().position(|&b| b == 0)?;
+    let old = normalize_path(&payload[..first])?;
+    let new = normalize_path(&rest[..second])?;
+    Some((old, new))
+}
+
+/// RENAME（第十八刀 · ZeroPkg 安装事务地基）：同卷原子改名。
+/// 数据槽位原地保留（LBA 不动），仅超级块内换名并落盘——「原子」由
+/// 单扇区 RMW 的既有持久化纪律保证。目录标记不可改名（走 rmdir/mkdir
+/// 组合），父目录变更允许（跨目录移动 = 换全路径）。
+fn cmd_rename(payload: &[u8]) {
+    let Some((old, new)) = parse_rename(payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    if !MOUNT_OK.load(Ordering::SeqCst) {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let mut volume = VOLUME.lock();
+    if volume.degraded {
+        respond(fs_proto::ERR_DEVICE, &[]);
+        return;
+    }
+    let src = volume.slots.iter().position(|s| s.matches(&old));
+    let Some(from) = src else {
+        respond(fs_proto::ERR_NOT_FOUND, &[]);
+        return;
+    };
+    // 目标必须不存在（不覆盖——ZeroPkg 提交流程自行先清场）
+    if path_taken(&volume, &new) || new == old {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    // 新父目录必须存在
+    let (parent, _) = split_parent(&new);
+    if !parent_exists(&volume, parent) {
+        respond(fs_proto::ERR_NOT_FOUND, &[]);
+        return;
+    }
+    let slot = &mut volume.slots[from];
+    if slot.is_dir_marker() {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    if !slot.set_name(&new) {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    persist_super_locked(&mut volume);
+    respond(0, &[]);
+}
+
 /// UNLINK（第十二刀）：payload [path NUL]。删除一个文件（数据区槽位
 /// 就地回收复用）；目录必须走 RMDIR，不存在 → ERR_NOT_FOUND。
 fn cmd_unlink(payload: &[u8]) {
@@ -885,6 +943,21 @@ mod path_tests {
         assert!(slot.matches_dir(b"docs"));
         assert!(!slot.matches_dir(b"docsx")); // 前缀不得误配
         assert!(!slot.matches(b"docs")); // 标记不是文件
+    }
+
+    #[test]
+    fn rename_payload_parses_both_paths() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"old.txt");
+        payload.push(0);
+        payload.extend_from_slice(b"new.txt");
+        payload.push(0);
+        let (o, n) = parse_rename(&payload).expect("parse");
+        assert_eq!(o, b"old.txt".to_vec());
+        assert_eq!(n, b"new.txt".to_vec());
+        // 缺第二个 NUL → None
+        let bad = b"only-old";
+        assert!(parse_rename(bad).is_none());
     }
 
     #[test]

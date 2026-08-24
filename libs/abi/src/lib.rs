@@ -805,6 +805,11 @@ pub mod protocol {
             pub const CMD_RMDIR: u32 = 0x26;
             /// 删除文件（第十二刀）：`[path\0]`；目录须走 CMD_RMDIR。
             pub const CMD_UNLINK: u32 = 0x27;
+            /// 原子重命名（第十八刀 ZeroPkg 安装事务地基）：
+            /// `[old\0new\0]`——同卷内换路径，目标存在即拒绝。
+            /// 用途：安装流先写临时名 `.tmp`，校验后原子 rename 上线，
+            /// 实现「读者要么看到旧版、要么看到新版」的提交语义。
+            pub const CMD_RENAME: u32 = 0x28;
 
             /// OPEN mode：仅打开已存在文件（不存在 → ERR_NOT_FOUND）。
             pub const OPEN_EXISTING: u8 = 0;
