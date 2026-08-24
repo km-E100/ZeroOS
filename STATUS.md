@@ -98,12 +98,13 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 
 | 档 | 内容 | 状态 |
 | --- | --- | --- |
-| 🥇 | 堆损坏猎杀：canary+分配史工具**转正常驻**；根因未破但取证决定性收窄（堆轨迹干净/父路径正确/子进程断链后静默自旋且记录消失）；COW 重开阻塞立案，下会话 `-d int` 全异常追踪 | ✅工具交付·修复待续 |
-| 🥈 | ZeroPkg 设备内：立项设计冻结（docs/zeropkg_inos_plan.md，WS-A~D 四步） | ✅立项完成 |
-| 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex(三态字) + mutextest(3线程×500互斥自增精确断言) | ✅实机 PASS(-smp1/-smp4) |
-| 小件 | threaddemo+mutextest 注入 acceptance（15 项矩阵）；crashlog 评估缓行（需服务化） | ✅ |
+| 🥇 | 堆损坏猎杀：canary+分配史工具转正常驻；根因未破但取证决定性收窄；COW 重开阻塞立案 | ✅工具交付·修复待续 |
+| 🥈 | ZeroPkg 设备内：WS-A 已交付（abi::zpkg，feature 门控）；WS-B~D 待续 | ✅WS-A·余待续 |
+| 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex + mutextest | ✅实机 PASS |
+| 小件 | threaddemo+mutextest 注入 acceptance（15 项）；crashlog 缓行 | ✅ |
+| ➕ | **第十八刀·ACPI 静态表 WS-A~D 全交付**：RSDP 经 UEFI config table 抓取→boot.S 槽位补丁→no_std 解析器(host矩阵测试)→SMP 按 MADT 点亮(legacy 回退保留)；AML 不做 | ✅-smp4 实机验证 |
 
-**验收现状：15/15 ALL PASS**（-smp1 全矩阵 + -smp4 threaddemo/mutextest 冒烟）
+**验收现状：15/15 ALL PASS**（含 threaddemo/mutextest 新项）
 
 完成后解锁路径：堆损坏结案 → COW_SHARED_FORK 一键翻转 → SMP 阶段 3 收口。
 结构性天花板剩余：镜像级 KASLR 实施（设计已冻结）。
