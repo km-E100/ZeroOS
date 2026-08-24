@@ -409,6 +409,14 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         25 => Some(Syscall::Sleepticks {
             ticks: regs[1],
         }),
+        // 号位 26（CreateThread，第十五刀）：x1=entry/x2=stack/x3=tls/
+        // x4=arg。ABI 冻结于 zero-abi；tid 为 wait_pid 可 join 的真 pid。
+        26 => Some(Syscall::CreateThread {
+            entry: regs[1] as usize,
+            stack_top: regs[2] as usize,
+            tls: regs[3] as usize,
+            arg: regs[4] as usize,
+        }),
         // ═══ 号位 40-45：安全模型成型（第十三刀，本刀领地）═════════
         // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展自 40 起。
         // ABI 契约见 zero-abi Syscall::CapGrant..SessionList 文档；

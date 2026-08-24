@@ -129,6 +129,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  sched/sleep: sleepdemo (号位 25 Sleep(ticks))");
             println("  memory:  brktest");
             println("  storage: fstest/fsdemo/blktest");
+            println("  threads: threaddemo (shared-space thread + join)");
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  security: login/su/whoami/sessions/secdemo");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
@@ -593,6 +594,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"fsdemo" {
             // 目录树端到端验证（第十二刀）。见 fsdemo_command。
             fsdemo_command();
+        } else if cmd == b"threaddemo" {
+            // 线程模型端到端验证（号位 26，第十五刀）。见 threaddemo_command。
+            threaddemo_command();
         } else if cmd == b"clear" {
             // ANSI：清屏 + 光标归位
             let _ = console_write(b"\x1b[2J\x1b[H");
@@ -2125,4 +2129,109 @@ fn request_cap(target_pid: u64, caps: u32) -> Option<u64> {
         return None;
     }
     parse_token(&resp.payload)
+}
+
+// ═══════════════ 第十五刀：线程模型（threaddemo）═══════════════
+
+/// 线程与主程序共享的静态缓冲（同地址空间的直接证据）。
+/// 访问一律经 addr_of_mut!，规避 static_mut_refs 警告。
+static mut THREAD_SHARED: u64 = 0;
+
+/// 共享写入的特征值（来自 create_thread 的 arg 参数）。
+const THREAD_MAGIC_ARG: usize = 0xC0DE_CAFE;
+
+/// 线程入口：写共享区 → 打印 → exit(77)。**不得返回**（x30=0，
+/// 返回即 SIGSEGV 终结本线程——ABI 约定见 zero-abi 号位 26 文档）。
+extern "C" fn threaddemo_thread_entry(arg: usize) -> ! {
+    unsafe {
+        core::ptr::addr_of_mut!(THREAD_SHARED).write_volatile(arg as u64);
+    }
+    let tid = userlib::getpid().unwrap_or(0);
+    print("[T] thread tid=");
+    print_u64(tid);
+    print(" arg=0x");
+    print_hex(arg as u64);
+    println(" (shared space write done)");
+    userlib::exit(77);
+}
+
+/// threaddemo —— 线程端到端验证（第十五刀）。
+///
+/// 序列：sbrk 取 64KiB 线程栈 → 清共享标志 → CreateThread(入口/栈顶/
+/// tls=0/arg=MAGIC) → 主线程阻塞 wait_pid(tid) join → 断言退出码 77
+/// **且共享缓冲已被线程写入 MAGIC**（证明同地址空间零拷贝共享生效，
+/// 区别于 fork 的独立副本）。双断言全过打印 PASS。
+fn threaddemo_command() {
+    println("[P] threaddemo: allocating 64KiB thread stack via brk");
+    let old_break = match userlib::sbrk(65536) {
+        Ok(v) => v,
+        Err(e) => {
+            print("[P] sbrk failed: ");
+            print_i32(e as i32);
+            println("");
+            return;
+        }
+    };
+    let stack_top = (old_break + 65536 + 0xfff) & !0xfff; // 页对齐栈顶
+
+    unsafe {
+        core::ptr::addr_of_mut!(THREAD_SHARED).write_volatile(0);
+    }
+
+    let my = userlib::getpid().unwrap_or(0);
+    print("[P] self pid=");
+    print_u64(my);
+    println(", creating thread");
+    let tid = match unsafe {
+        userlib::create_thread(
+            threaddemo_thread_entry as usize,
+            stack_top,
+            0, // tls：本演示不用 TLS
+            THREAD_MAGIC_ARG,
+        )
+    } {
+        Ok(t) => t,
+        Err(e) => {
+            print("[P] create_thread failed: ");
+            print_i32(e as i32);
+            println("");
+            return;
+        }
+    };
+    print("[P] tid=");
+    print_u64(tid);
+    println("");
+
+    // join：阻塞收尸（tid 是真 pid，WaitPid 语义原样复用）
+    let mut pass = false;
+    match userlib::wait_pid(tid) {
+        Ok((pid, code)) => {
+            print("[P] joined tid=");
+            print_u64(pid);
+            print(" code=");
+            print_i32(code);
+            println("");
+            pass = pid == tid && code == 77;
+        }
+        Err(e) => {
+            print("[P] wait failed: ");
+            print_i32(e as i32);
+            println("");
+        }
+    }
+    let shared = unsafe { core::ptr::addr_of!(THREAD_SHARED).read_volatile() };
+    if shared != THREAD_MAGIC_ARG as u64 {
+        print("[P] shared buffer mismatch: 0x");
+        print_hex(shared);
+        println("");
+        pass = false;
+    } else {
+        println("[P] shared buffer carries thread write: ok");
+    }
+
+    if pass {
+        println("threaddemo: PASS (CreateThread + shared space + join)");
+    } else {
+        println("threaddemo: FAIL");
+    }
 }

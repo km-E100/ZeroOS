@@ -432,6 +432,25 @@ pub fn sleep_ticks(ticks: u64) -> Result<u64, SysError> {
     decode_result(ret)
 }
 
+/// 在调用方地址空间内创建线程（号位 26，第十五刀）。
+///
+/// 返回新线程 tid（真 pid，可用 [`wait_pid`] join）。共享语义：堆与
+/// 已映射页立即可见。`entry` 不得返回——应自行调用 [`exit`]（线程
+/// 语境下仅终结本线程）。
+///
+/// # Safety
+/// `entry`/`stack_top` 必须指向调用方地址空间内的合法代码/栈；
+/// `stack_top` 需预留足够深度且 16 字节对齐。
+pub unsafe fn create_thread(
+    entry: usize,
+    stack_top: usize,
+    tls: usize,
+    arg: usize,
+) -> Result<u64, SysError> {
+    let ret = svc_call(26, [entry as u64, stack_top as u64, tls as u64, arg as u64]);
+    decode_result(ret)
+}
+
 /// 以**增量**调整用户堆 break（号位 24 的 POSIX sbrk 语义封装）。
 ///
 /// 成功返回**调用前的旧 break**（对照 POSIX sbrk：返回值指向新分配

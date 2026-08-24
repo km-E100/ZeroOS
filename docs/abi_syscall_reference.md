@@ -40,6 +40,7 @@
 | 43 | SessionBegin | login_token, -, -, - | 新 sid | 一次性消费本进程名下含 CAP_SESSION 的令牌建会话；su 换会话注销旧会话 | 令牌即授权 |
 | 44 | GetSession | -,-,-,- | sid（无会话=0） | - | - |
 | 45 | SessionList | &buf, len, -, - | 写入字节数 | 行集 `sid=N leader=P\n` 截断到 len | - |
+| 26 | CreateThread | entry, stack_top, tls, arg | tid（真 pid，可 wait_pid join） | 共享地址空间线程（组载体模型：堆/映射页全组立即可见）；entry 不得返回（返回=SIGSEGV 终结本线程）；Exit 在线程语境仅终结本线程，组空间由末代成员回收 | - |
 
 ### 第十三刀补充说明（号位 40-45）
 

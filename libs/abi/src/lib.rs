@@ -1235,6 +1235,26 @@ pub mod syscall {
             /// 睡眠时长（timer tick 数）。
             ticks: u64,
         },
+        /// 号位 26：CreateThread——在**调用方地址空间**内创建线程
+        /// （第十五刀线程模型）。
+        ///
+        /// - `x1`=entry、`x2`=stack_top（调用方自备栈）、`x3`=tls
+        ///   （写入 TPIDR_EL0）、`x4`=arg（新线程 x0 初值）；
+        /// - 返回值 = 新线程 tid（真 pid，可经号位 22 wait_pid join）；
+        /// - 共享语义：堆与已映射页全组立即可见，无复制无 COW；
+        /// - 约定：entry 不得返回（返回即 SIGSEGV 终结本线程），应自行
+        ///   调用号位 5 Exit——线程语境下仅终结本线程，组空间由末代
+        ///   成员回收（载体所有权转移，见内核 process.rs 文档）。
+        CreateThread {
+            /// 线程入口（用户虚拟地址）。
+            entry: usize,
+            /// 线程栈顶（向下生长，页对齐推荐）。
+            stack_top: usize,
+            /// TLS 基址（TPIDR_EL0 初值；0 = 无 TLS）。
+            tls: usize,
+            /// 传给入口的参数（x0）。
+            arg: usize,
+        },
         // ═══ 第十三刀（安全模型成型）号位 40-45 ═════════════════════
         // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展从 40 起。
         // 内核侧落点：trap.rs::decode_syscall + syscalls::handle +

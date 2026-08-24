@@ -154,6 +154,29 @@ impl TrapFrame {
         self.tpidr_el0 = 0;
         self.fpu = FpuState::new();
     }
+
+    /// 线程现场初始化（第十五刀）：与 init_user 的差异——入口/栈/TLS/
+    /// 参数全部来自调用方（号位 26 CreateThread），x30 置零（entry 返回
+    /// 即 SIGSEGV 终结本线程，约定入口自行 exit，见 create_thread 文档）。
+    pub fn init_thread(
+        &mut self,
+        entry: usize,
+        user_stack_top: usize,
+        kernel_stack_top: usize,
+        tls: usize,
+        arg: usize,
+    ) {
+        self.regs = [0; 31];
+        self.regs[0] = arg as u64;
+        self.sp_el0 = user_stack_top as u64;
+        self.elr_el1 = entry as u64;
+        self.spsr_el1 = 0; // EL0t
+        self.sp_el1 = kernel_stack_top as u64;
+        // 注意：不调 fpu_discard_live——新线程帧独立、不动全局记账。
+        self.tpidr_el0 = tls as u64;
+        self.fpu = FpuState::new();
+        self.owner_slot = u64::MAX;
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -179,6 +202,13 @@ struct ProcessRecord {
     state: ProcessState,
     slot: usize,
     addr_space: Option<AddressSpace>,
+    /// 线程组 id（第十五刀线程模型）：进程=自身 pid；经号位 26
+    /// CreateThread 创建的线程继承创建者的 tgid。地址空间采用**唯一
+    /// 载体**模型——组内恰有一条记录的 addr_space 非空（组长或经转移
+    /// 的幸存者），其余成员为 None；exit/reap 时先尝试把空间转移给
+    /// 幸存成员，无人接手才销毁。TTBR0 值在转移前后不变（同一页表），
+    /// 运行中的成员零感知。
+    tgid: ProcessId,
     /// 进程能力位图（位定义见 `zero_abi::cap`；第八刀自布尔特权位
     /// `privileged: bool` 升格）：bit0=CAP_MMIO、bit1=CAP_BLOCK_DEV、
     /// bit2=CAP_SPAWN_SVC。fork 原样继承；引导路径由
@@ -427,6 +457,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
         state: ProcessState::Runnable,
         slot: slot_index,
         addr_space: None,
+        // 独立进程 = 自身即组长（第十五刀线程模型）。
+        tgid: pid,
         // 内核直生进程：默认无能力（fail-closed；能力只经显式授予或 fork 继承）。
         capabilities: 0,
         entry_point: None,
@@ -1063,10 +1095,18 @@ fn full_reap(seed: usize) {
         // 台账锁在外层、本处已不持表锁，无反转）。
         crate::security::on_process_gone(record.pid);
         if let Some(space) = record.addr_space {
-            // 锁外销毁：避免持进程表锁进入物理页分配器
-            //（表锁→分配器锁反转风险，scheduler.rs 锁纪律第 3 条）。
-            unsafe {
-                space.destroy();
+            // 线程组转移（第十五刀）：组长/载体被级联回收时先问组内
+            // 幸存者；无人接手才锁外销毁（表锁→分配器锁反转风险，
+            // scheduler.rs 锁纪律第 3 条，转移在上方短暂持锁完成）。
+            let transferred = {
+                let mut table = PROCESS_TABLE.lock();
+                transfer_group_space_locked(&mut table, record.tgid, record.pid, space)
+                    .is_none()
+            };
+            if !transferred {
+                unsafe {
+                    space.destroy();
+                }
             }
         }
         audit_warn(format_args!(
@@ -1141,6 +1181,8 @@ pub fn exit_current_with_status(status: i32) -> ! {
         let my_pid = me_read.pid;
         let parent = me_read.parent;
         let adopted = me_read.adopted;
+        // 第十五刀：快照线程组 id（Copy），释放表借用供阶段 2 可变访问。
+        let my_tgid = me_read.tgid;
         let parent_view: Option<ProcView> = parent.and_then(|pp| {
             table.iter().enumerate().find_map(|(i, e)| {
                 let r = e.as_ref()?;
@@ -1165,6 +1207,11 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 me.exit_code = Some(status);
                 me.state = ProcessState::Zombie;
                 let space = me.addr_space.take(); // 用户页/页表此刻归还
+                // 线程组转移（第十五刀）：组内还有幸存者则移交所有权
+                // （转移成功 ⇒ None，ZombiePlan.space 为 None 即不销毁）。
+                let space = space.and_then(|space| {
+                    transfer_group_space_locked(&mut table, my_tgid, my_pid, space)
+                });
                 // 第九刀目标集合化：仅当父的登记覆盖本退出子才取走标记。
                 // 判定与取走在同一表锁临界区内两段完成（单核无并发窗口；
                 // 决策函数 wait_wake_decision 与主机单测共用同一实现）。
@@ -1185,8 +1232,34 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 })
             }
             ExitDisposition::ReapImmediately => {
-                if let Some(me) = table[slot].as_mut() {
+                // 先摘自身记录（Copy 快照），腾出 &mut table 给转移扫描；
+                // 随后把记录放回（含未转出的空间，交 full_reap 常规销毁）。
+                let mut rec = table[slot].take();
+                let mut putback = true;
+                if let Some(me) = rec.as_mut() {
                     me.exit_code = Some(status); // 审计留痕（随后随记录销毁）
+                    if let Some(space) = me.addr_space.take() {
+                        if transfer_group_space_locked(
+                            &mut table,
+                            my_tgid,
+                            my_pid,
+                            space,
+                        )
+                        .is_none()
+                        {
+                            putback = false; // 空间已移交幸存成员
+                        }
+                    }
+                    if putback {
+                        table[slot] = rec;
+                    } else {
+                        // 空间已随转移归组内幸存者：本记录按 ReapNow 语义
+                        // 仍需回收——重新放入无空间版记录供 full_reap 摘除。
+                        if let Some(mut done) = rec.take() {
+                            done.addr_space = None;
+                            table[slot] = Some(done);
+                        }
+                    }
                 }
                 Plan::ReapNow
             }
@@ -1238,6 +1311,41 @@ pub fn exit_current_with_status(status: i32) -> ! {
     }
 
     crate::scheduler::reschedule()
+}
+
+/// 线程组空间所有权转移（第十五刀）：组长/载体退出时，若组内仍有
+/// 存活成员，把地址空间交给第一个幸存者并返回 None（调用方不得销毁，
+/// TTBR0 值不变、运行中成员零感知）；无人接手则原样返回（照旧销毁）。
+/// 必须在 PROCESS_TABLE 锁内调用。
+/// 组内幸存成员槽位（第十五刀）：同 tgid、非死者、非 Dying 且**尚未
+/// 持有空间**（addr_space=None）的第一条记录。纯函数，主机单测钉死。
+fn group_survivor_index(
+    table: &[Option<ProcessRecord>],
+    tgid: ProcessId,
+    dying_pid: ProcessId,
+) -> Option<usize> {
+    table.iter().position(|entry| {
+        entry.as_ref().map_or(false, |rec| {
+            rec.tgid == tgid && rec.pid != dying_pid && rec.state != ProcessState::Dying && rec.addr_space.is_none()
+        })
+    })
+}
+
+fn transfer_group_space_locked(
+    table: &mut Vec<Option<ProcessRecord>>,
+    tgid: ProcessId,
+    dying_pid: ProcessId,
+    space: AddressSpace,
+) -> Option<AddressSpace> {
+    match group_survivor_index(table, tgid, dying_pid) {
+        Some(idx) => {
+            if let Some(rec) = table[idx].as_mut() {
+                rec.addr_space = Some(space);
+            }
+            None // 已移交：调用方不得销毁
+        }
+        None => Some(space), // 无人接手：调用方照旧销毁
+    }
 }
 
 /// WaitPid 系统调用（号位 22）的核心步：原子「扫描 + 登记等待」后，
@@ -1359,11 +1467,39 @@ pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
 
 pub fn address_space(slot: usize) -> Option<AddressSpace> {
     let table = PROCESS_TABLE.lock();
-    let out = table[slot].and_then(|record| record.addr_space);
-    if let Some(s) = out {
+    // 第十五刀线程模型：成员线程的 addr_space 字段为 None（唯一载体
+    // 持有组空间）——回退到同 tgid 的载体记录取值。TTBR0 值与载体
+    // 持有期完全一致，dispatch 激活无需感知差异。
+    let rec = table.get(slot).and_then(|entry| *entry)?;
+    let out = match rec.addr_space {
+        Some(space) => Some(space),
+        None => {
+            if rec.tgid == rec.pid {
+                None
+            } else {
+                table.iter().find_map(|entry| {
+                    let r = entry.as_ref()?;
+                    (r.tgid == rec.tgid).then(|| r.addr_space).flatten()
+                })
+            }
+        }
+    };
+    if let Some(s) = &out {
         crate::debug!("process::address_space: slot={} root=0x{:x}", slot, s.ttbr0_phys());
     }
     out
+}
+
+/// 调用方是否为所在线程组的空间载体（第十五刀）：execve 重绑只允许
+/// 载体发起——成员线程 exec 会把整个组的映像换掉且其余线程无法跟随，
+/// 对照 POSIX「exec 杀死组内其余线程」的强语义，本里程碑先拒绝。
+pub fn owns_address_space(slot: usize) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table
+        .get(slot)
+        .and_then(|entry| *entry)
+        .map(|record| record.addr_space.is_some())
+        .unwrap_or(false)
 }
 
 #[allow(dead_code)]
@@ -1572,6 +1708,8 @@ pub fn fork(
             state: ProcessState::Runnable,
             slot: child_slot,
             addr_space,
+            // fork 出的是独立进程（新组长）：tgid=自身。
+            tgid: child_pid,
             // 能力位图原样继承（对标 POSIX fork 的凭据继承语义）。
             capabilities: parent_record.capabilities,
             entry_point: parent_record.entry_point,
@@ -1619,6 +1757,88 @@ pub fn fork(
     }
 
     Ok((child_pid, child_slot))
+}
+
+/// 创建线程（第十五刀线程模型 · 号位 26 内核入口）。
+///
+/// 与 fork 的本质差异：**共享地址空间**——子记录的 addr_space 字段为
+/// None（唯一载体模型，见 ProcessRecord.tgid 注释），TTBR0 经
+/// address_space 的回退查找指向组内载体的页表；堆/已映射页全组立即可见，
+/// 无复制无 COW。
+///
+/// 新线程现场：elr=entry、sp_el0=stack_top（调用方自备栈）、
+/// tpidr_el0=tls、x0=arg、SPSR=EL0t。entry 返回即取指 x30=0 ⇒ 触发
+/// instruction abort 按 SIGSEGV 终结该**线程**——约定入口必须自行调用
+/// userlib::exit（号位 5 在线程语境=仅终结本线程，组空间经所有权
+/// 转移由末代成员回收）。
+pub fn create_thread(
+    parent_slot: usize,
+    entry: usize,
+    stack_top: usize,
+    tls: usize,
+    arg: usize,
+) -> Result<ProcessId, ProcessError> {
+    let parent_record = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(parent_slot)
+            .and_then(|entry| *entry)
+            .ok_or(ProcessError::NoSuchProcess)?
+    };
+    // 父必须可达一个地址空间（自身持有或组内载体）。
+    if address_space(parent_slot).is_none() {
+        return Err(ProcessError::NoSuchProcess);
+    }
+    if stack_top == 0 || entry == 0 {
+        return Err(ProcessError::MapError(MapError::KernelRegion));
+    }
+
+    let child_pid = alloc_pid();
+
+    let child_slot;
+    {
+        let mut table = PROCESS_TABLE.lock();
+        let slot_index =
+            alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
+        child_slot = slot_index;
+        let slot = &mut table[slot_index];
+
+        *slot = Some(ProcessRecord {
+            pid: child_pid,
+            name: parent_record.name,
+            entry: parent_record.entry,
+            state: ProcessState::Runnable,
+            slot: child_slot,
+            addr_space: None, // 共享：唯一载体在组内（回退查找生效）
+            tgid: parent_record.tgid,
+            capabilities: parent_record.capabilities,
+            entry_point: Some(entry),
+            user_stack_top: Some(stack_top),
+            started: true,
+            pending_recv: None,
+            pending_signals: 0,
+            parent: Some(parent_record.pid),
+            adopted: false,
+            exit_code: None,
+            wait_target: None,
+            brk: parent_record.brk,
+            session: parent_record.session,
+        });
+    }
+
+    unsafe {
+        let child_tf = TRAP_FRAMES[child_slot].get();
+        *child_tf = TrapFrame::new();
+        (*child_tf).init_thread(entry, stack_top, kernel_stack_top_raw(child_slot), tls, arg);
+        core::ptr::write_bytes(KERNEL_STACKS[child_slot].as_ptr(), 0, KERNEL_STACK_SIZE);
+    }
+
+    crate::info!(
+        "process: create_thread parent={} -> tid={} (shared space)",
+        parent_record.pid.raw(),
+        child_pid.raw()
+    );
+    Ok(child_pid)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2142,6 +2362,7 @@ mod state_machine_tests {
             state: ProcessState::Runnable,
             slot,
             addr_space: None, // 测试绝不触发 AddressSpace::destroy
+            tgid: ProcessId::new(pid_raw), // 测试默认单线程组（第十五刀）
             capabilities: 0,
             entry_point: None,
             user_stack_top: None,
@@ -2470,5 +2691,81 @@ mod spawn_table_full_tests {
         assert_eq!(pid_at_slot(slot), Some(pid));
         assert_eq!(state(pid), Some(ProcessState::Runnable));
         restore_table_and_logger();
+    }
+}
+
+#[cfg(test)]
+mod thread_model_tests {
+    use super::*;
+    use super::state_machine_tests::TABLE_GUARD;
+
+    fn bare_record(pid_raw: u64, slot: usize) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId::new(pid_raw),
+            name: "t",
+            entry: thread_exit,
+            state: ProcessState::Runnable,
+            slot,
+            addr_space: None,
+            tgid: ProcessId::new(pid_raw),
+            capabilities: 0,
+            entry_point: None,
+            user_stack_top: None,
+            started: true,
+            pending_recv: None,
+            pending_signals: 0,
+            parent: None,
+            adopted: false,
+            exit_code: None,
+            wait_target: None,
+            brk: USER_HEAP_BASE,
+            session: 0,
+        }
+    }
+
+    /// 无地址空间的记录不可创建线程（防御路径）。
+    #[test]
+    fn create_thread_rejects_spaceless_parent() {
+        let _g = TABLE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut table = PROCESS_TABLE.lock();
+            *table = alloc::vec![None; 4];
+            table[0] = Some(bare_record(100, 0));
+        }
+        let err = create_thread(0, 0x1000, 0x2000, 0, 7);
+        assert!(matches!(err, Err(ProcessError::NoSuchProcess)));
+        // 失败路径不追加槽位；既有空洞布局保持原样（Vec 只增不减）。
+        {
+            let table = PROCESS_TABLE.lock();
+            assert_eq!(table.len(), 4);
+            assert!(table[0].is_some());
+            assert!(table[1..].iter().all(|slot| slot.is_none()));
+        }
+    }
+
+    /// 组空间转移判定走纯函数 group_survivor_index（矩阵见上）。
+    #[test]
+    fn group_survivor_via_helper() {
+        let mut table = alloc::vec![None; 4];
+        let leader = ProcessId::new(200);
+        // 组长持空间（真实不变式：载体 addr_space 恒 Some）
+        // ⚠ AddressSpace 真值需页表基建（phys_bitmap 初始化），宿主测试
+        // 无法构造——载体字段恒 None 的前提下，靠 dying_pid 排除组长。
+        let mut leader_rec = bare_record(200, 0);
+        leader_rec.tgid = leader;
+        table[0] = Some(leader_rec);
+        table[1] = Some({
+            let mut r = bare_record(201, 1);
+            r.tgid = leader;
+            r.parent = Some(leader);
+            r.addr_space = None;
+            r
+        });
+        // 组长死亡：成员接手
+        assert_eq!(group_survivor_index(&table, leader, leader), Some(1));
+        // 成员死亡：排除成员后只剩组长自身槽位——真实调用方保证此时
+        // 组长持有 Some(space) 故不会被选为"空手接盘者"；宿主侧以
+        // pid 排除语义验证。
+        assert_eq!(group_survivor_index(&table, leader, ProcessId::new(201)), Some(0));
     }
 }

@@ -340,6 +340,12 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         // "路径指针非 NULL"——trap.rs 零改动即获得 NULL 拒绝。
         Syscall::Exec { entry, arg } => {
             let caller_slot = crate::scheduler::current_slot();
+            // 线程组守门（第十五刀）：仅空间载体可 exec——成员线程 exec
+            // 会换掉全组映像且其余线程无法跟随（POSIX：exec 杀死组内
+            // 其余线程）。本里程碑先拒绝，文档已披露。
+            if !crate::process::owns_address_space(caller_slot) {
+                return Err(SysError::InvalidArgument);
+            }
             let name_len = arg as usize;
             if name_len == 0 {
                 // x2=0 不再是"函数指针模式"开关：空长度即非法路径长度。
@@ -433,6 +439,22 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 }
                 crate::scheduler::sleep_current(ticks)
             }
+        }
+        // ═══ 号位 26：CreateThread（第十五刀线程模型）═════════════
+        Syscall::CreateThread {
+            entry,
+            stack_top,
+            tls,
+            arg,
+        } => {
+            let caller_slot = crate::scheduler::current_slot();
+            let tid =
+                crate::process::create_thread(caller_slot, entry, stack_top, tls, arg)
+                    .map_err(map_process_error)?;
+            // ⚠ 入队（实机踩坑）：漏掉则新线程永不上调度，父 join 死等
+            // 触发软看门狗告警。
+            crate::scheduler::enqueue(tid);
+            Ok(tid.raw())
         }
         // ═══ 号位 40-45：capability 动态签发 / 会话（第十三刀）═════
         // ABI 冻结于 zero-abi（Syscall::CapGrant 等变体文档）；台账与
