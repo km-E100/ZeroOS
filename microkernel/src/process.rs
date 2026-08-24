@@ -1682,7 +1682,7 @@ pub fn fork(
     let addr_space = if let Some(space) = parent_record.addr_space {
         let cloned = address_space::clone_space(&space).map_err(ProcessError::MapError)?;
         let (shared, ro_shared, copied) = crate::mm::paging::last_clone_stats();
-        crate::info!(
+        crate::debug!(
             "process: cow fork pid={} -> child pid={} shared_pages={} readonly_shared={} copied={}",
             parent_record.pid.raw(),
             child_pid.raw(),
@@ -1923,6 +1923,9 @@ pub(crate) fn exec_stage_plan(build_ok: bool) -> &'static [ExecStage] {
 /// 不越过 USER_STACK_LEN 一半——保底剩余栈深，避免极端随机值压爆
 /// 深调用链。熵源见 crate::rng（计数器抖动，非密码学安全）。
 pub fn randomized_user_stack_top(base: usize) -> usize {
+    if crate::mm::table_walk::COW_BISECT_SKIP_ASLR {
+        return base;
+    }
     use crate::mm::table_walk::PAGE_SIZE;
     let max_pages = (USER_STACK_LEN / 2) / PAGE_SIZE;
     let offset_pages = crate::rng::random_page_offset(max_pages.min(256));

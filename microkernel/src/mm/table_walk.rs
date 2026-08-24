@@ -118,6 +118,7 @@ pub enum LeafShareClass {
 /// COW 模式确定性复现）。取证线索见 STATUS.md「已知问题」。翻转此值
 /// 即恢复第十刀零复制 fork（其在旧调度基线下实机 PASS，证据链完整）。
 pub const COW_SHARED_FORK: bool = false;
+pub const COW_BISECT_SKIP_ASLR: bool = false;
 
 pub fn classify_leaf(leaf: u64) -> LeafShareClass {
     if !COW_SHARED_FORK {
