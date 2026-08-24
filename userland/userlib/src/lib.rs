@@ -451,6 +451,21 @@ pub unsafe fn create_thread(
     decode_result(ret)
 }
 
+/// futex 条件等待（号位 27）：`*uaddr == expected` 才睡眠。
+/// 返回 Ok(0)=被唤醒；Err 里带不匹配时的实际值语义由内核约定：
+/// 不匹配时内核直接返回 actual（非错误码），故此处 actual 会经
+/// decode_result 变成 Ok(actual)——调用方用 [`futex_wait`] 即可屏蔽。
+pub fn futex_wait_raw(uaddr: usize, expected: u32) -> Result<u64, SysError> {
+    let ret = svc_call(27, [uaddr as u64, expected as u64, 0, 0]);
+    decode_result(ret)
+}
+
+/// 唤醒至多 max 个等在 uaddr 的线程，返回实际唤醒数（号位 28）。
+pub fn futex_wake(uaddr: usize, max: usize) -> Result<usize, SysError> {
+    let ret = svc_call(28, [uaddr as u64, max as u64, 0, 0]);
+    decode_result(ret).map(|v| v as usize)
+}
+
 /// 以**增量**调整用户堆 break（号位 24 的 POSIX sbrk 语义封装）。
 ///
 /// 成功返回**调用前的旧 break**（对照 POSIX sbrk：返回值指向新分配
@@ -662,5 +677,61 @@ mod tests {
         assert_eq!(sbrk_next(0, -1), None);
         // i64::MIN：unsigned_abs 无溢出，但收缩量超过当前 break ⇒ 下溢 None。
         assert_eq!(sbrk_next(HB, i64::MIN), None);
+    }
+}
+// ═══ 第十五刀二期：用户态互斥锁（futex 慢路径）═══════════════════
+//
+// 三态字约定（Linux 风格）：0=解锁、1=锁定无竞争、2=锁定有等待者。
+// lock 快路径 CAS 0→1；失败置 2 并 FutexWait(2)；unlock 置 0 后若
+// 此前为 2 则 FutexWake(1)。
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+const MUTEX_UNLOCKED: u32 = 0;
+const MUTEX_LOCKED: u32 = 1;
+const MUTEX_CONTENDED: u32 = 2;
+
+/// 内核辅助的互斥锁。`T` 值本身由使用者另行存放（本锁只管门闩），
+/// 或直接把 `Mutex<u32>` 当计数闸使用。
+pub struct UserMutex {
+    word: AtomicU32,
+}
+
+impl UserMutex {
+    pub const fn new() -> Self {
+        Self {
+            word: AtomicU32::new(MUTEX_UNLOCKED),
+        }
+    }
+
+    /// 加锁：快路径 CAS；竞争时置 CONTENDED 并 futex 睡眠。
+    pub fn lock(&self) {
+        match self
+            .word
+            .compare_exchange(MUTEX_UNLOCKED, MUTEX_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => {}
+            Err(_) => {
+                // 已有人持锁：标记 CONTENDED（保证 unlock 时会 wake），
+                // 再睡到被唤醒后重试快路径。
+                if self.word.swap(MUTEX_CONTENDED, Ordering::Acquire) != MUTEX_UNLOCKED {
+                    while self.word.load(Ordering::Relaxed) == MUTEX_CONTENDED {
+                        let _ = futex_wait_raw(
+                            self.word.as_ptr() as usize,
+                            MUTEX_CONTENDED,
+                        );
+                    }
+                }
+                // 醒来：重试整体 lock
+                self.lock();
+            }
+        }
+    }
+
+    /// 解锁：置 0；此前为 CONTENDED 则唤醒一个等待者。
+    pub fn unlock(&self) {
+        if self.word.swap(MUTEX_UNLOCKED, Ordering::Release) == MUTEX_CONTENDED {
+            let _ = futex_wake(self.word.as_ptr() as usize, 1);
+        }
     }
 }

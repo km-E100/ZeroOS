@@ -440,6 +440,16 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 crate::scheduler::sleep_current(ticks)
             }
         }
+        // ═══ 号位 27/28：FutexWait/Wake（第十五刀二期）════════════
+        Syscall::FutexWait { uaddr, expected } => {
+            match crate::process::futex_wait_check(uaddr, expected)? {
+                Some(actual) => Ok(actual as u64), // 条件不匹配：不睡眠
+                None => crate::process::futex_block_current(), // noreturn
+            }
+        }
+        Syscall::FutexWake { uaddr, max } => {
+            Ok(crate::process::futex_wake(uaddr, max) as u64)
+        }
         // ═══ 号位 26：CreateThread（第十五刀线程模型）═════════════
         Syscall::CreateThread {
             entry,

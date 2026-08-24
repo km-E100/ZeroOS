@@ -129,7 +129,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  sched/sleep: sleepdemo (号位 25 Sleep(ticks))");
             println("  memory:  brktest");
             println("  storage: fstest/fsdemo/blktest");
-            println("  threads: threaddemo (shared-space thread + join)");
+            println("  threads: threaddemo/mutextest (futex-backed UserMutex)");
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  security: login/su/whoami/sessions/secdemo");
             println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
@@ -594,6 +594,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
         } else if cmd == b"fsdemo" {
             // 目录树端到端验证（第十二刀）。见 fsdemo_command。
             fsdemo_command();
+        } else if cmd == b"mutextest" {
+            // 线程同步原语验证（号位27/28，第十五刀二期）。见 mutextest_command。
+            mutextest_command();
         } else if cmd == b"threaddemo" {
             // 线程模型端到端验证（号位 26，第十五刀）。见 threaddemo_command。
             threaddemo_command();
@@ -2233,5 +2236,99 @@ fn threaddemo_command() {
         println("threaddemo: PASS (CreateThread + shared space + join)");
     } else {
         println("threaddemo: FAIL");
+    }
+}
+
+// ═══════════════ 第十五刀二期：mutextest ═══════════════════════
+
+/// 共享计数器与门闩（线程组共享地址空间的直接受益者）。
+static MUTEX_COUNT: userlib::UserMutex = userlib::UserMutex::new();
+static mut MUTEX_COUNTER: u64 = 0;
+const MUTEX_ITERS: u64 = 500;
+
+/// 线程入口：持锁自增 N 次。arg 用作线程序号（打印区分）。
+extern "C" fn mutextest_entry(seq: usize) -> ! {
+    for _ in 0..MUTEX_ITERS {
+        MUTEX_COUNT.lock();
+        unsafe {
+            core::ptr::addr_of_mut!(MUTEX_COUNTER).write_volatile(
+                core::ptr::addr_of!(MUTEX_COUNTER).read_volatile() + 1,
+            );
+        }
+        MUTEX_COUNT.unlock();
+    }
+    let tid = userlib::getpid().unwrap_or(0);
+    print("[T] worker ");
+    print_u64(seq as u64);
+    print(" tid=");
+    print_u64(tid);
+    println(" done");
+    userlib::exit(0);
+}
+
+/// mutextest —— 三线程互斥计数验证（号位 26+27/28 组合拳）。
+///
+/// 主线程创建 3 个工作线程，各自经 UserMutex（快路径 CAS / 慢路径
+/// FutexWait-Wake）对共享计数器自增 500 次；全部 join 后断言总数恰为
+/// 1500。任何竞态/丢唤醒都会表现为计数偏差 ⇒ FAIL。
+fn mutextest_command() {
+    // sbrk 取 3 份线程栈（各 32KiB）
+    let old = match userlib::sbrk(3 * 32768) {
+        Ok(v) => v,
+        Err(e) => {
+            print("[P] sbrk failed: ");
+            print_i32(e as i32);
+            println("");
+            return;
+        }
+    };
+    unsafe {
+        core::ptr::addr_of_mut!(MUTEX_COUNTER).write_volatile(0);
+    }
+
+    let mut tids = [0u64; 3];
+    for seq in 0..3usize {
+        let stack_top = (old + (seq + 1) * 32768 + 0xfff) & !0xfff;
+        match unsafe { userlib::create_thread(mutextest_entry as usize, stack_top, 0, seq) } {
+            Ok(t) => tids[seq] = t,
+            Err(e) => {
+                print("[P] create_thread failed: ");
+                print_i32(e as i32);
+                println("");
+                return;
+            }
+        }
+    }
+    println("[P] 3 workers created (each +500 through UserMutex)");
+
+    let mut pass = true;
+    for seq in 0..3usize {
+        match userlib::wait_pid(tids[seq]) {
+            Ok((pid, code)) => {
+                if pid != tids[seq] || code != 0 {
+                    pass = false;
+                    print("[P] join mismatch pid=");
+                    print_u64(pid);
+                    print(" code=");
+                    print_i32(code);
+                    println("");
+                }
+            }
+            Err(e) => {
+                print("[P] join failed: ");
+                print_i32(e as i32);
+                println("");
+                pass = false;
+            }
+        }
+    }
+    let total = unsafe { core::ptr::addr_of!(MUTEX_COUNTER).read_volatile() };
+    print("[P] counter=");
+    print_u64(total);
+    println("");
+    if pass && total == 3 * MUTEX_ITERS {
+        println("mutextest: PASS (futex-backed mutex, exact count)");
+    } else {
+        println("mutextest: FAIL");
     }
 }

@@ -79,6 +79,8 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
   printf 'whoami\r';       sleep 2
   printf 'sessions\r';     sleep 2
   printf 'sleepdemo\r';    sleep 8
+  printf 'threaddemo\r';   sleep 10
+  printf 'mutextest\r';    sleep 12
   printf 'forktest\r';     sleep 5
   # blktest 注入已恢复（第十刀集成：Shell 最小授权补授 CAP_BLOCK_DEV，
   # 原第八刀收权后的"permission denied"不再发生）。
@@ -98,7 +100,7 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
     >"$LOG" 2>&1 &
 QEMU_PID=$!
 
-sleep 90
+sleep 130
 kill_qemu
 wait "$QEMU_PID" 2>/dev/null || true
 trap - EXIT INT TERM
@@ -131,6 +133,8 @@ check "blktest"          "blktest: PASS"
 check "fstest"           "fstest: PASS"
 check "sleepdemo"        "sleepdemo: PASS (sleep/wake + frame writeback)"
 check "fsdemo"           "fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)"
+check "threaddemo"       "threaddemo: PASS (CreateThread + shared space + join)"
+check "mutextest"        "mutextest: PASS (futex-backed mutex, exact count)"
 echo "--------------------------"
 total=$((pass + fail))
 if [[ $fail -eq 0 ]]; then

@@ -97,12 +97,15 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 
 | 档 | 内容 | 状态 |
 | --- | --- | --- |
-| 🥇 | 堆损坏猎杀：COW-MISS 探针 + 堆毒填/canary + 根因修复 + **翻转 COW_SHARED_FORK** | 🚧 |
-| 🥈 | ZeroPkg 设备内 WS-A~D（abi 解析核/fsd RENAME/shell 三命令/验收注入） | 🚧 |
-| 🥉 | 线程二期：号位27/28 FutexWait/FutexWake + userlib Mutex + 竞态验证 | 🚧 |
-| 小件 | threaddemo 注入 acceptance；crashlog 命令评估（pstore 设备内读取需新号位或服务化，先缓） | 🚧 |
+| 🥇 | 堆损坏猎杀：canary+分配史工具**转正常驻**；根因未破但取证决定性收窄（堆轨迹干净/父路径正确/子进程断链后静默自旋且记录消失）；COW 重开阻塞立案，下会话 `-d int` 全异常追踪 | ✅工具交付·修复待续 |
+| 🥈 | ZeroPkg 设备内：立项设计冻结（docs/zeropkg_inos_plan.md，WS-A~D 四步） | ✅立项完成 |
+| 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex(三态字) + mutextest(3线程×500互斥自增精确断言) | ✅实机 PASS(-smp1/-smp4) |
+| 小件 | threaddemo+mutextest 注入 acceptance（15 项矩阵）；crashlog 评估缓行（需服务化） | ✅ |
 
-完成后：SMP 阶段 3 随 🥇 自动收口；结构性天花板仅剩镜像级 KASLR 实施。
+**验收现状：15/15 ALL PASS**（-smp1 全矩阵 + -smp4 threaddemo/mutextest 冒烟）
+
+完成后解锁路径：堆损坏结案 → COW_SHARED_FORK 一键翻转 → SMP 阶段 3 收口。
+结构性天花板剩余：镜像级 KASLR 实施（设计已冻结）。
 
 ### SMP 多核立项（2026-08-24 定稿，四阶段）
 > 裁决：先 SMP 后 ACPI。virt 上副核启动走 PSCI CPU_ON（conduit 已验证），

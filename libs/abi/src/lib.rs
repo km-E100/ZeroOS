@@ -1255,6 +1255,20 @@ pub mod syscall {
             /// 传给入口的参数（x0）。
             arg: usize,
         },
+        /// 号位 27：FutexWait——条件等待（第十五刀线程二期）。
+        FutexWait {
+            /// 目标用户字（4 字节对齐 u32）。
+            uaddr: usize,
+            /// 期望值（不匹配即不睡眠，返回实际值）。
+            expected: u32,
+        },
+        /// 号位 28：FutexWake——唤醒至多 max 个等在该地址的线程。
+        FutexWake {
+            /// 目标用户字。
+            uaddr: usize,
+            /// 最大唤醒数。
+            max: usize,
+        },
         // ═══ 第十三刀（安全模型成型）号位 40-45 ═════════════════════
         // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展从 40 起。
         // 内核侧落点：trap.rs::decode_syscall + syscalls::handle +

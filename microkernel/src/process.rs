@@ -1185,6 +1185,8 @@ pub fn exit_current_with_status(status: i32) -> ! {
         let my_pid = me_read.pid;
         let parent = me_read.parent;
         let adopted = me_read.adopted;
+        // 第十五刀二期：摘除本进程的 futex 登记（防幽灵唤醒目标）。
+        futex_detach(my_pid);
         // 第十五刀：快照线程组 id（Copy），释放表借用供阶段 2 可变访问。
         let my_tgid = me_read.tgid;
         let parent_view: Option<ProcView> = parent.and_then(|pp| {
@@ -1315,6 +1317,86 @@ pub fn exit_current_with_status(status: i32) -> ! {
     }
 
     crate::scheduler::reschedule()
+}
+
+// ═══ 第十五刀二期：futex 等待表 ═══════════════════════════════════
+//
+// (uaddr, pid) 平表。容量上限防御同 SLEEP_QUEUE；线程死亡时的清理：
+// exit_current_with_status 走 remove/full_reap 前调用 futex_detach(pid)
+// （与 wait_target 摘除同一临界区风格），防幽灵等待者。
+
+#[derive(Copy, Clone)]
+struct FutexWaiter {
+    uaddr: usize,
+    pid: ProcessId,
+}
+
+static FUTEX_TABLE: Mutex<Vec<FutexWaiter>> = Mutex::new(Vec::new());
+const FUTEX_TABLE_CAP: usize = 128;
+
+/// 从用户地址读一个 u32（EL1 代读，信任级别与 copy_slice_from_user
+/// 同源：地址非法将由异常表的 EFAULT 路径终结调用者）。
+fn read_user_u32(uaddr: usize) -> u32 {
+    unsafe { (uaddr as *const u32).read_volatile() }
+}
+
+/// 号位 27 内核入口：条件不满足 ⇒ 入队阻塞（noreturn 由调用方包装）。
+/// 返回 Ok(Some(actual)) = 条件不匹配无需睡眠；Ok(None) = 已登记并
+/// 阻塞完成唤醒后的返回路径（本函数只登记，见下）。
+pub fn futex_wait_check(uaddr: usize, expected: u32) -> Result<Option<u32>, SysError> {
+    if uaddr % 4 != 0 {
+        return Err(SysError::InvalidArgument);
+    }
+    let actual = read_user_u32(uaddr);
+    if actual != expected {
+        return Ok(Some(actual));
+    }
+    let me = crate::scheduler::current_slot();
+    let pid = pid_at_slot(me).ok_or(SysError::NotFound)?;
+    {
+        let mut t = FUTEX_TABLE.lock();
+        if t.len() >= FUTEX_TABLE_CAP {
+            return Err(SysError::NoMemory);
+        }
+        // 双登记防丢唤：先入队再由调用方 block（IRQ 屏蔽窗口内无竞态）。
+        t.push(FutexWaiter { uaddr, pid });
+    }
+    Ok(None)
+}
+
+/// 登记后阻塞（syscalls 层在 futex_wait_check==None 时调用）。
+pub fn futex_block_current() -> ! {
+    crate::scheduler::block_current()
+}
+
+/// 号位 28 内核入口：唤醒至多 max 个等在该地址的线程。
+pub fn futex_wake(uaddr: usize, max: usize) -> usize {
+    let woken: Vec<ProcessId> = {
+        let mut t = FUTEX_TABLE.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < t.len() && out.len() < max {
+            if t[i].uaddr == uaddr {
+                out.push(t[i].pid);
+                t.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        out
+    };
+    for pid in woken {
+        if state(pid) == Some(ProcessState::Blocked) {
+            set_state(pid, ProcessState::Runnable);
+            crate::scheduler::enqueue(pid);
+        }
+    }
+    0
+}
+
+/// 进程死亡时摘除其全部 futex 登记（remove/full_reap 前调用）。
+pub fn futex_detach(pid: ProcessId) {
+    FUTEX_TABLE.lock().retain(|w| w.pid != pid);
 }
 
 /// 线程组空间所有权转移（第十五刀）：组长/载体退出时，若组内仍有

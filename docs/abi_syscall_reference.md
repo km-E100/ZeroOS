@@ -41,6 +41,8 @@
 | 44 | GetSession | -,-,-,- | sid（无会话=0） | - | - |
 | 45 | SessionList | &buf, len, -, - | 写入字节数 | 行集 `sid=N leader=P\n` 截断到 len | - |
 | 26 | CreateThread | entry, stack_top, tls, arg | tid（真 pid，可 wait_pid join） | 共享地址空间线程（组载体模型：堆/映射页全组立即可见）；entry 不得返回（返回=SIGSEGV 终结本线程）；Exit 在线程语境仅终结本线程，组空间由末代成员回收 | - |
+| 27 | FutexWait | uaddr, expected, -, - | 0（被唤醒）/ actual（不匹配不睡眠） | 原子条件等待；uaddr 4 字节对齐；线程死亡自动摘除登记 |
+| 28 | FutexWake | uaddr, max, -, - | 实际唤醒数 | 唤醒至多 max 个等在 uaddr 的线程；配合 UserMutex 三态字约定 |
 
 ### 第十三刀补充说明（号位 40-45）
 

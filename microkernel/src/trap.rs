@@ -428,6 +428,15 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
             tls: regs[3] as usize,
             arg: regs[4] as usize,
         }),
+        // 号位 27/28（FutexWait/Wake，第十五刀二期）：线程同步原语。
+        27 => Some(Syscall::FutexWait {
+            uaddr: regs[1] as usize,
+            expected: regs[2] as u32,
+        }),
+        28 => Some(Syscall::FutexWake {
+            uaddr: regs[1] as usize,
+            max: regs[2] as usize,
+        }),
         // ═══ 号位 40-45：安全模型成型（第十三刀，本刀领地）═════════
         // 号位 25=Sleep、26+=文件系统已被并行刀占用，安全扩展自 40 起。
         // ABI 契约见 zero-abi Syscall::CapGrant..SessionList 文档；
