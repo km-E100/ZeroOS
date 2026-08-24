@@ -102,6 +102,15 @@ __zero_driver_table:
 __zero_memory_bytes:
     .quad 0
 
+// RSDP 物理地址占位（ACPI 立项 · docs/acpi_static_plan.md WS-A/B）：
+// bootloader 从 UEFI config table 抓 ACPI2.0 RSDP 写入此处；0 = 无 ACPI，
+// 内核回退硬编码探测路径。恒等映射内，内核直接读。
+.align 3
+.weak __zero_rsdp_phys
+.type __zero_rsdp_phys, %object
+__zero_rsdp_phys:
+    .quad 0
+
 // -----------------------------------------------------------------------------
 // 内核引导栈
 // -----------------------------------------------------------------------------

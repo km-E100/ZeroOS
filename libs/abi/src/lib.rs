@@ -22,6 +22,11 @@
 
 #![no_std]
 
+#[cfg(feature = "zpkg")]
+extern crate alloc;
+
+
+
 pub mod bootfs;
 
 /// POSIX 信号编号最小集 + 进程 pending 位图编码（第九刀「信号位图最小版」）。
@@ -1630,3 +1635,7 @@ mod fuzz_tests {
         }
     }
 }
+
+#[cfg(feature = "zpkg")]
+#[cfg(feature = "zpkg")]
+pub mod zpkg;

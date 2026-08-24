@@ -7,6 +7,46 @@ use uefi::table::Runtime;
 /// 使内核拿到的 `BootInfo.memory_bytes` 反映实际硬件配置。
 const KERNEL_MEMORY_SYMBOL: &str = "__zero_memory_bytes";
 
+/// ACPI 静态表支持（立项 docs/acpi_static_plan.md · WS-A）：
+/// 从 UEFI System Table 的 config 数组抓 ACPI 2.0+ RSDP，补丁进内核
+/// 符号 `__zero_rsdp_phys`（0 = 未找到，内核回退硬编码探测路径）。
+const KERNEL_RSDP_SYMBOL: &str = "__zero_rsdp_phys";
+use uefi::data_types::Guid;
+/// ACPI 2.0 Table Guid：8868e871-e4f1-11d3-bc22-0080c73c8881
+const ACPI20_GUID: Guid = Guid::from_bytes(
+    0x8868_e871u128.to_le_bytes(),
+);
+
+fn find_rsdp_phys(st: &SystemTable<Boot>) -> Option<u64> {
+    for entry in st.config_table() {
+        if entry.guid == ACPI20_GUID {
+            return Some(entry.address as usize as u64);
+        }
+    }
+    None
+}
+
+fn patch_kernel_rsdp(kernel: &crate::kernel_loader::KernelImage, rsdp: Option<u64>) {
+    let Some(addr) = kernel.segments.symbol_address(KERNEL_RSDP_SYMBOL) else {
+        log_warn!("kernel symbol `{}` not found; rsdp stays 0", KERNEL_RSDP_SYMBOL);
+        return;
+    };
+    let value = rsdp.unwrap_or(0);
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u64, value);
+    }
+    if let Some(v) = rsdp {
+        log_info!(
+            "patched kernel `{}` @0x{:016x} = RSDP 0x{:x}",
+            KERNEL_RSDP_SYMBOL,
+            addr,
+            v
+        );
+    } else {
+        log_warn!("no ACPI RSDP in config table; kernel `{}` = 0", KERNEL_RSDP_SYMBOL);
+    }
+}
+
 /// 内核引导上下文：UEFI bootloader 与内核之间的协议载体。
 ///
 /// 当前内核入口 (boot.S `_start`) 固定读取静态 `boot_info_struct`，
@@ -55,6 +95,9 @@ impl KernelBootContext {
         );
 
         patch_kernel_memory(kernel, memory_bytes);
+
+        // ACPI（WS-A）：ExitBootServices 前 RSDP 仍由固件持有/有效。
+        patch_kernel_rsdp(kernel, find_rsdp_phys(st));
 
         // 精细内存图：把合并后的 CONVENTIONAL 区间表灌入内核汇槽，
         // 物理分配器据此登记空洞（失败仅告警，内核回退总量路径）。

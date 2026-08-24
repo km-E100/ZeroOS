@@ -20,6 +20,7 @@
 #![no_std]
 #![no_main]
 
+use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 use userlib::{
     cause_segv, console_read, console_write, create_channel, encode_message,
@@ -43,6 +44,33 @@ fn panic(_info: &PanicInfo) -> ! {
     let _ = console_write(msg);
     exit(1);
 }
+
+// ── 第十五刀二期：shell 侧极简分配器 ─────────────────────────────
+// 动机：zero-abi 引入 alloc 依赖后，链接器要求本 bin 提供全局分配器。
+// 当前 shell 自身零堆使用（bump 永不回收也够用）；未来若引入
+// String/Vec，应升级为 free-list（对照内核 heap_free_list）。
+struct ShellBump;
+
+const SHELL_HEAP_SIZE: usize = 64 * 1024;
+static mut SHELL_HEAP: [u8; SHELL_HEAP_SIZE] = [0; SHELL_HEAP_SIZE];
+static mut SHELL_BUMP: usize = 0;
+
+unsafe impl GlobalAlloc for ShellBump {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let base = core::ptr::addr_of!(SHELL_HEAP) as usize;
+        let cur = SHELL_BUMP;
+        let start = (base + cur + layout.align() - 1) & !(layout.align() - 1);
+        if start - base + layout.size() > SHELL_HEAP_SIZE {
+            return core::ptr::null_mut();
+        }
+        SHELL_BUMP = start - base + layout.size();
+        start as *mut u8
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static SHELL_ALLOC: ShellBump = ShellBump;
 
 extern "C" {
     static mut __bss_start: u8;
