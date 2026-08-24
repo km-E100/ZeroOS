@@ -1205,6 +1205,10 @@ pub fn exit_current_with_status(status: i32) -> ! {
         // remove_slot/full_reap 会级联处理本尸，两条路都收敛）。
         let parent_alive = matches!(parent_view, Some(pv) if pv.state != ProcessState::Zombie);
 
+        crate::error!(
+            "EXIT pid={} slot={} status={}",
+            my_pid.raw(), slot, status
+        );
         // —— 阶段 2（独占写）：定处置 / 写退出码 / 转 Zombie / 取走父等待标记 ——
         match exit_disposition(parent, parent_alive, adopted) {
             ExitDisposition::BecomeZombie => {

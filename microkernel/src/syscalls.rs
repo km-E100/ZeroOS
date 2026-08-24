@@ -210,6 +210,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             Ok(read as u64)
         }
         Syscall::ConsoleWrite { user_buffer, len } => {
+            crate::error!("CW-SYS len={}", unsafe { (*frame).regs[2] } as usize);
             if len == 0 {
                 return Ok(0);
             }
