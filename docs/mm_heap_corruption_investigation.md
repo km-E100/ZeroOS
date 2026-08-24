@@ -231,3 +231,28 @@ eager 同路径全绿 ⇒ 因果挂靠 COW 特有的 phys retain/bbm 序列，
 ## 下会话首选：表内存取证
 wait NotFound 处 `dump_record_bytes(slot)` hex-dump 记录 256B，对照
 ProcessRecord 布局找被覆写字段偏移；再由覆写内容反查来源缓冲。
+
+## 🎯 根因行为锁定（2026-08-24 · WAIT-STEP 探针轮）
+`WAIT-STEP caller_slot=5 target=7 flags=0`——**子进程（pid7/slot5）以
+「父分支」语义调用 wait_pid(7)**（等待自己 ⇒ NoChild ⇒ NotFound(3)）。
+
+⇒ COW 模式下 fork 的返回值分配被破坏：**子进程拿到的 x0 ≠ 0**。
+⇒ 连锁全解释：子走父分支→sleep(垃圾ticks)/wait(自身)→NotFound→FAIL
+  →回主循环忙转（DISP spam）；真父阻塞等一个永不退出的"伪父"
+  （elapsed 回写丢失亦同源——帧归属错乱）。
+⇒ forktest 为何通过：其子分支首两个 syscall(getpid/getppid) 不依赖
+  x0 值，且打印内容恰能掩盖分支错位（待复核）。
+
+## 已证实/已排除边界
+✅ 创建时 `(*child_tf).regs[0] = 0` 写入正确（FORK-COPY 探针实读）
+✅ 进程表记录完好（hex-dump 实证 pid/tgid/parent 全对）
+✅ 堆轨迹合法、Vec 生长排除、父侧 BBM 排除、CANARY 零触发
+❓ 写入(创建时) 与 装载(dispatch 时) 之间，child_tf.regs[0] 被改写
+   —— 或 restore_context 装载路径读错偏移/帧
+
+## 下会话行动（二选一或并用）
+1. 括号探针：fork 写零后、dispatch switch_to 前，两处各打
+   `child_tf.regs[0]` —— 精确圈定改写发生的半区；
+2. 若装载侧：dump restore_context 入口处 frame 前 16 字节 +
+   实际 ldp 的 x0 值对照；若写侧：在 write 后立即回读断言。
+3. 终极兜底：`-d int,in_asm --singlestep` 包裹窗口逐指令对照。

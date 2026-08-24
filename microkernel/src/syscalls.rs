@@ -562,7 +562,13 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 Ok(crate::process::WaitStep::Completed(value)) => Ok(value),
                 Ok(crate::process::WaitStep::Blocked) => crate::scheduler::block_current(),
                 Ok(crate::process::WaitStep::WouldBlock) => Ok(0),
-                Err(e) => Err(e),
+                Err(e) => {
+                    // 第十七刀🥇取证：NotFound 即转储全表（定位被覆写的 pid）
+                    if e == SysError::NotFound {
+                        crate::process::debug_dump_table();
+                    }
+                    Err(e)
+                }
             }
         }
     }

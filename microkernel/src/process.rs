@@ -962,6 +962,12 @@ pub(crate) fn wait_scan(
 ) -> WaitDecision {
     let mut has_live_child = false;
     for view in procs.iter().flatten() {
+        if view.parent == Some(caller) {
+            crate::error!(
+                "SCAN-CAND pid={} state={:?} zombie-code={:?} tgt-match={}",
+                view.pid.raw(), view.state, view.exit_code, view.pid.raw() == target
+            );
+        }
         if view.parent != Some(caller) {
             continue;
         }
@@ -1149,6 +1155,32 @@ fn full_reap(seed: usize) {
 /// `AddressSpace::destroy()` → `paging::destroy_user_address_space()`
 /// 桥接，销毁必须发生在 PROCESS_TABLE 锁外（full_reap 已遵守）。
 /// TRAP_FRAMES/KERNEL_STACKS 是 64×16KiB 静态数组，槽位回用即可。
+/// 第十七刀🥇取证：全表概览 + 僵尸记录原始字节转储（定位越界写者）。
+pub fn debug_dump_table() {
+    let table = PROCESS_TABLE.lock();
+    crate::error!("TBL-DUMP len={}:", table.len());
+    for (i, entry) in table.iter().enumerate() {
+        let Some(rec) = entry else {
+            continue;
+        };
+        crate::error!(
+            "TBL slot={} pid={:#x} tgid={:#x} parent={:#x} state={:?} name={}",
+            i,
+            rec.pid.raw(),
+            rec.tgid.raw(),
+            rec.parent.map(|p| p.raw()).unwrap_or(0),
+            rec.state,
+            rec.name
+        );
+        // 原始字节：pid 字段（前 8 字节）逐字节——垃圾覆写在此可见。
+        let base = core::ptr::addr_of!(*entry).cast::<u8>();
+        if !base.is_null() {
+            let bytes = unsafe { core::slice::from_raw_parts(base, 48) };
+            crate::error!("TBL raw[{}] {:02x?}", i, &bytes[..48]);
+        }
+    }
+}
+
 pub fn remove_slot(slot: usize) {
     assert!(slot < MAX_PROCESSES, "remove_slot: slot {} out of range", slot);
     if let Some(rec) = PROCESS_TABLE.lock().get(slot).and_then(|e| *e) {
@@ -1485,6 +1517,7 @@ pub(crate) fn wait_plan(caller: ProcessId, target: u64, flags: u64, procs: &[Opt
 
 pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
     let caller_slot = crate::scheduler::current_slot();
+    crate::error!("WAIT-STEP caller_slot={} target={} flags={:#x}", caller_slot, target_pid, flags);
 
     enum Act {
         Collect { packed: u64, space: Option<AddressSpace> },
