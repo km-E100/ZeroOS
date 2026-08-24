@@ -86,8 +86,15 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 - spawn/exec 两路用户栈顶向下随机偏移 ≤1MiB（页粒度，保底半栈深）
 - 镜像级 KASLR 待 PIE 工具链改造（bootloader 选址+重定位），另行立项
 
-## 结构性天花板剩余
-SMP 阶段 3（TLB 击落深化 + COW 重开）/ 镜像级 KASLR / ZeroPkg 生态
+## 待立项 → 已立项（设计冻结，实施待排）
+| 项目 | 立项文档 | 关键结论 |
+| --- | --- | --- |
+| SMP 阶段 3 · COW 重开 | docs/mm_heap_corruption_investigation.md | 阻塞于内核堆损坏 bug（trap 日志串覆写空闲链/进程表）；自动捕获工具已转正；行动清单四步 |
+| 镜像级 KASLR | docs/kaslr_image_plan.md | 推荐 PIE 方案四步走，用户态先行；阶段1栈随机化已交付 |
+| ZeroPkg 生态 | docs/zeropkg_inos_plan.md | 宿主侧已成型；缺口=设备内 pkg ls/install/remove 四步刀次；依赖 fsd 树+session 均已交付 |
+
+## 结构性天花板剩余（未立项）
+线程模型后续（TLS 动态注册/mutex ABI）/ SMP 阶段 3 收口后重审
 
 ### SMP 多核立项（2026-08-24 定稿，四阶段）
 > 裁决：先 SMP 后 ACPI。virt 上副核启动走 PSCI CPU_ON（conduit 已验证），
