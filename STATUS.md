@@ -107,8 +107,9 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 **验收现状：15/15 ALL PASS**（含 threaddemo/mutextest 新项）
 **压力长跑：-smp4 三轮 6/6 functional 全绿**（scripts/stress-loop.sh）
 **P1-P3 收口**：stress-loop 脚本入库 / README 现代化 / perf-history 首期
-入库 / knife10~13 worktree 与分支清理。剩余待实施仅三项设计文档对应
-的实施工作（堆损坏修复→COW 重开、ZeroPkg WS-B~D、镜像级 KASLR）。
+入库 / knife10~13 worktree 与分支清理。
+**第十八刀追加**：userlib Condvar（futex 实现）交付；COW 重开阻塞立案
+（Vec 生长假说已排除，见调查文档「已排除」节）；ZeroPkg WS-B/C 交付。
 
 完成后解锁路径：堆损坏结案 → COW_SHARED_FORK 一键翻转 → SMP 阶段 3 收口。
 结构性天花板剩余：镜像级 KASLR 实施（设计已冻结）。

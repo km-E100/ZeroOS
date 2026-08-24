@@ -735,3 +735,38 @@ impl UserMutex {
         }
     }
 }
+
+/// 条件变量（第十五刀二期 · futex 实现）。
+///
+/// 用法契约：`wait` 必须在持有配套 [`UserMutex`] 时调用——内部先解锁、
+/// 睡眠、被唤醒后重新加锁返回（对照 POSIX pthread_cond_wait 的原子
+/// 释放-等待语义，由「先解互斥锁再 futex 睡眠」的顺序近似；存在经典
+/// 唤醒丢失窗口的调用方应改用带谓词的重试循环）。
+pub struct Condvar {
+    word: AtomicU32,
+}
+
+impl Condvar {
+    pub const fn new() -> Self {
+        Self {
+            word: AtomicU32::new(0),
+        }
+    }
+
+    /// 阻塞等待：解锁 `m` → futex 睡眠 → 醒来后重加锁 `m`。
+    pub fn wait(&self, m: &UserMutex) {
+        m.unlock();
+        let _ = futex_wait_raw(self.word.as_ptr() as usize, 0);
+        m.lock();
+    }
+
+    /// 唤醒一个等待者。
+    pub fn notify_one(&self) {
+        let _ = futex_wake(self.word.as_ptr() as usize, 1);
+    }
+
+    /// 唤醒全部等待者。
+    pub fn notify_all(&self) {
+        let _ = futex_wake(self.word.as_ptr() as usize, u32::MAX as usize);
+    }
+}
