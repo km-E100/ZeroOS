@@ -318,6 +318,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let (child_pid, _) =
                 crate::process::fork(caller_slot, parent_frame).map_err(map_process_error)?;
             crate::scheduler::enqueue(child_pid);
+            crate::error!("FORK-DONE parent_slot={} child={}", caller_slot, child_pid.raw());
             Ok(child_pid.raw())
         }
         // ═══ 号位 3：execve 最小完备版（第九刀，破坏性升级）═══

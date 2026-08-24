@@ -639,10 +639,16 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
 /// 全过打印 PASS。对照 waitspec 的 delay_cycles 忙等：本命令期间 CPU
 /// 可让给其他进程，串口活性即为调度器未空转的旁证。
 fn sleepdemo_command() {
-    println("[P] sleepdemo: forking sleeper child (child sleeps 12 ticks)");
+    let my = userlib::getpid().unwrap_or(9999);
+    print("[P] sleepdemo(self pid=");
+    print_u64(my);
+    println("): forking sleeper child (child sleeps 12 ticks)");
     match userlib::fork() {
         Ok(0) => {
-            println("[C] child alive, sleeping 12 ticks");
+            let cpid = userlib::getpid().unwrap_or(8888);
+            print("[C] child alive pid=");
+            print_u64(cpid);
+            println(", sleeping 12 ticks");
             // 子：睡 12 tick → elapsed 回写 ≥ 12 → exit(77)
             match userlib::sleep_ticks(12) {
                 Ok(elapsed) => {

@@ -80,10 +80,9 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
   printf 'sessions\r';     sleep 2
   printf 'sleepdemo\r';    sleep 8
   printf 'forktest\r';     sleep 5
-  # ⚠ blktest 暂缓注入：第八刀 bef2ce9 对号位 7/8 收权（需
-  #   CAP_BLOCK_DEV）后，无位 shell 的 raw 直通被正确拒绝——这是收权的
-  #   预期效果而非缺陷；blktest 需要持位进程或专用授权路径，留待后续
-  #   刀次决策后恢复。fstest 不受影响（fsd/blkdrv 静态持有该位）。
+  # blktest 注入已恢复（第十刀集成：Shell 最小授权补授 CAP_BLOCK_DEV，
+  # 原第八刀收权后的"permission denied"不再发生）。
+  printf 'blktest\r';      sleep 4
   printf 'fstest\r';       sleep 14
   printf 'fsdemo\r';       sleep 14
 } | qemu-system-aarch64 \

@@ -48,20 +48,22 @@
 - 软看门狗：连续 600 tick 无 Running 进程告警一次（scheduler）
 - 性能基线：scripts/perf-baseline.sh + docs/performance_baseline.md
 
-## 实机验收现状（scripts/acceptance.sh，13 项）
+## 实机验收现状（scripts/acceptance.sh，**13/13 ALL PASS**）
 
-✅ shell-up / launchd 三服务 / login-root / su-guest / sessions /
-   forktest(COW) / fstest / fsdemo(树语义)
-❌ **secdemo**（child code=1 + collected pid=2105656 垃圾值，确定性复现）
-❌ **sleepdemo**（父 elapsed=0 立即返回 + wait NotFound(3)；SVC25 探针证明
-   内核已收到 ticks=5，问题在睡眠登记→唤醒→帧回写链路与会话/COW 叠加态）
-❌ **blktest**（knife13 版脚本注释掉了注入项；CAP 修复已在 main，恢复注入即可）
+✅ 全项：shell-up / launchd 三服务 / login-root / secdemo / su-guest /
+   sessions / sleepdemo / forktest / blktest / fstest / fsdemo
 
-> ⚠ 三红均为**并行刀叠加交互**问题：各刀在自身分支实机均 PASS。
-> 主嫌疑：idle-scratch 修复未覆盖「父阻塞等尸」窗口的 TPIDR 陈旧指向 ×
-> 会话撤销路径。已定位到 SVC25 收到 ticks=5 但 elapsed 回写为 0 的断层。
-> 下会话首选：以 sleepdemo 为靶，二分 on_tick_consume 的 expiry 写回与
-> dispatch 恢复之间的帧一致性。
+### 已知问题（唯一遗留，已隔离并默认关闭）
+**COW fork × 第十一刀新调度器交互回归**：
+- 症状：COW 开启时 sleepdemo/secdemo 的 fork 子进程困在 post-fork
+  首指令处循环（elr 不前进、无输出），父进程 elapsed 回写为 0、
+  wait NotFound(3)——确定性复现；eager-copy 模式 13/13 全绿。
+- 取证：FORK-COPY 探针证明子帧 x0=0/elr 正确武装；RC5 显示子进程
+  反复困在同一 elr（疑似 COW 断链重放不前进）；SVC25 收到 ticks=5。
+- 裁决：`table_walk::COW_SHARED_FORK = false`（显式开关，真只读页
+  仍直接映射）。第十刀 COW 在旧调度基线的实机证据链完整保留，
+  翻转开关即回归零复制 fork；待专会二分「断链重放 × MLFQ 抢占/
+  FPU 门位」的帧一致性。恢复注入 blktest 后验收矩阵补齐为 13 项。
 
 ## 结构性天花板（架构级决策，单独立项）
 SMP 多核 / 线程模型（ABI 级约定）/ KASLR / 动态进程槽

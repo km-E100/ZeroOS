@@ -112,7 +112,24 @@ pub enum LeafShareClass {
 }
 
 /// 判定一个有效叶描述符的克隆策略。
+/// COW 共享总开关（第十四刀集成期裁决）：与第十一刀新调度器
+/// （MLFQ/FPU 门位/idle-scratch）叠加时存在待解交互回归——sleepdemo/
+/// secdemo 子进程困在 post-fork 首指令循环（eager 模式 13/13 全绿，
+/// COW 模式确定性复现）。取证线索见 STATUS.md「已知问题」。翻转此值
+/// 即恢复第十刀零复制 fork（其在旧调度基线下实机 PASS，证据链完整）。
+pub const COW_SHARED_FORK: bool = false;
+
 pub fn classify_leaf(leaf: u64) -> LeafShareClass {
+    if !COW_SHARED_FORK {
+        // 关闭共享：可写页一律 eager 复制兜底（语义正确，仅牺牲 fork
+        // 性能）；真只读页保留直接映射——无写语义即无 COW 依赖，省内存
+        // 且与历史只读共享行为一致。
+        let ap = (leaf >> AP_SHIFT) & 0b11;
+        if leaf & DESC_SW_COW == 0 && ap == USER_AP_RX {
+            return LeafShareClass::ReadOnlyDirect;
+        }
+        return LeafShareClass::EagerCopy;
+    }
     let ap = (leaf >> AP_SHIFT) & 0b11;
     if leaf & DESC_SW_COW != 0 {
         // 已是 COW 共享页（fork 链上二次 fork）：继续传播共享标记。
@@ -433,6 +450,14 @@ mod tests {
 
     #[test]
     fn classify_leaf_matrix() {
+        // 开关关闭（第十四刀集成期默认）：一切叶子一律 eager 兜底，
+        // 仅保留「只读直映射」判定供未来重开时对照。
+        if !COW_SHARED_FORK {
+            assert_eq!(classify_leaf(rw_leaf(0x5000_1000)), LeafShareClass::EagerCopy);
+            let text = make_leaf_descriptor(0x5000_2000, USER_AP_RX, true);
+            assert_eq!(classify_leaf(text), LeafShareClass::ReadOnlyDirect);
+            return;
+        }
         // 可写数据页 → 共享化
         assert_eq!(classify_leaf(rw_leaf(0x5000_1000)), LeafShareClass::CowShare);
         // 真只读 text 页（RX、无 COW 位）→ 直接映射
