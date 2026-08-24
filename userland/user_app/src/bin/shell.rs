@@ -20,8 +20,8 @@
 #![no_std]
 #![no_main]
 
-use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
+use useralloc::StaticFreeList;
 use userlib::{
     cause_segv, console_read, console_write, create_channel, encode_message,
     exec, exit, extract_payload_text, get_session, session_begin, session_list, wait_pid,
@@ -45,32 +45,11 @@ fn panic(_info: &PanicInfo) -> ! {
     exit(1);
 }
 
-// ── 第十五刀二期：shell 侧极简分配器 ─────────────────────────────
-// 动机：zero-abi 引入 alloc 依赖后，链接器要求本 bin 提供全局分配器。
-// 当前 shell 自身零堆使用（bump 永不回收也够用）；未来若引入
-// String/Vec，应升级为 free-list（对照内核 heap_free_list）。
-struct ShellBump;
-
+// 用户态可回收 free-list 堆：临时 String/Vec 释放后归还，长期 shell
+// 不再因历史 bump allocator 只增不减而最终 OOM。
 const SHELL_HEAP_SIZE: usize = 64 * 1024;
-static mut SHELL_HEAP: [u8; SHELL_HEAP_SIZE] = [0; SHELL_HEAP_SIZE];
-static mut SHELL_BUMP: usize = 0;
-
-unsafe impl GlobalAlloc for ShellBump {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let base = core::ptr::addr_of!(SHELL_HEAP) as usize;
-        let cur = SHELL_BUMP;
-        let start = (base + cur + layout.align() - 1) & !(layout.align() - 1);
-        if start - base + layout.size() > SHELL_HEAP_SIZE {
-            return core::ptr::null_mut();
-        }
-        SHELL_BUMP = start - base + layout.size();
-        start as *mut u8
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
 #[global_allocator]
-static SHELL_ALLOC: ShellBump = ShellBump;
+static SHELL_ALLOC: StaticFreeList<SHELL_HEAP_SIZE> = StaticFreeList::new();
 
 extern "C" {
     static mut __bss_start: u8;
@@ -110,12 +89,13 @@ pub unsafe extern "C" fn _start(a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
 }
 
 /// forktest 的期望父 pid：fork 前由父进程写入自身 getpid() 结果；
-/// eager-copy fork 使子进程继承该静态变量的副本（跨 fork 传参的信纸），
+/// fork 使子进程继承该静态变量的逻辑值（当前由 COW 页共享后按需断链），
 /// 子进程据此断言 getppid() == 父 getpid() 值（号位 23 端到端）。
 static mut FORKTEST_PARENT_PID: u64 = 0;
 
 /// 命令历史：内存态最近 8 条（环形）。单核 shell 独占执行，静态可变安全。
-static mut HISTORY: [[u8; 128]; 8] = [[0; 128]; 8];
+const HISTORY_CAP: usize = 8;
+static mut HISTORY: [[u8; 128]; HISTORY_CAP] = [[0; 128]; HISTORY_CAP];
 static mut HIST_LEN: [usize; 8] = [0; 8];
 static mut HIST_HEAD: usize = 0;
 static mut HIST_TOTAL: usize = 0;
@@ -204,7 +184,7 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             // 并发输出交错时辨识来源行（console_write 无进程级串行化）。
             //
             // 号位 23 端到端：fork 前把父进程自身 pid 写入静态变量；
-            // eager-copy fork 让子进程继承同一内存副本，子进程据此断言
+            // COW fork 让子进程继承同一逻辑内存内容，子进程据此断言
             // getppid() == 父 getpid() 值，断言结果经退出码带回父进程。
             match userlib::getpid() {
                 Ok(my_pid) => unsafe { FORKTEST_PARENT_PID = my_pid },
@@ -965,8 +945,8 @@ fn record_history(cmd: &[u8]) {
         let n = cmd.len().min(slot.len());
         slot[..n].copy_from_slice(&cmd[..n]);
         HIST_LEN[head] = n;
-        HIST_HEAD = (head + 1) % HISTORY.len();
-        HIST_TOTAL = (HIST_TOTAL + 1).min(HISTORY.len());
+        HIST_HEAD = (head + 1) % HISTORY_CAP;
+        HIST_TOTAL = (HIST_TOTAL + 1).min(HISTORY_CAP);
     }
 }
 
@@ -974,9 +954,9 @@ fn print_history() {
     unsafe {
         let total = HIST_TOTAL;
         let head = HIST_HEAD;
-        let start = (head + HISTORY.len() - total) % HISTORY.len();
+        let start = (head + HISTORY_CAP - total) % HISTORY_CAP;
         for k in 0..total {
-            let idx = (start + k) % HISTORY.len();
+            let idx = (start + k) % HISTORY_CAP;
             let len = HIST_LEN[idx];
             print_u64((k + 1) as u64);
             print(": ");
@@ -1369,7 +1349,7 @@ fn parse_u64(text: &[u8]) -> Option<u64> {
     Some(value)
 }
 
-fn read_line(buf: &mut [u8]) -> usize {
+fn read_line_impl(buf: &mut [u8], echo: bool) -> usize {
     let mut i = 0usize;
     while i < buf.len() {
         let mut c: [u8; 1] = [0];
@@ -1393,20 +1373,35 @@ fn read_line(buf: &mut [u8]) -> usize {
         if ch == b'\n' || ch == b'\r' {
             buf[i] = ch;
             i += 1;
+            if !echo {
+                let _ = console_write(b"\r\n");
+            }
             break;
         } else if ch == 0x7f || ch == 0x08 {
             // backspace
             if i > 0 {
                 i -= 1;
-                let _ = console_write(b"\x08 \x08");
+                if echo {
+                    let _ = console_write(b"\x08 \x08");
+                }
             }
         } else {
             buf[i] = ch;
             i += 1;
-            let _ = console_write(&c);
+            if echo {
+                let _ = console_write(&c);
+            }
         }
     }
     i
+}
+
+fn read_line(buf: &mut [u8]) -> usize {
+    read_line_impl(buf, true)
+}
+
+fn read_line_hidden(buf: &mut [u8]) -> usize {
+    read_line_impl(buf, false)
 }
 
 fn print(text: &str) {
@@ -1827,15 +1822,24 @@ fn sec_exchange(code: u32, payload: &[u8]) -> Option<Message> {
     }
 }
 
-/// 读取一行并去掉 CR/LF 尾（复用交互 read_line；密码明文回显——实验
-/// 内核串口单用户场景可接受，与既有 fstest 风格一致）。
-fn read_line_trimmed(buf: &mut [u8]) -> &[u8] {
-    let n = read_line(buf);
+/// 读取一行并去掉 CR/LF 尾。
+fn trim_line(buf: &mut [u8], n: usize) -> &[u8] {
     let mut end = n;
     while end > 0 && (buf[end - 1] == b'\r' || buf[end - 1] == b'\n') {
         end -= 1;
     }
     &buf[..end]
+}
+
+fn read_line_trimmed(buf: &mut [u8]) -> &[u8] {
+    let n = read_line(buf);
+    trim_line(buf, n)
+}
+
+/// 密码输入不回显；仍支持退格并在 Enter 后换行。
+fn read_password(buf: &mut [u8]) -> &[u8] {
+    let n = read_line_hidden(buf);
+    trim_line(buf, n)
 }
 
 /// `login` / `su` 共用流程：
@@ -1851,7 +1855,7 @@ fn login_flow(mode: &str) {
     let user = read_line_trimmed(&mut ubuf);
     print("password: ");
     let mut pbuf = [0u8; 64];
-    let password = read_line_trimmed(&mut pbuf);
+    let password = read_password(&mut pbuf);
 
     // ---- ① 凭据校验 ----
     let mut payload = [0u8; 128];
@@ -1974,31 +1978,25 @@ fn println_u64(v: u64) {
     println("");
 }
 
-/// secdemo —— 第十三刀实机验收：受保护通道 RX/TX 组策略 + capability
-/// 动态签发/撤销全生命周期。六步证据链：
-///   [1] 无权创建受保护通道 → PermissionDenied（门控先于一切）
-///   [2] securityd 签发 CAP_CHANNEL_CREATE|CAP_SECURE_IPC（绑定本进程）
-///   [3] 创建受保护通道 SECDEMO_CH(tx=CAP_SECURE_IPC) 成功
-///   fork 子进程（动态授予**不**随 fork 继承 ⇒ 子进程从零能力起步）：
-///   [4] 子无权 send → PolicyDenied(PermissionDenied)
-///   [5] 子向 securityd 申请 CAP_SECURE_IPC → 重发成功
-///       （fork 不继承动态授予、按 pid 授予的最小授权在此得证）
-///   [6] securityd 撤销该授予 → 再发被拒
-/// 三次发送的"拒-许-拒"全部符合预期 → PASS。
+/// secdemo —— 受保护通道 + 动态 capability 生命周期。
 ///
-/// 注：步骤 [2][5] 的目标 pid 由调用方自报（Message 无发送者身份，
-/// 信任模型披露见 zero_abi::protocol::security）。
+/// 新安全模型下 securityd 读取的是**内核盖章的 sender PID**；只有已登录
+/// admin 能签普通能力/撤销令牌。演示因此直接在当前 admin shell 上验证：
+///   [1] 无权创建受保护通道 → PermissionDenied
+///   [2] admin 为自己申请 CAP_CHANNEL_CREATE|CAP_SECURE_IPC
+///   [3] 创建受保护通道成功
+///   [4] 持动态能力发送成功
+///   [5] 撤销令牌后再次发送 → PermissionDenied
 fn secdemo_command() {
     const CH: u32 = zero_abi::channels::SECDEMO_CH;
-
-    // ---- [1] 无权创建受保护通道：必须被拒 ----
     let desc = ChannelDesc {
         id: CH,
         capacity: 4,
         tx_groups: CAP_SECURE_IPC,
         rx_groups: 0,
     };
-    print("[1/6] create protected channel WITHOUT cap: ");
+
+    print("[1/5] create protected channel WITHOUT cap: ");
     match create_channel(&desc) {
         Err(SysError::PermissionDenied) => println("denied as expected"),
         Err(e) => {
@@ -2015,125 +2013,55 @@ fn secdemo_command() {
         }
     }
 
-    // ---- [2] 向 securityd 申请签发 ----
     let Ok(my_pid) = userlib::getpid() else {
         println("secdemo: getpid failed");
         return;
     };
     let Some(token) = request_cap(my_pid, CAP_CHANNEL_CREATE | CAP_SECURE_IPC) else {
-        println("secdemo: FAIL at step 2 (issuance)");
+        println("secdemo: FAIL at step 2 (admin issuance denied)");
         return;
     };
-    println("[2/6] securityd issued cap token (create+secure-ipc)");
+    println("[2/5] securityd issued admin-authorized token");
 
-    // ---- [3] 创建受保护通道：放行 ----
-    print("[3/6] create protected channel WITH cap: ");
+    print("[3/5] create protected channel WITH cap: ");
     match create_channel(&desc) {
         Ok(()) => println("ok"),
-        Err(SysError::ChannelUnavailable) => {
-            // 重复运行 secdemo：通道已在（id 冲突如实回报），继续演示。
-            println("already exists (continuing)");
-        }
+        Err(SysError::ChannelUnavailable) => println("already exists (continuing)"),
         Err(e) => {
             print("failed (");
             print_hex(e.code());
             println(")");
+            let _ = request_revoke(token);
             println("secdemo: FAIL at step 3");
             return;
         }
     }
 
-    // ---- [4][5][6] 子进程三连击：拒-许-拒 ----
-    match userlib::fork() {
-        Ok(0) => {
-            // 子进程：动态授予不随 fork 继承 ⇒ 有效能力为空。
-            let mut pass = true;
+    print("[4/5] send WITH dynamic grant: ");
+    let m = encode_message(0x2, b"probe-authorized");
+    if userlib::ipc_send(CH, &m).is_err() {
+        println("failed");
+        let _ = request_revoke(token);
+        println("secdemo: FAIL at step 4");
+        return;
+    }
+    println("accepted");
 
-            print("[C][4/6] child send WITHOUT grant: ");
-            let m = encode_message(0x1, b"probe-1");
-            match userlib::ipc_send(CH, &m) {
-                Err(SysError::PermissionDenied) => println("denied as expected"),
-                _ => {
-                    println("NOT denied (FAIL)");
-                    pass = false;
-                }
-            }
-
-            print("[C][5/6] child requests own grant then sends: ");
-            let child_pid = userlib::getpid().unwrap_or(0);
-            let Some(child_token) = request_cap(child_pid, CAP_SECURE_IPC) else {
-                println("issuance failed (FAIL)");
-                userlib::exit(5);
-            };
-            let m2 = encode_message(0x2, b"probe-2");
-            match userlib::ipc_send(CH, &m2) {
-                Ok(()) => println("accepted"),
-                Err(e) => {
-                    print("send failed (");
-                    print_hex(e.code());
-                    println(") (FAIL)");
-                    pass = false;
-                }
-            }
-
-            print("[C][6/6] after revoke, send again: ");
-            // 撤销必须经签发者（securityd 协议 CMD_CAP_REVOKE）：子进程
-            // 不持 CAP_ISSUER，直接调号位 41 会被内核拒绝——撤销权与
-            // 签发权同源是本协议的刻意设计。
-            if !request_revoke(child_token) {
-                println("revoke via securityd failed (FAIL)");
-                pass = false;
-            }
-            let m3 = encode_message(0x3, b"probe-3");
-            match userlib::ipc_send(CH, &m3) {
-                Err(SysError::PermissionDenied) => println("denied as expected"),
-                _ => {
-                    println("NOT denied (FAIL)");
-                    pass = false;
-                }
-            }
-
-            if pass {
-                println("[C] secdemo: deny-grant-revoke chain PASS");
-                exit(0); // -> ! ：子进程到此终结，绝不回主循环抢终端
-            } else {
-                println("[C] secdemo: FAIL");
-                exit(5);
-            }
+    print("[5/5] revoke then send again: ");
+    if !request_revoke(token) {
+        println("revoke failed");
+        println("secdemo: FAIL at step 5");
+        return;
+    }
+    let m2 = encode_message(0x3, b"probe-revoked");
+    match userlib::ipc_send(CH, &m2) {
+        Err(SysError::PermissionDenied) => {
+            println("denied as expected");
+            println("[P] secdemo: PASS - RX/TX policy + dynamic capability lifecycle verified");
         }
-        Ok(child_pid) => {
-            print("[P] secdemo: forked child ");
-            print_u64(child_pid);
-            println("");
-            match wait_pid(child_pid) {
-                Ok((pid, code)) => {
-                    print("[P] secdemo: collected pid=");
-                    print_u64(pid);
-                    print(" code=");
-                    print_i32(code);
-                    println("");
-                    // 收尾：父进程自身的演示授予也经 securityd 撤销
-                    //（不留悬空权柄；失败仅提示，不影响判定）。
-                    if request_revoke(token) {
-                        println("[P] secdemo: parent demo grant revoked");
-                    }
-                    if code == 0 {
-                        println("[P] secdemo: PASS - RX/TX policy + dynamic capability lifecycle verified");
-                    } else {
-                        println("[P] secdemo: FAIL (child reported failure)");
-                    }
-                }
-                Err(e) => {
-                    print("[P] secdemo: wait failed (");
-                    print_hex(e.code());
-                    println(")");
-                }
-            }
-        }
-        Err(e) => {
-            print("[P] secdemo: fork failed (");
-            print_hex(e.code());
-            println(")");
+        _ => {
+            println("NOT denied (FAIL)");
+            println("secdemo: FAIL at step 5");
         }
     }
 }
@@ -2221,7 +2149,7 @@ fn threaddemo_command() {
     println(", creating thread");
     let tid = match unsafe {
         userlib::create_thread(
-            threaddemo_thread_entry as usize,
+            threaddemo_thread_entry as *const () as usize,
             stack_top,
             0, // tls：本演示不用 TLS
             THREAD_MAGIC_ARG,
@@ -2323,7 +2251,7 @@ fn mutextest_command() {
     let mut tids = [0u64; 3];
     for seq in 0..3usize {
         let stack_top = (old + (seq + 1) * 32768 + 0xfff) & !0xfff;
-        match unsafe { userlib::create_thread(mutextest_entry as usize, stack_top, 0, seq) } {
+        match unsafe { userlib::create_thread(mutextest_entry as *const () as usize, stack_top, 0, seq) } {
             Ok(t) => tids[seq] = t,
             Err(e) => {
                 print("[P] create_thread failed: ");

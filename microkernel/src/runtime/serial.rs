@@ -1,4 +1,6 @@
+use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
+use spin::Mutex;
 
 const UART_BASE: usize = 0x0900_0000;
 const UART_DR: usize = UART_BASE + 0x00;
@@ -10,6 +12,8 @@ const UART_FBRD: usize = UART_BASE + 0x28;
 const UART_LCRH: usize = UART_BASE + 0x2c;
 const UART_CR: usize = UART_BASE + 0x30;
 const UART_IMSC: usize = UART_BASE + 0x38;
+
+static TX_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn init() {
     unsafe {
@@ -32,15 +36,25 @@ pub fn write_str(s: &str) {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
-    for &byte in bytes {
-        if byte == b'\n' {
-            write_byte(b'\r');
-        }
-        write_byte(byte);
-    }
+    let _guard = TX_LOCK.lock();
+    write_bytes_unlocked(bytes);
 }
 
 pub fn write_byte(byte: u8) {
+    let _guard = TX_LOCK.lock();
+    write_byte_unlocked(byte);
+}
+
+fn write_bytes_unlocked(bytes: &[u8]) {
+    for &byte in bytes {
+        if byte == b'\n' {
+            write_byte_unlocked(b'\r');
+        }
+        write_byte_unlocked(byte);
+    }
+}
+
+fn write_byte_unlocked(byte: u8) {
     unsafe {
         // 有界等待 TX FIFO 腾空：内核日志完整性优先于极端情形下的微秒级
         // 延迟；上限防止硬件异常时卡死执行流（与 pl011 驱动同策略）。
@@ -51,4 +65,21 @@ pub fn write_byte(byte: u8) {
         }
         write_volatile(UART_DR as *mut u32, byte as u32);
     }
+}
+
+struct RawSerialSink;
+
+impl Write for RawSerialSink {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_bytes_unlocked(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// SMP-safe atomic log line: formatting fragments cannot interleave across cores.
+pub fn write_fmt_line(args: fmt::Arguments<'_>) {
+    let _guard = TX_LOCK.lock();
+    let mut sink = RawSerialSink;
+    let _ = sink.write_fmt(args);
+    write_bytes_unlocked(b"\n");
 }

@@ -412,9 +412,10 @@ pub mod protocol {
         // 漂移）。通用响应约定：code==0 成功、非 0 失败。
 
         /// 动态签发能力令牌（payload 见 [`encode_cap_issue`]；
-        /// 成功响应 payload：`token\0` 十进制）。安全策略由 securityd
-        /// 自行裁决（当前参考实现按请求放行并披露）；内核侧由号位 40
-        /// CapGrant 落账，签发权 CAP_ISSUER 仅 securityd 静态持有。
+        /// 成功响应 payload：`token\0` 十进制）。内核 IPC 会把真实发送者
+        /// PID 作为 ReceiveMessage 返回值交给 securityd：普通已认证用户只
+        /// 能为自己申请 CAP_SESSION，其余签发/撤销由 admin 策略裁决；
+        /// 内核号位 40 再做 CAP_ISSUER 与不可转授的第二道门。
         pub const CMD_CAP_ISSUE: u32 = 0x20;
         /// 撤销能力令牌（payload：`token\0`；成功 code==0）。
         pub const CMD_CAP_REVOKE: u32 = 0x21;
@@ -428,9 +429,8 @@ pub mod protocol {
         pub struct CapIssueRequest {
             /// 目标进程 pid（内核把授予记到该 pid 名下）。
             ///
-            /// 【信任模型披露】IPC Message 不携带发送者身份，pid 由调用方
-            /// 自报——与既有 userdb/launchd 协议同一信任级别（单机实验
-            /// 内核可接受）；未来引入内核侧消息源戳后收紧。
+            /// 本字段只是“目标”，不是调用者身份。调用者 PID 由内核 IPC
+            /// envelope 单独提供，securityd 不信任 payload 自报来源。
             pub target_pid: u64,
             /// 请求授予的能力位图（[`crate::cap`] 位或组合）。
             pub caps: u32,
@@ -1049,7 +1049,8 @@ pub mod syscall {
             channel: u32,
             user_message: usize,
         },
-        /// (1) 从通道收消息（空队列返回 WouldBlock）：`x1`=channel，`x2`=&mut Message。
+        /// (1) 从通道收消息：`x1`=channel，`x2`=&mut Message；成功返回发送者 PID。
+        /// 空队列时内核阻塞并在 continuation 完成后同样返回发送者 PID。
         ReceiveMessage {
             channel: u32,
             user_buffer: usize,

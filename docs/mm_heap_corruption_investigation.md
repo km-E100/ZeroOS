@@ -256,3 +256,56 @@ ProcessRecord 布局找被覆写字段偏移；再由覆写内容反查来源缓
 2. 若装载侧：dump restore_context 入口处 frame 前 16 字节 +
    实际 ldp 的 x0 值对照；若写侧：在 write 后立即回读断言。
 3. 终极兜底：`-d int,in_asm --singlestep` 包裹窗口逐指令对照。
+
+
+---
+
+## 2026-08-25 最终结案（后文优先于以上历史假说）
+
+此前的 Vec、FPU、日志 String、进程表覆写等判断均是逐步二分时的中间
+假说。fresh HEAD + fresh ISO 重新验收后，最终确认是**两个彼此独立的
+底层 bug 叠加**。
+
+### 根因 A：COW 的 TLBI operand 编码错误
+
+父侧 fork 共享可写页时，PTE 的 BBM 次序本身正确：先 break，再把父 PTE
+改成 RO + software COW 位。但 `kbbm_barrier(va)` 执行：
+
+```text
+tlbi vaae1is, Xt
+```
+
+时把**完整 byte VA**放进 `Xt`。AArch64 按 VA 的 TLBI 指令在寄存器中
+编码的是 `VA[55:12]`，因此正确 operand 是 `va >> 12`。
+
+错误后果不是立刻 fault，而是父核的旧 **RW TLB translation 仍然存活**。
+页表看起来已经只读，父进程却能继续借陈旧 TLB 静默写共享物理栈页。
+子进程 fork 返回后第一条栈写本应保存 `x0=0`，但共享栈又被父分支覆盖，
+于是出现历史上的统一症状：子拿父返回值、走父分支、wait 自己、记录随后
+表现为“被覆写/消失”。这也解释了为什么大量进程表/Vec 探针抓不到真正
+写入者——写穿发生在**用户共享物理页 + stale TLB**，不是内核 Vec。
+
+修复：`tlbi_va_operand(va) = va >> 12`，并加纯函数单测钉死编码。
+修后 fresh QEMU：`shared=34 ... copied=0`，子分支正常，标准 15/15 全绿。
+
+### 根因 B：free-list 的不可分裂尾巴形成 ghost gap
+
+另一个 `corrupt next block` 是分配器自身 bug。选中 free block 后若
+`remainder < MIN_FREE`，旧实现正确地“不创建新 free block”，却仍把
+allocated header/footer 的 size 写成较小的 `used`。因此 `used` 与原 block
+结尾之间留下了一段**没有任何 header 所有权的 gap**。
+
+后续 dealloc 以 `block + used` 当下一块起点，把 gap 里的任意数据解析成
+header，最终报出巨大的假 free block / `corrupt next block`。修复规则是：
+余量不足以构成合法 free block 时，本次 allocation 必须吞掉整个原 block，
+即 committed size = original size。新增 `tiny_remainder_is_absorbed...` 回归；
+公共用户态 `StaticFreeList` 同类边界同步修复。
+
+### 同轮修出的相关正确性问题（非上述主根因）
+
+- AArch64 异常入口过去先用 x16 取 TPIDR_EL1，导致异步异常丢失用户 x16；
+  现先在 EL1 栈暂存 x16/x17，再落 TrapFrame。
+- COW clone 中途 OOM 现在销毁半成品页表并撤销 retain，不再泄漏引用。
+- 调查期 `FORK-DONE/WAIT-STEP/TBL-DUMP/HIST_RING` 等探针已全部移除。
+
+结论：`COW_SHARED_FORK` 现默认 **true**，历史“COW 阻塞项”关闭。

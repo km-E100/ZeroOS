@@ -16,3 +16,5 @@ path = "src/bin/main.rs"
 zero-abi = { path = "../../libs/abi" }
 spin = { workspace = true }
 userlib = { path = "../../userland/userlib" }
+
+useralloc = { path = "../../userland/useralloc" }

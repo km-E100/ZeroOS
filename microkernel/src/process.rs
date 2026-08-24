@@ -28,7 +28,7 @@ const INIT_PID: u64 = 2;
 fn init_pid() -> ProcessId {
     ProcessId::new(INIT_PID)
 }
-/// 内核栈 64KiB（×64 槽 = 4MiB 静态区）：对照 Linux THREAD_SIZE 16K/
+/// 内核栈 64KiB（×256 槽 = 16MiB 静态区）：对照 Linux THREAD_SIZE 16K/
 /// XNU kernel_stack 16K——我们无中断栈分离，所有 EL1 工作（含 IPC 拷贝、
 /// 页表操作）都在本栈，取 4 倍余量防深层调用链溢出。
 const KERNEL_STACK_SIZE: usize = 0x1_0000;
@@ -142,7 +142,7 @@ impl TrapFrame {
         kernel_stack_top: usize,
     ) {
         self.regs = [0; 31];
-        self.regs[30] = thread_exit as usize as u64;
+        self.regs[30] = thread_exit as *const () as usize as u64;
         self.sp_el0 = user_stack_top as u64;
         self.elr_el1 = entry as usize as u64;
         self.spsr_el1 = 0; // EL0t, interrupts enabled
@@ -249,7 +249,7 @@ struct ProcessRecord {
     /// 用户堆当前 break（号位 24 Brk，第十刀）：堆区域为
     /// `[USER_HEAP_BASE, brk)`，值恒为页对齐（初始 == USER_HEAP_BASE，
     /// 即 0 字节堆）。spawn/exec 重置为基址；fork 原样继承——子进程的
-    /// 堆物理页由 eager-copy 克隆（clone_space）自然带上，无需额外搬运。
+    /// 堆页随 fork 以 COW 语义继承（clone_space），首写再按页断链。
     /// 读写只经本文件底部 heap_view / store_brk 助手（表锁纪律同源）。
     brk: usize,
     /// 登录会话 id（第十三刀；0 = 无会话）：登录成功经号位 43
@@ -365,7 +365,7 @@ fn alloc_table_slot_locked(table: &mut Vec<Option<ProcessRecord>>) -> Option<usi
     None
 }
 #[repr(C, align(16))]
-struct TrapFrameCell(UnsafeCell<TrapFrame>);
+pub struct TrapFrameCell(UnsafeCell<TrapFrame>);
 impl TrapFrameCell {
     const fn new() -> Self {
         Self(UnsafeCell::new(TrapFrame::new()))
@@ -527,7 +527,8 @@ pub fn spawn_user_from_bootfs(
         );
         let tf = TRAP_FRAMES[slot].get();
         (*tf).elr_el1 = elf.entry;
-        (*tf).sp_el0 = USER_STACK_TOP as u64;
+        // spawn() 已为该 TrapFrame 选择随机栈顶；不要在 bootfs 装载
+        // 收尾把它重新覆盖回固定 USER_STACK_TOP。
         Ok(())
     };
 
@@ -962,12 +963,6 @@ pub(crate) fn wait_scan(
 ) -> WaitDecision {
     let mut has_live_child = false;
     for view in procs.iter().flatten() {
-        if view.parent == Some(caller) {
-            crate::error!(
-                "SCAN-CAND pid={} state={:?} zombie-code={:?} tgt-match={}",
-                view.pid.raw(), view.state, view.exit_code, view.pid.raw() == target
-            );
-        }
         if view.parent != Some(caller) {
             continue;
         }
@@ -1155,37 +1150,9 @@ fn full_reap(seed: usize) {
 /// `AddressSpace::destroy()` → `paging::destroy_user_address_space()`
 /// 桥接，销毁必须发生在 PROCESS_TABLE 锁外（full_reap 已遵守）。
 /// TRAP_FRAMES/KERNEL_STACKS 是 64×16KiB 静态数组，槽位回用即可。
-/// 第十七刀🥇取证：全表概览 + 僵尸记录原始字节转储（定位越界写者）。
-pub fn debug_dump_table() {
-    let table = PROCESS_TABLE.lock();
-    crate::error!("TBL-DUMP len={}:", table.len());
-    for (i, entry) in table.iter().enumerate() {
-        let Some(rec) = entry else {
-            continue;
-        };
-        crate::error!(
-            "TBL slot={} pid={:#x} tgid={:#x} parent={:#x} state={:?} name={}",
-            i,
-            rec.pid.raw(),
-            rec.tgid.raw(),
-            rec.parent.map(|p| p.raw()).unwrap_or(0),
-            rec.state,
-            rec.name
-        );
-        // 原始字节：pid 字段（前 8 字节）逐字节——垃圾覆写在此可见。
-        let base = core::ptr::addr_of!(*entry).cast::<u8>();
-        if !base.is_null() {
-            let bytes = unsafe { core::slice::from_raw_parts(base, 48) };
-            crate::error!("TBL raw[{}] {:02x?}", i, &bytes[..48]);
-        }
-    }
-}
 
 pub fn remove_slot(slot: usize) {
     assert!(slot < MAX_PROCESSES, "remove_slot: slot {} out of range", slot);
-    if let Some(rec) = PROCESS_TABLE.lock().get(slot).and_then(|e| *e) {
-        crate::error!("REMOVE slot={} pid={}", slot, rec.pid.raw());
-    }
     full_reap(slot);
 }
 
@@ -1237,8 +1204,8 @@ pub fn exit_current_with_status(status: i32) -> ! {
         // remove_slot/full_reap 会级联处理本尸，两条路都收敛）。
         let parent_alive = matches!(parent_view, Some(pv) if pv.state != ProcessState::Zombie);
 
-        crate::error!(
-            "EXIT pid={} slot={} status={}",
+        crate::debug!(
+            "process exit: pid={} slot={} status={}",
             my_pid.raw(), slot, status
         );
         // —— 阶段 2（独占写）：定处置 / 写退出码 / 转 Zombie / 取走父等待标记 ——
@@ -1517,8 +1484,6 @@ pub(crate) fn wait_plan(caller: ProcessId, target: u64, flags: u64, procs: &[Opt
 
 pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
     let caller_slot = crate::scheduler::current_slot();
-    crate::error!("WAIT-STEP caller_slot={} target={} flags={:#x}", caller_slot, target_pid, flags);
-
     enum Act {
         Collect { packed: u64, space: Option<AddressSpace> },
         Block,
@@ -1797,17 +1762,6 @@ pub fn fork(
     let child_slot;
     let child_pid = alloc_pid();
 
-    // 第十七刀🥇行动清单 #1：clone 前**预扩容**进程表至上限——消除
-    // 整个 fork 窗口内 Vec 生长（realloc 搬移）的可能性。若堆损坏随此
-    // 一并消失，即实锤「COW 路径 × 表生长」叠加为根因。
-    {
-        let mut table = PROCESS_TABLE.lock();
-        if table.len() < MAX_PROCESSES {
-            let spare = MAX_PROCESSES - table.len();
-            table.reserve(spare);
-        }
-    }
-
     // 地址空间克隆必须在持锁外进行（分配物理页/可能失败）。
     // 第十刀 COW：clone 不再逐页 memcpy——父子共享数据页（双侧只读 +
     // DESC_SW_COW），首写 Permission fault 时才断链复制；共享/复制统计
@@ -1859,9 +1813,8 @@ pub fn fork(
             adopted: false,
             exit_code: None,
             wait_target: None,
-            // POSIX fork：子进程 break 继承父值；[BASE, brk) 的堆物理页
-            // 已由上方 clone_space eager-copy 复制进子地址空间，值与页
-            // 天然一致，无需额外同步。
+            // POSIX fork：子进程 break 继承父值；[BASE, brk) 的堆页由
+            // clone_space 以 COW/只读直映射继承，无需额外同步。
             brk: parent_record.brk,
             // 会话随 fork 继承（第十三刀）：登录 shell 的子进程留在同一
             // 会话内。动态能力授予不随之继承（活算台账只认 pid，子 pid
@@ -2015,6 +1968,7 @@ pub fn create_thread(
 /// exec 提交阶段模型（纯数据，主机单测钉死两条不变量：① 成功路径
 /// ActivateNew 先于 DestroyOld；② 构建失败在触碰旧映像前短路）。
 /// [`exec_load`] 按此计划执行，注释引用同名概念防实现与模型漂移。
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExecStage {
     /// 阶段 1：旧映像完整时构建全新地址空间（唯一可失败阶段）。
@@ -2031,6 +1985,7 @@ pub(crate) enum ExecStage {
 
 /// 阶段计划：成功为完整五步；构建失败止步于第一步——Commit 及其后全部
 /// 不发生，旧地址空间自始至终不被触碰（失败原子性的模型化表述）。
+#[cfg(test)]
 pub(crate) fn exec_stage_plan(build_ok: bool) -> &'static [ExecStage] {
     if build_ok {
         &[
@@ -2079,7 +2034,7 @@ fn apply_exec_frame(
     frame.regs[3] = args[3];
     // main 正常返回 = exit(0)：沿用 spawn 的 trampoline 约定，
     // 新映像的退出码同样可被父进程 WaitPid 收集（forktest/execdemo 依赖）。
-    frame.regs[30] = thread_exit as usize as u64;
+    frame.regs[30] = thread_exit as *const () as usize as u64;
     // KASLR 阶段 1：exec 后的栈顶同样随机化（与 spawn 同策略同窗口）。
     let sp_base = user_sp as usize;
     frame.sp_el0 = randomized_user_stack_top(sp_base) as u64;
@@ -2264,7 +2219,7 @@ mod exec_tests {
         assert_eq!(frame.regs[3], 0);
         for i in 4..31 {
             if i == 30 {
-                assert_eq!(frame.regs[30], thread_exit as usize as u64);
+                assert_eq!(frame.regs[30], thread_exit as *const () as usize as u64);
             } else {
                 assert_eq!(frame.regs[i], 0, "x{i} 必须清零");
             }

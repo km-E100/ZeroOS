@@ -14,3 +14,5 @@ path = "src/bin/shell.rs"
 [dependencies]
 userlib = { path = "../userlib" }
 zero-abi = { path = "../../libs/abi" }
+
+useralloc = { path = "../useralloc" }

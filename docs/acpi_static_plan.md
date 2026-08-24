@@ -1,44 +1,43 @@
-# ACPI 静态表支持立项设计（真机迁移前置 · 结构性天花板收口）
+# ACPI 静态表支持（实现状态 + 后续范围）
 
-> 裁决沿革：原"先 SMP 后 ACPI"。SMP 阶段 0-2 已交付（蛮力 MPIDR 探测
-> 在 QEMU virt 可用），ACPI 窗口开启。**关键更新：QEMU virt + edk2 即
-> 生成完整 ACPI 表**（RSDP 挂 UEFI System Table config table），解析/
-> 测试全程可在 QEMU 完成，不受真机限制——时机纯属优先级选择。
+## 2026-08-25 已落地
 
-## 范围：只做静态表解析，AML 明确不做
+Zero OS 当前只做**静态 ACPI 表**，AML 明确不做。QEMU virt + edk2 可在
+UEFI System Table 的 config table 暴露 ACPI 2.0 RSDP，因此整个链路可在
+QEMU 验证。
 
-| 表 | 内容 | 内核消费方 |
+当前真实数据流：
+
+1. `bootloader-uefi` 用 `uefi::table::cfg::ACPI2_GUID` 找 RSDP；
+2. 不扩 `zero_abi::BootInfo`，而是像 memory-bytes 汇槽一样，通过已加载
+   kernel 的 ELF symbol `__zero_rsdp_phys` 直接补丁 RSDP 物理地址；
+3. MM/恒等映射建立后 `microkernel::acpi::init()` 解析 RSDP → XSDT →
+   第一个 MADT/APIC 表；多字节 packed 字段逐字节 volatile 读取后按
+   little-endian 组装，避免未对齐 `read_volatile` UB；
+4. MADT 当前产出 enabled CPU 的 MPIDR 列表与 GICD base；
+5. `smp::boot_secondaries()` 优先按 MADT CPU list 做 PSCI CPU_ON，并用
+   当前 boot CPU 的 MPIDR affinity 过滤自身；无 ACPI 时保留 legacy
+   MPIDR 探测回退。
+
+fresh `-smp 4` 验证可见：`MADT cpus=4`，cpu1/2/3 均通过 MADT MPIDR
+点亮，最终 `online=4`。
+
+## 当前范围边界
+
+| 表 | 当前状态 | 消费方 |
 | --- | --- | --- |
-| RSDP → XSDT | 表目录 | bootloader 侧一次性遍历 |
-| MADT | GICC 条目（每核 MPIDR/GICR 指针）、GICD 帧、MSI 帧 | `boot_secondaries` 替换蛮力 MPIDR 扫描；GIC 初始化参数化 |
-| GTDT | EL1 物理定时器 PPI 号与标志 | timer::init 的硬编码 IRQ=30 替换 |
-| FADT | （可选）PSCI 通道确认 | 与 DT/hvc 实测互为校验 |
+| RSDP → XSDT | ✅ 校验签名/checksum/长度 | ACPI 目录入口 |
+| MADT GICC | ✅ enabled + MPIDR | SMP CPU_ON |
+| MADT GICD | ✅ 解析并缓存 base | 尚未替换 GIC driver 的 QEMU 默认基址 |
+| GTDT | ⏳ 未解析 | timer 仍使用当前平台参数 |
+| FADT/PSCI 描述 | ⏳ 未解析 | PSCI conduit 仍按已验证的 HVC 路径 |
+| AML / _DSM / _PTS / 热插拔 | ❌ 明确不做 | 未来真机需求另立项 |
 
-**明确不做**：AML 解释器、_DSM/_PTS 电源对象、热插拔——QEMU 场景
-用不到，真机需求出现时另立项。
+## 后续如果继续做 ACPI
 
-## 四步实施
-
-### WS-A bootloader 抓表
-bootloader-uefi 在 `ExitBootServices` **前**从 System Table config
-数组按 `EFI_ACPI_TABLE_GUID` 取 RSDP→XSDT；校验 checksum 后把
-RSDP 物理地址塞进 bootinfo 新增字段（向后兼容：0 = 无 ACPI）。
-
-### WS-B abi/bootinfo 扩展
-`zero_abi::BootInfo` 追加 `rsdp_phys: u64`；文档登记。内核侧
-`mm/mod.rs` 引导期把 XSDT 区域恒等映射标记保留（防分配器挪用）。
-
-### WS-C 内核解析器（no_std）
-新模块 `acpi.rs`：XSDT 遍历 → MADT IC 条目流（GICC/GICD/GICR）→
-产出 `CpuList { mpidr, }` 与 `GicInfo`、`TimerInfo(GTDT)`。
-host 单测：手工构造字节表钉死解析矩阵（checksum 错/条目截断/重复项）。
-
-### WS-D 替换蛮力点 + 验收
-1. `smp::boot_secondaries`：按 CpuList 逐核 CPU_ON（删除六组合扫描，
-   保留作为无 ACPI 回退）；2. gic/timer 参数化；3. `-smp 4` 下打印
-   枚举结果与实测一致；4. 标准验收 15/15 零回归。
-
-## 工作量与风险
-一个会话可收口。风险最低项：QEMU 生成的表格式稳定；checksum 校验
-失败一律回退现有硬编码路径（fail-open to legacy），不存在"解析坏表
-打穿启动"的路径。
+1. GIC 初始化优先消费 MADT GICD/GICR 数据，legacy 常量只作回退；
+2. 解析 GTDT，把 timer PPI/flags 从平台常量变成固件数据；
+3. 若迁移到需要 SMC conduit 的真机，再消费 FADT/DT 信息选择 PSCI
+   conduit；
+4. 对 XSDT/MADT 增加更多 malformed/fuzz case，但任何解析失败都必须
+   fail-open 到已验证的 legacy 平台路径，不能让坏表打穿启动。

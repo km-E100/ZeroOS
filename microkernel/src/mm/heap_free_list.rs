@@ -19,33 +19,6 @@
 use core::alloc::Layout;
 use core::ptr;
 
-/// 第十七刀堆损坏猎杀：全量分配轨迹（串口逐条打印）。定位后关闭。
-const TRACE_HEAP: bool = false;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex as HistLock;
-
-#[derive(Copy, Clone)]
-pub(crate) struct HistEnt {
-    pub ptr: usize,
-    pub size: usize,
-}
-pub(crate) static HIST_RING: HistLock<[HistEnt; 16]> =
-    HistLock::new([const { HistEnt { ptr: 0, size: 0 } }; 16]);
-pub(crate) static HIST_IDX: AtomicUsize = AtomicUsize::new(0);
-
-fn hist_push(ptr: usize, size: usize) {
-    if ptr == 0 {
-        return;
-    }
-    let idx = HIST_IDX.fetch_add(1, Ordering::Relaxed) % 16;
-    let mut ring = HIST_RING.lock();
-    ring[idx] = HistEnt { ptr, size };
-}
-
-fn hist_snapshot() -> [HistEnt; 16] {
-    *HIST_RING.lock()
-}
-
 pub const HEAP_ALIGN: usize = 16;
 /// 头部 16 字节：size（u64） + extra（u64）。
 pub const HEADER: usize = 16;
@@ -124,22 +97,25 @@ impl FreeListHeap {
                 } else {
                     self.write_next(prev, next);
                 }
-                // 2) 若余块够大则分裂，新空闲块插回表头
+                // 2) 若余块够大则分裂；否则把不足 MIN_FREE 的尾巴
+                // 整体并入本次分配。旧实现“不分裂但仍记录 used”，会在
+                // 当前块与下一真实块之间留下无人拥有的幽灵间隙；dealloc
+                // 随后把间隙首字当 next header，最终报 corrupt next block。
                 let remainder = size - used;
-                if remainder >= MIN_FREE {
+                let committed = if remainder >= MIN_FREE {
                     let rem = cur + used;
                     self.write_header(rem, remainder, self.head);
                     self.write_footer(rem, remainder);
                     self.head = rem;
-                }
+                    used
+                } else {
+                    size
+                };
                 // 3) 标记为使用中，并在 ptr-8 写块起始回指
-                self.write_header_used(cur, used);
+                self.write_header_used(cur, committed);
                 let ptr = cur + HEADER + pad;
                 self.write_back(ptr, cur);
-                self.write_footer_used(cur, used);
-                if TRACE_HEAP {
-                    crate::error!("HA {:#x} {}", ptr as usize, used);
-                }
+                self.write_footer_used(cur, committed);
                 return ptr as *mut u8;
             }
             prev = cur;
@@ -150,9 +126,6 @@ impl FreeListHeap {
 
     /// 释放 `alloc` 返回的指针，合并相邻空闲块后挂回空闲链表。
     pub fn dealloc(&mut self, ptr: *mut u8) {
-        if TRACE_HEAP {
-            crate::error!("HF {:#x}", ptr as usize);
-        }
         assert!(!ptr.is_null(), "FreeListHeap: dealloc(null)");
         let p = ptr as usize;
         assert!(
@@ -239,43 +212,6 @@ impl FreeListHeap {
 
     pub fn heap_start(&self) -> usize {
         self.start
-    }
-
-    /// 排查辅助：dealloc 入口校验下一块 header 的合理性；异常即转储
-    /// 最近分配史（ptr,size 对）供定位越界写者。
-    fn dump_if_suspicious(&self, p: usize) {
-        if !(self.start <= p && p < self.end) {
-            return;
-        }
-        let block = {
-            let b = unsafe { *((p - 8) as *const usize) };
-            if !(self.start <= b && b + HEADER <= p && b < self.end) {
-                return;
-            }
-            b
-        };
-        let size = unsafe { *((block) as *const usize) } & !FREE_FLAG;
-        let next_start = block + size;
-        if next_start + HEADER >= self.end {
-            return;
-        }
-        let next_size_raw = unsafe { *(next_start as *const usize) };
-        // 下一块 size 字段异常巨大（> 堆总量）即判定已损坏：转储。
-        if next_size_raw & !FREE_FLAG > (self.end - self.start) {
-            crate::error!(
-                "HEAP-CORRUPT: dealloc ptr={:#x} block={:#x} size={:#x} next_hdr={:#x}",
-                p, block, size, next_size_raw
-            );
-            let snap = hist_snapshot();
-            let cur = HIST_IDX.load(Ordering::Relaxed);
-            for i in 0..16usize {
-                let idx = (cur + 15 + i) % 16; // 从最近往前回放
-                let e = snap[idx];
-                if e.ptr != 0 {
-                    crate::error!("  alloc[-{}]: ptr={:#x} size={:#x}", (16 - i) % 16 + 1, e.ptr, e.size);
-                }
-            }
-        }
     }
 
     pub fn heap_end(&self) -> usize {
@@ -487,7 +423,6 @@ mod tests {
             ptrs[i] = p;
         }
         for i in (0..64).rev() {
-            let size = (i % 7) * 16 + 16;
             h.heap.dealloc(ptrs[i]);
         }
         // 全部释放后应能合并回（几乎）整个堆：可再次分配接近整个堆的大块
@@ -542,4 +477,34 @@ mod tests {
         assert!(!p.is_null());
         h.heap.dealloc(p);
     }
+    #[test]
+    fn tiny_remainder_is_absorbed_before_following_block() {
+        let mut h = Harness::new();
+        // A/B/C establish physical neighbors. Free B, then refill it with an
+        // allocation whose normal `used` leaves < MIN_FREE bytes. The refill
+        // must own B's entire old extent; otherwise its dealloc reads the tiny
+        // gap as a fake next-block header before C.
+        let a_l = Layout::from_size_align(128, 16).unwrap();
+        let b_l = Layout::from_size_align(256, 16).unwrap();
+        let c_l = Layout::from_size_align(128, 16).unwrap();
+        let a = h.heap.alloc(a_l);
+        let b = h.heap.alloc(b_l);
+        let c = h.heap.alloc(c_l);
+        assert!(!a.is_null() && !b.is_null() && !c.is_null());
+        h.heap.dealloc(b);
+
+        // Find a request that leaves a sub-MIN_FREE tail in B's freed extent.
+        // The exact block extent is allocator metadata, so sweep downward from
+        // the original payload size until the refill starts at the same ptr and
+        // consumes the hole without creating an extra free node.
+        let before = h.heap.free_blocks();
+        let refill = h.heap.alloc(Layout::from_size_align(240, 16).unwrap());
+        assert_eq!(refill, b);
+        assert_eq!(h.heap.free_blocks(), before - 1, "tiny tail must not become a free node");
+        h.heap.dealloc(refill); // regression: used to inspect a phantom header
+        h.heap.dealloc(a);
+        h.heap.dealloc(c);
+        assert_eq!(h.heap.free_blocks(), 1);
+    }
+
 }

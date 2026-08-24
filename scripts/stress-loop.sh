@@ -11,6 +11,9 @@ for r in $(seq 1 "$ROUNDS"); do
   echo "== round $r/$ROUNDS =="
   {
     sleep 16
+    printf 'login\r';         sleep 2
+    printf 'root\r';          sleep 1
+    printf 'zero\r';          sleep 3
     printf 'forktest\r';      sleep 6
     printf 'sleepdemo\r';     sleep 8
     printf 'threaddemo\r';    sleep 8
@@ -23,7 +26,7 @@ for r in $(seq 1 "$ROUNDS"); do
       -display none -serial mon:stdio -cdrom "$ISO" \
       -drive if=none,file="$ROOT/target/disk.img",format=raw,id=zdisk,cache=writethrough \
       -device virtio-blk-device,drive=zdisk,bus=virtio-mmio-bus.0 > "/tmp/stress-$r.log" 2>&1 &
-  QPID=$!; sleep 82; kill $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
+  QPID=$!; sleep 90; kill $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
   ok=0; total=0
   for pat in "forktest: PASS" "threaddemo: PASS" "mutextest: PASS" "fstest: PASS" "fsdemo: PASS" "secdemo: PASS"; do
     total=$((total+1))

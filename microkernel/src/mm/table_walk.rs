@@ -112,12 +112,10 @@ pub enum LeafShareClass {
 }
 
 /// 判定一个有效叶描述符的克隆策略。
-/// COW 共享总开关（第十四刀集成期裁决）：与第十一刀新调度器
-/// （MLFQ/FPU 门位/idle-scratch）叠加时存在待解交互回归——sleepdemo/
-/// secdemo 子进程困在 post-fork 首指令循环（eager 模式 13/13 全绿，
-/// COW 模式确定性复现）。取证线索见 STATUS.md「已知问题」。翻转此值
-/// 即恢复第十刀零复制 fork（其在旧调度基线下实机 PASS，证据链完整）。
-pub const COW_SHARED_FORK: bool = false;
+/// COW 共享总开关。此前因 post-fork 异常现场损坏而临时回退 eager；
+/// 异常入口现已完整保存 x16/x17，并重新以 host + QEMU 回归覆盖。
+/// 保留常量便于未来故障二分，但正常构建默认启用零复制 fork。
+pub const COW_SHARED_FORK: bool = true;
 pub const COW_BISECT_SKIP_ASLR: bool = false;
 pub const COW_BISECT_SKIP_PARENT_BBM: bool = false;
 

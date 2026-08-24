@@ -127,6 +127,14 @@ pub unsafe fn activate_kernel_page_table() {
 /// AArch64 BBM（break-before-make）屏障：dsb ishst → tlbi vaae1is → dsb ish → isb。
 /// host（非 aarch64）下为 no-op，仅用于单测遍历描述符写入。
 #[inline]
+const fn tlbi_va_operand(va: usize) -> u64 {
+    // TLBI VAAE1IS encodes VA[55:12] in Xt[43:0]. Passing the byte VA
+    // invalidates a completely different translation (effectively VA<<12).
+    // This bug let stale RW TLB entries survive the parent-side COW BBM.
+    (va as u64) >> 12
+}
+
+#[inline]
 fn kbbm_barrier(va: usize) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -135,7 +143,7 @@ fn kbbm_barrier(va: usize) {
             "tlbi vaae1is, {0}",
             "dsb ish",
             "isb",
-            in(reg) va as u64,
+            in(reg) tlbi_va_operand(va),
             options(nostack, preserves_flags)
         );
     }
@@ -275,20 +283,6 @@ fn alloc_page_table_raw() -> Option<*mut PageTable> {
     })
 }
 
-fn alloc_page_table() -> *mut PageTable {
-    match alloc_page_table_raw() {
-        Some(t) => t,
-        None => {
-            crate::info!(
-                "paging: OOM in alloc_page_table (free_pages={} page_table_pages={})",
-                crate::mm::phys::free_pages(),
-                crate::mm::phys::page_table_pages()
-            );
-            panic!("paging: out of physical memory for page tables")
-        }
-    }
-}
-
 fn alloc_page_table_fallible() -> Result<*mut PageTable, MapError> {
     alloc_page_table_raw().ok_or(MapError::OutOfMemory)
 }
@@ -318,24 +312,50 @@ fn kernel_l2_0() -> *const PageTable {
 const KERNEL_SHARED_L1: usize = TW_KERNEL_SHARED_L1;
 
 #[allow(static_mut_refs)]
-pub unsafe fn create_user_address_space() -> AddressSpace {
-    let l0 = alloc_page_table();
-    let l1 = alloc_page_table();
+unsafe fn create_user_address_space_fallible() -> Result<AddressSpace, MapError> {
+    let l0 = alloc_page_table_fallible()?;
+    let l1 = match alloc_page_table_fallible() {
+        Ok(table) => table,
+        Err(err) => {
+            phys::free_page_table(l0 as usize);
+            return Err(err);
+        }
+    };
     install_table_descriptor(l0, 0, l1);
 
-    // L1[1]：复制内核 L1 的**表描述符**，与内核共享 L2_1 表本体。
+    // L1[1]：复制内核 L1 的共享表描述符；该表本体不归用户空间所有。
     (*l1).0[KERNEL_SHARED_L1] = (*kernel_l1()).0[KERNEL_SHARED_L1];
 
-    // L1[0]：**私有 L2 副本**（4KiB memcpy）。既保留 GIC/PL011 等 MMIO
-    // block 对 EL1 的可见性，又允许把用户 ELF 所在的 2MiB block 在私有
-    // 副本里拆成 4K 页而不污染内核自己的 L2_0。
-    let l2_0 = alloc_page_table();
+    // L1[0]：私有 L2 快照。失败时把此前分配的表页全部回滚。
+    let l2_0 = match alloc_page_table_fallible() {
+        Ok(table) => table,
+        Err(err) => {
+            phys::free_page_table(l1 as usize);
+            phys::free_page_table(l0 as usize);
+            return Err(err);
+        }
+    };
     ptr::copy_nonoverlapping(kernel_l2_0() as *const u64, l2_0 as *mut u64, 512);
     install_table_descriptor(l1, 0, l2_0);
 
-    AddressSpace {
+    Ok(AddressSpace {
         root_table: l0,
         root_phys: page_table_phys(l0),
+    })
+}
+
+#[allow(static_mut_refs)]
+pub unsafe fn create_user_address_space() -> AddressSpace {
+    match create_user_address_space_fallible() {
+        Ok(space) => space,
+        Err(_) => {
+            crate::info!(
+                "paging: OOM creating user address space (free_pages={} page_table_pages={})",
+                phys::free_pages(),
+                phys::page_table_pages()
+            );
+            panic!("paging: out of physical memory for user address space")
+        }
     }
 }
 
@@ -632,9 +652,9 @@ pub fn last_clone_stats() -> (usize, usize, usize) {
 /// ⚠ 绝不复制 L1[KERNEL_SHARED_L1]（共享表），绝不共享表描述符本体——
 ///   子的页表页全部新建，只有**数据叶**被共享。
 ///
-/// 已知取舍（与旧 eager 版一致）：中途 OOM 返回 Err 时半成品 child 直接
-/// 泄漏（其 retain 过的共享页引用计数虚高，只会导致对端多走几次慢断链，
-/// 不会破坏隔离性）；修复需引入半成品回滚，超出本刀范围。
+/// 失败原子性：中途 OOM/建表失败会销毁半成品 child，并对“已 retain 但
+/// 尚未安装 PTE”的当前页显式撤销引用；已安装页由 destroy 统一回滚。父侧
+/// 已经改成 COW 的叶可以暂留只读标记，refcount 回到 1 后首写原地恢复。
 ///
 /// # Safety
 /// `parent` 必须处于稳定状态（无并发修改）；parent 当前已装入 TTBR 且
@@ -645,10 +665,11 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
         "paging: cow clone_user_address_space parent root_phys=0x{:016x}",
         parent.root_phys
     );
-    let mut child = create_user_address_space();
+    let mut child = create_user_address_space_fallible()?;
     let pl0 = parent.root_table;
     let e0 = (*pl0).0[0];
     if !is_valid(e0) || !is_table(e0) {
+        destroy_user_address_space(&child);
         return Err(MapError::OutOfMemory);
     }
     let pl1 = descriptor_to_table(e0) as *mut PageTable;
@@ -682,6 +703,7 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                 }
                 // 拒绝内核共享区（防御：parent 里本就不该有）
                 if l1_idx == KERNEL_SHARED_L1 {
+                    destroy_user_address_space(&child);
                     return Err(MapError::KernelRegion);
                 }
                 let src = (pte & PHYS_ADDR_MASK) as usize;
@@ -692,7 +714,13 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                         // 父子共享同一物理页；双侧只读 + 软件 COW 位。
                         phys::retain_page(src);
                         let child_desc = cow_share_leaf(pte);
-                        install_leaf_descriptor(&mut child, va, child_desc)?;
+                        if let Err(err) = install_leaf_descriptor(&mut child, va, child_desc) {
+                            // 当前 retain 尚未出现在 child PTE 中，先单独撤销；
+                            // 之前已经安装的共享页由 destroy 逐叶归还。
+                            phys::free_page(src);
+                            destroy_user_address_space(&child);
+                            return Err(err);
+                        }
                         // 父侧 BBM 改只读 + 置位（保留 PA/attr/UXN，仅换 AP）。
                         // 父正在运行：陈旧 RW TLB 必须逐 VA 击落，否则共享写
                         // 会静默穿透 COW 防线（bbm_update_page 内含屏障序）。
@@ -709,23 +737,37 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                     LeafShareClass::ReadOnlyDirect => {
                         // text/rodata：同 PA 直接映射（省复制），不打 COW 位。
                         phys::retain_page(src);
-                        install_leaf_descriptor(
+                        if let Err(err) = install_leaf_descriptor(
                             &mut child,
                             va,
                             make_leaf_descriptor(src as u64, USER_AP_RX, executable),
-                        )?;
+                        ) {
+                            phys::free_page(src);
+                            destroy_user_address_space(&child);
+                            return Err(err);
+                        }
                         ro_shared += 1;
                     }
                     LeafShareClass::EagerCopy => {
                         // 兜底（异常 AP 编码）：维持旧全量复制语义。
-                        let dst = alloc_user_page()?;
+                        let dst = match alloc_user_page() {
+                            Ok(page) => page,
+                            Err(err) => {
+                                destroy_user_address_space(&child);
+                                return Err(err);
+                            }
+                        };
                         ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE_SIZE);
                         let ap = (pte >> table_walk::AP_SHIFT) & 0b11;
-                        install_leaf_descriptor(
+                        if let Err(err) = install_leaf_descriptor(
                             &mut child,
                             va,
                             make_leaf_descriptor(dst as u64, ap, executable),
-                        )?;
+                        ) {
+                            phys::free_page(dst);
+                            destroy_user_address_space(&child);
+                            return Err(err);
+                        }
                         copied += 1;
                     }
                 }
@@ -836,6 +878,12 @@ pub unsafe fn unmap_user_range(space: &AddressSpace, start: usize, end: usize) -
 #[cfg(test)]
 mod unmap_tests {
     use super::*;
+
+    #[test]
+    fn tlbi_operand_is_page_number() {
+        assert_eq!(tlbi_va_operand(0x1234_5000), 0x12345);
+        assert_eq!(tlbi_va_operand(0xffff_f000), 0xfffff);
+    }
     use crate::mm::table_walk::WalkOutcome;
 
     /// 4K 对齐伪页表（地址即“物理地址”，与 table_walk 单测同一手法）。

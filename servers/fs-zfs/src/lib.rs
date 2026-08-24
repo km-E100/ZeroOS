@@ -62,7 +62,7 @@ impl From<libblkclient::Error> for ServerError {
     }
 }
 
-pub extern "C" fn server_main(boot_files: &[UserBootFile]) -> ! {
+pub fn server_main(boot_files: &[UserBootFile]) -> ! {
     mount_root_volume(boot_files);
     loop {
         let mut message = Message::empty();

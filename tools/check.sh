@@ -45,9 +45,6 @@ echo "############################################################"
 #     定义了 #[panic_handler] 的 no_std 裸机 crate，host 检查与 std 冲突，
 #     改由下面交叉目标 check 覆盖。
 #   - bootloader-uefi：aarch64-unknown-uefi 专用，同样由交叉目标覆盖。
-#   - zero-user-commands(userland/commands) & microkernel/tests：
-#     当前被其他 Agent 在制品代码（E0433 FsError / E0152 duplicated panic）
-#     阻塞，属于仓库基线问题，先记录并继续，不因它们中断本脚本。
 # ------------------------------------------------------------------
 HOST_CRATES=(
     "zero-abi"
@@ -62,37 +59,32 @@ HOST_CRATES=(
     "zero-service-controller"
     "mkzfs"
     "userlib"
+    "useralloc"
+    "zero-user-commands"
     "libfsclient"
     "libblkclient"
     "xtask"
-    "tools"
 )
 for crate in "${HOST_CRATES[@]}"; do
     run_step "check(host) $crate" cargo check -p "$crate"
 done
 
-# userland/commands（用户态 Agent 在制品，基线失败，单独标出）
-echo ""
-echo "=== [check.sh] userland/commands (known-baseline-issue, 记录不中断)"
-if cargo check -p zero-user-commands >/dev/null 2>&1; then
-    note_ok "check(host) zero-user-commands"
-else
-    echo "    warning: zero-user-commands 基线失败（等待用户态 Agent 修复）"
-    note_fail "check(host) zero-user-commands (基线问题, 非本脚本引入)"
-fi
-
 # ------------------------------------------------------------------
 # 2) 交叉目标 check（裸机内核链）
 # ------------------------------------------------------------------
-run_step "check(aarch64-unknown-none) microkernel+kernel+launchd+user-app" \
-    cargo check --target aarch64-unknown-none -p zero-microkernel -p zero-kernel -p zero-launchd -p user-app
+run_step "check(aarch64-unknown-none) bare-metal chain" \
+    cargo +nightly check -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none \
+      -p zero-microkernel -p zero-kernel -p zero-launchd -p user-app \
+      -p zero-securityd -p zero-fsd -p zero-blkdrv
 run_step "check(aarch64-unknown-uefi) bootloader-uefi" \
-    cargo check --target aarch64-unknown-uefi -p bootloader-uefi
+    cargo +nightly check --target aarch64-unknown-uefi -p bootloader-uefi
 
 # ------------------------------------------------------------------
 # 3) cargo test（有测试的 crate）
 # ------------------------------------------------------------------
-for crate in zero-zfs-core userlib zero-abi; do
+run_step "test zero-microkernel" cargo test -p zero-microkernel --lib -- --test-threads=1
+run_step "test mm-host-tests" bash -lc 'cd microkernel/mm-host-tests && cargo test'
+for crate in zero-zfs-core zero-securityd zero-fsd zero-ipc-router userlib useralloc zero-abi; do
     run_step "test $crate" cargo test -p "$crate"
 done
 
@@ -106,12 +98,17 @@ run_step "build-kernel-bare" cargo run -p xtask -- build-kernel-bare
 # ------------------------------------------------------------------
 echo ""
 echo "############################################################"
-echo "# 汇总: ${#PASSED[@]} 通过, ${#FAILED[@]} 失败"
-for name in "${FAILED[@]}"; do
-    echo "    [FAIL] ${name}"
-done
+fail_count=${#FAILED[@]}
+echo "# 汇总: ${#PASSED[@]} 通过, ${fail_count} 失败"
+if [ "$fail_count" -gt 0 ]; then
+    # macOS 自带 Bash 3.2 + set -u 对空数组的 "${arr[@]}" 展开会报
+    # unbound variable；只在确有失败项时才展开数组。
+    for name in "${FAILED[@]}"; do
+        echo "    [FAIL] ${name}"
+    done
+fi
 echo "############################################################"
-if [ "${#FAILED[@]}" -gt 0 ]; then
+if [ "$fail_count" -gt 0 ]; then
     echo "check.sh: 存在失败项，退出码 1"
     exit 1
 fi

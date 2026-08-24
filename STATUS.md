@@ -2,6 +2,43 @@
 
 > 新会话先读本文件 + `git log --oneline` 接上进度。
 
+## 2026-08-25 · 第十九刀：全仓收口（当前权威状态）
+
+- **标准实机验收：15/15 ALL PASS**。root/guest 会话、动态 capability、
+  COW fork、Sleep、线程/futex、块设备与 fsd 全链均在 fresh ISO 上通过。
+- **四核压力**：fresh `-smp 4` 下 `stress-loop.sh 3` 连续三轮均 6/6；
+  MADT 枚举 4 核，cpu1/2/3 经 ACPI MPIDR 点亮，最终 `online=4`。
+- **COW 默认重开并结案**：`COW_SHARED_FORK=true`。根因不是 Vec/FPU/进程表，
+  而是 `TLBI VAAE1IS` 错把完整 VA 当寄存器操作数；AArch64 要求传
+  `VA[55:12]`，即 `va >> 12`。旧 RW TLB 未被真正击落，父进程因此能
+  静默写穿 COW 共享栈，最终让子进程读到父分支的 fork 返回值。
+- **内核 free-list 结案**：free block 分配后若余量 `< MIN_FREE`，旧代码
+  不分裂却仍记录较小 `used`，留下无人拥有的 ghost gap；dealloc 后把
+  gap 当 next header。现改为把小尾巴并入本次分配，并有专门回归测试。
+  新 `useralloc::StaticFreeList` 同类边界也同步修复。
+- **异常现场**：AArch64 vector 入口先保存 x16/x17，再借 x16 定位
+  TrapFrame；异步 IRQ/Data Abort 不再错误套用 AAPCS caller-clobbered 规则。
+- **SMP/ACPI**：修复副核栈 double-add；PSCI context_id 写 TPIDRRO_EL0
+  作为逻辑 CPU id；MADT 按实际 boot CPU affinity 过滤；ACPI GUID 改用
+  UEFI crate 权威常量，多字节 packed 字段改逐字节 volatile 解码。
+- **256 槽补齐**：MLFQ `PROC_LEVEL`/`SLICE_USED` 从遗留 64 改为
+  `MAX_PROCESSES`，动态进程槽不再只扩进程表没扩调度记账。
+- **安全边界补齐**：IPC queue 由 `Message` 升为 `(sender PID, Message)`；
+  securityd 只信内核返回的 sender。普通已认证用户只能为自己申请
+  `CAP_SESSION`，普通 capability/撤销/用户库管理需 admin。userdb 改
+  `$zero$sha256$...` 编码，旧明文盘自动迁移；验证直接比较 32-byte digest，
+  密码输入不回显。
+- **长期用户态堆**：shell/fsd/securityd/blkdrv 等从永不回收的 bump heap
+  统一迁到固定预算、可 free/coalesce、带锁的 `useralloc::StaticFreeList`。
+- **工程链**：host SIGSEGV（wait_scan 残留 error! 直写 PL011）与
+  mm-host-tests 编译回归已修；CI/check.sh 更新；ISO 内写入 commit、dirty
+  与 kernel/rootfs SHA256。Git dangling commit 先挂 `refs/archive/dangling/*`
+  后清掉 lost-found/tmp packs，`.git` 从约 1.7GB 降到约 107MB。
+
+### 当前仍是路线图/架构取舍
+镜像级 KASLR 尚未实施；AML 不做；默认文件服务仍是轻量 `zero-fsd`，
+`zero-fs-zfs`/`zfs-core` 尚未切为运行时默认。这三项不是当前验收红灯。
+
 ## 当前里程碑（2026-08-24 · 第十~十四刀单日走完，四线并行+集成）
 
 ### 第十刀 内存现代化（实机全绿）
@@ -48,22 +85,18 @@
 - 软看门狗：连续 600 tick 无 Running 进程告警一次（scheduler）
 - 性能基线：scripts/perf-baseline.sh + docs/performance_baseline.md
 
-## 实机验收现状（scripts/acceptance.sh，**13/13 ALL PASS**）
+## 实机验收现状（scripts/acceptance.sh，**15/15 ALL PASS**）
 
-✅ 全项：shell-up / launchd 三服务 / login-root / secdemo / su-guest /
-   sessions / sleepdemo / forktest / blktest / fstest / fsdemo
+✅ shell-up / launchd-fsd / launchd-blkdrv / launchd-securityd / login-root /
+secdemo / su-guest / sessions / forktest / blktest / fstest / sleepdemo /
+fsdemo / threaddemo / mutextest。
 
-### 已知问题（唯一遗留，已隔离并默认关闭）
-**COW fork × 第十一刀新调度器交互回归**：
-- 症状：COW 开启时 sleepdemo/secdemo 的 fork 子进程困在 post-fork
-  首指令处循环（elr 不前进、无输出），父进程 elapsed 回写为 0、
-  wait NotFound(3)——确定性复现；eager-copy 模式 13/13 全绿。
-- 取证：FORK-COPY 探针证明子帧 x0=0/elr 正确武装；RC5 显示子进程
-  反复困在同一 elr（疑似 COW 断链重放不前进）；SVC25 收到 ticks=5。
-- 裁决：`table_walk::COW_SHARED_FORK = false`（显式开关，真只读页
-  仍直接映射）。第十刀 COW 在旧调度基线的实机证据链完整保留，
-  翻转开关即回归零复制 fork；待专会二分「断链重放 × MLFQ 抢占/
-  FPU 门位」的帧一致性。恢复注入 blktest 后验收矩阵补齐为 13 项。
+### COW 历史回归：✅ 2026-08-25 已结案
+`table_walk::COW_SHARED_FORK = true`。最终根因是父侧 BBM 后的 TLBI
+operand 编码：`VAAE1IS` 接收页号而不是 byte VA，旧代码传 `va` 导致
+陈旧 RW TLB 留存。修为 `va >> 12` 后，fresh 实机 COW 日志为
+`copied=0` 且 sleepdemo/forktest/线程/文件链全绿。同期发现的内核堆
+损坏另有独立根因：不可分裂的小尾巴形成 ghost gap，现亦有回归测试。
 
 ## 第十六刀（2026-08-24 · 三大件一气呵成）
 
@@ -89,7 +122,7 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 ## 待立项 → 已立项（设计冻结，实施待排）
 | 项目 | 立项文档 | 关键结论 |
 | --- | --- | --- |
-| SMP 阶段 3 · COW 重开 | docs/mm_heap_corruption_investigation.md | 阻塞于内核堆损坏 bug（trap 日志串覆写空闲链/进程表）；自动捕获工具已转正；行动清单四步 |
+| SMP 阶段 3 · COW 重开 | docs/mm_heap_corruption_investigation.md | ✅ 2026-08-25：TLBI operand + free-list ghost gap 双根因结案，COW 默认开启 |
 | 镜像级 KASLR | docs/kaslr_image_plan.md | 推荐 PIE 方案四步走，用户态先行；阶段1栈随机化已交付 |
 | ZeroPkg 生态 | docs/zeropkg_inos_plan.md | 宿主侧已成型；缺口=设备内 pkg ls/install/remove 四步刀次；依赖 fsd 树+session 均已交付 |
 | ACPI 静态表 | docs/acpi_static_plan.md | QEMU+edk2 即有全表，不受真机限制；WS-A~D 四步（RSDP 抓取/bootinfo 扩展/no_std 解析器/替换蛮力探测）；AML 明确不做 |
@@ -98,7 +131,7 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 
 | 档 | 内容 | 状态 |
 | --- | --- | --- |
-| 🥇 | 堆损坏猎杀：canary+分配史工具转正常驻；根因未破但取证决定性收窄；COW 重开阻塞立案 | ✅工具交付·修复待续 |
+| 🥇 | 堆损坏猎杀：最终定位 free-list 不可分裂尾巴形成 ghost gap；修复并加回归 | ✅2026-08-25 结案 |
 | 🥈 | ZeroPkg 设备内：WS-A(abi::zpkg 解析核)+WS-B(fsd CMD_RENAME 原子改名)+WS-C(shell pkg ls/rename) 已交付；WS-D 安装全流待卷预置链路 | ✅WS-A~C·实机 15/15 |
 | 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex + mutextest | ✅实机 PASS |
 | 小件 | threaddemo+mutextest 注入 acceptance（15 项）；crashlog 缓行 | ✅ |
@@ -111,7 +144,7 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 **第十八刀追加**：userlib Condvar（futex 实现）交付；COW 重开阻塞立案
 （Vec 生长假说已排除，见调查文档「已排除」节）；ZeroPkg WS-B/C 交付。
 
-完成后解锁路径：堆损坏结案 → COW_SHARED_FORK 一键翻转 → SMP 阶段 3 收口。
+解锁路径已完成：堆损坏结案 → COW_SHARED_FORK 重开 → SMP 阶段 3 收口。
 结构性天花板剩余：镜像级 KASLR 实施（设计已冻结）。
 
 ### SMP 多核立项（2026-08-24 定稿，四阶段）
@@ -124,10 +157,10 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | 0 | per-CPU 地基：CURRENT_SLOT/看门狗逐核化；每核 idle scratch 帧；自旋锁跨核纪律成文 | `-smp 1` 全功能零回归 | ✅2026-08-24 |
 | 1 | 副核点亮：PSCI CPU_ON 探测 1..MAX → 入口汇编（独立栈+TPIDR+GICC 初始化）→ 进调度循环 | `-smp 4` cpu1-3 online 日志 | ✅2026-08-24 |
 | 2 | 调度多核化：全局队列跨核消费；wake() 广播 RESCHED SGI 踢醒 WFI 核 | `-smp 4` forktest/sleepdemo/fstest/fsdemo/secdemo 全绿 | ✅2026-08-24 |
-| 3 | TLB 击落/IPI 深化 + 重开 COW_SHARED_FORK（跨核页表竞态收口） | COW 实机 copied=0 且 demo 全绿 | 未开工 |
+| 3 | TLB 击落 + 重开 COW_SHARED_FORK（跨核页表语义收口） | COW 实机 copied=0 且 demo 全绿 | ✅2026-08-25 |
 
 > **实机战报**：`-smp 4` 下 forktest/sleepdemo/fstest/fsdemo/secdemo 全 PASS；
-> `-smp 1` 标准验收 13/13 零回归。两个关键坑：
+> `-smp 1` 标准验收 15/15 零回归。两个关键坑：
 > ① PSCI 目标 MPIDR 不带 AArch64 的 RES1 位（bit31）——按 DT reg 原值
 >    （0x0/0x1/...）匹配，带位反而 INVALID_PARAMETERS；
 > ② QEMU virt 默认拓扑把逻辑核放 Aff0，但真机/socket 拓扑在 Aff1——

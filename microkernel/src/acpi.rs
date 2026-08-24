@@ -12,8 +12,8 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use alloc::vec;
 
-/// bootloader 补丁的 RSDP 物理地址（0 = 不可用）。槽位本体定义于
-/// boot/boot.S（.rodata.boot，与 __zero_memory_bytes 同款模式）。
+// bootloader 补丁的 RSDP 物理地址（0 = 不可用）。槽位本体定义于
+// boot/boot.S（.rodata.boot，与 __zero_memory_bytes 同款模式）。
 extern "C" {
     static __zero_rsdp_phys: u64;
 }
@@ -33,10 +33,20 @@ fn rd8(base: u64, off: usize) -> u8 {
     unsafe { ((base + off as u64) as *const u8).read_volatile() }
 }
 fn rd32(base: u64, off: usize) -> u32 {
-    unsafe { ((base + off as u64) as *const u32).read_volatile() }
+    // ACPI 字段是 packed byte stream，不保证 u32/u64 自然对齐。逐字节
+    // volatile 读取再按 little-endian 组装，避免 read_volatile 的对齐 UB。
+    let mut bytes = [0u8; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = rd8(base, off + i);
+    }
+    u32::from_le_bytes(bytes)
 }
 fn rd64(base: u64, off: usize) -> u64 {
-    unsafe { ((base + off as u64) as *const u64).read_volatile() }
+    let mut bytes = [0u8; 8];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = rd8(base, off + i);
+    }
+    u64::from_le_bytes(bytes)
 }
 
 /// RSDP 校验：签名 "RSD PTR "、rev>=2、第一段校验和（前 20 字节）
@@ -195,15 +205,13 @@ pub fn gicd_base() -> u64 {
     GICD_BASE.load(Ordering::SeqCst)
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin;
+use core::sync::atomic::Ordering;
 
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
     
     fn put(buf: &mut Vec<u8>, off: usize, bytes: &[u8]) {
         let end = off + bytes.len();

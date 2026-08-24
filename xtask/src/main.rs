@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use xshell::{cmd, Shell};
 
+mod hash;
 mod image;
 mod qemu;
 

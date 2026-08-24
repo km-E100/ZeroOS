@@ -46,6 +46,8 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     info!("kernel_main: entering boot::init_arch");
     boot::init_arch(boot_info);
     info!("kernel_main: boot::init_arch complete");
+    // ACPI 表地址来自固件，等 MM/恒等映射建立后再解析。
+    acpi::init();
     info!(
         "kernel_main: rootfs init (boot_info.rootfs=0x{:016x})",
         boot_info.rootfs as usize

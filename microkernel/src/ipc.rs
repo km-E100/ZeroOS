@@ -33,7 +33,7 @@ pub fn register_waiter(caller: ProcessId, chan: u32) -> Result<(), IpcError> {
     CHANNEL_TABLE.lock().register_waiter(caller, chan)
 }
 
-pub fn receive(caller: ProcessId, chan: u32) -> Result<Message, IpcError> {
+pub fn receive(caller: ProcessId, chan: u32) -> Result<(ProcessId, Message), IpcError> {
     CHANNEL_TABLE.lock().receive(caller, chan)
 }
 
@@ -94,12 +94,12 @@ impl ChannelTable {
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
         channel.ensure_groups(channel.tx_groups, caller)?;
-        channel.queue.push(msg, channel.capacity)?;
+        channel.queue.push(Envelope { sender: caller, message: msg }, channel.capacity)?;
         Ok(channel.pop_waiter())
     }
 
     /// 接收。owner 匹配 + rx 组策略。
-    fn receive(&mut self, caller: ProcessId, chan: u32) -> Result<Message, IpcError> {
+    fn receive(&mut self, caller: ProcessId, chan: u32) -> Result<(ProcessId, Message), IpcError> {
         let channel = self
             .channels
             .iter_mut()
@@ -107,7 +107,8 @@ impl ChannelTable {
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
         channel.ensure_groups(channel.rx_groups, caller)?;
-        channel.queue.pop()
+        let env = channel.queue.pop()?;
+        Ok((env.sender, env.message))
     }
 
     /// 登记接收等待者（阻塞式接收的挂起点）。容量 4：超出返回 Busy，
@@ -242,8 +243,21 @@ fn group_allows(mask: u32, caller_caps: u32) -> bool {
 }
 
 #[derive(Copy, Clone)]
+struct Envelope {
+    sender: ProcessId,
+    message: Message,
+}
+
+impl Envelope {
+    const EMPTY: Self = Self {
+        sender: ProcessId::new(0),
+        message: Message::empty(),
+    };
+}
+
+#[derive(Copy, Clone)]
 struct MessageQueue {
-    buf: [Message; MAX_QUEUE],
+    buf: [Envelope; MAX_QUEUE],
     head: usize,
     tail: usize,
     len: usize,
@@ -252,7 +266,7 @@ struct MessageQueue {
 impl MessageQueue {
     const fn new() -> Self {
         Self {
-            buf: [Message::empty(); MAX_QUEUE],
+            buf: [Envelope::EMPTY; MAX_QUEUE],
             head: 0,
             tail: 0,
             len: 0,
@@ -265,7 +279,7 @@ impl MessageQueue {
         self.len = 0;
     }
 
-    fn push(&mut self, msg: Message, capacity: usize) -> Result<(), IpcError> {
+    fn push(&mut self, msg: Envelope, capacity: usize) -> Result<(), IpcError> {
         if self.len == capacity {
             return Err(IpcError::ChannelBusy);
         }
@@ -275,7 +289,7 @@ impl MessageQueue {
         Ok(())
     }
 
-    fn pop(&mut self) -> Result<Message, IpcError> {
+    fn pop(&mut self) -> Result<Envelope, IpcError> {
         if self.len == 0 {
             return Err(IpcError::Empty);
         }
@@ -296,6 +310,10 @@ mod tests {
         m
     }
 
+    fn env(n: u32) -> Envelope {
+        Envelope { sender: ProcessId::new(11), message: msg(n) }
+    }
+
     #[test]
     fn queue_empty_pop() {
         let mut q = MessageQueue::new();
@@ -306,10 +324,10 @@ mod tests {
     fn queue_push_pop_roundtrip() {
         let mut q = MessageQueue::new();
         for n in 1..=8 {
-            q.push(msg(n), MAX_QUEUE).unwrap();
+            q.push(env(n), MAX_QUEUE).unwrap();
         }
         for n in 1..=8 {
-            assert_eq!(q.pop().unwrap().code, n);
+            assert_eq!(q.pop().unwrap().message.code, n);
         }
         assert!(matches!(q.pop(), Err(IpcError::Empty)));
     }
@@ -318,36 +336,36 @@ mod tests {
     fn queue_full_rejected() {
         let mut q = MessageQueue::new();
         for n in 0..MAX_QUEUE {
-            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+            q.push(env(n as u32), MAX_QUEUE).unwrap();
         }
         // 容量=16 时第 17 个被拒
         assert!(matches!(
-            q.push(msg(999), MAX_QUEUE),
+            q.push(env(999), MAX_QUEUE),
             Err(IpcError::ChannelBusy)
         ));
         // 限定更小 capacity 同样生效
         let mut q2 = MessageQueue::new();
         for n in 0..4 {
-            q2.push(msg(n as u32), 4).unwrap();
+            q2.push(env(n as u32), 4).unwrap();
         }
-        assert!(matches!(q2.push(msg(4), 4), Err(IpcError::ChannelBusy)));
+        assert!(matches!(q2.push(env(4), 4), Err(IpcError::ChannelBusy)));
     }
 
     #[test]
     fn queue_wrap_around() {
         let mut q = MessageQueue::new();
         for n in 0..MAX_QUEUE {
-            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+            q.push(env(n as u32), MAX_QUEUE).unwrap();
         }
         for n in 0..MAX_QUEUE {
-            assert_eq!(q.pop().unwrap().code, n as u32);
+            assert_eq!(q.pop().unwrap().message.code, n as u32);
         }
         // head 已绕回，再入队出队顺序仍正确（容量仍为 MAX_QUEUE）
         for n in 100..(100 + MAX_QUEUE) {
-            q.push(msg(n as u32), MAX_QUEUE).unwrap();
+            q.push(env(n as u32), MAX_QUEUE).unwrap();
         }
         for n in 100..(100 + MAX_QUEUE) {
-            assert_eq!(q.pop().unwrap().code, n as u32);
+            assert_eq!(q.pop().unwrap().message.code, n as u32);
         }
         assert!(matches!(q.pop(), Err(IpcError::Empty)));
     }
@@ -439,7 +457,7 @@ mod tests {
             Err(IpcError::PolicyDenied)
         ));
         // 持组接收者取到消息
-        assert_eq!(receive(ALICE, CH).unwrap().code, 7);
+        assert_eq!(receive(ALICE, CH).unwrap().1.code, 7);
         // 阻塞等待登记同样受 rx 组约束
         assert!(register_waiter(ALICE, CH).is_ok());
         assert!(matches!(

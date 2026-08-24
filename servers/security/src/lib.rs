@@ -17,7 +17,7 @@
 //!
 //! 用户库落盘为固定布局（跨启动 ABI，编解码在 [`zero_abi::userdb`]）：
 //! LBA 4096 起头部扇区（magic `SUD1` + 版本 + 记录区扇区数），随后是
-//! 记录扇区（`name:password:role\n` 行集）。写入顺序**先记录后头部**
+//! 记录扇区（`name:encoded-password:role\n` 行集）。写入顺序**先记录后头部**
 //! （头部即提交标记）；写后读回逐字节自检。加载时 magic 校验失败
 //! ⇒ 视为首启/损坏，用内置默认表播种并写回。选址避开 virtio-blk
 //! 自检扇区（LBA 2048）与旧版 userdb 区（LBA 128），依据见
@@ -31,6 +31,7 @@ use core::slice;
 use heapless::{String, Vec};
 use spin::Mutex;
 use userlib;
+use zero_zfs_core::crypto::sha256;
 use zero_abi::bootfs::UserBootFile;
 use zero_abi::channels;
 use zero_abi::ipc::Message;
@@ -39,7 +40,10 @@ use zero_abi::protocol::security::{
 };
 
 const USERNAME_MAX: usize = 16;
-const PASSWORD_MAX: usize = 32;
+const PASSWORD_INPUT_MAX: usize = 64;
+const PASSWORD_MAX: usize = 80;
+const PASSWORD_PREFIX: &str = "$zero$sha256$";
+const PASSWORD_DOMAIN: &[u8] = b"zero-os-userdb-v2";
 const USER_CAPACITY: usize = 8;
 const LIST_BUFFER: usize = 256;
 
@@ -74,7 +78,7 @@ impl<const N: usize> SectorAligned<N> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UserRole {
     Admin,
     User,
@@ -97,6 +101,133 @@ impl UserRole {
     }
 }
 
+#[derive(Copy, Clone)]
+struct AuthRecord {
+    pid: u64,
+    role: UserRole,
+}
+
+const AUTH_CAPACITY: usize = 32;
+static AUTHZ: Mutex<Vec<AuthRecord, AUTH_CAPACITY>> = Mutex::new(Vec::new());
+
+fn remember_authenticated(pid: u64, role: UserRole) {
+    let mut auth = AUTHZ.lock();
+    if let Some(row) = auth.iter_mut().find(|r| r.pid == pid) {
+        row.role = role;
+        return;
+    }
+    if auth.len() == auth.capacity() {
+        // Bounded table: evict the oldest row rather than silently granting nobody.
+        auth.remove(0);
+    }
+    let _ = auth.push(AuthRecord { pid, role });
+}
+
+fn authenticated_role(pid: u64) -> Option<UserRole> {
+    AUTHZ.lock().iter().find(|r| r.pid == pid).map(|r| r.role)
+}
+
+fn is_admin(pid: u64) -> bool {
+    authenticated_role(pid) == Some(UserRole::Admin)
+}
+
+fn cap_issue_allowed(sender: u64, role: Option<UserRole>, req: &CapIssueRequest) -> bool {
+    let login_self = req.caps == zero_abi::cap::CAP_SESSION
+        && req.target_pid == sender
+        && role.is_some();
+    let admin_grant = role == Some(UserRole::Admin)
+        && req.caps != zero_abi::cap::CAP_SESSION;
+    login_self || admin_grant
+}
+
+fn password_digest(username: &str, password: &str) -> Option<[u8; 32]> {
+    if password.is_empty() || password.len() > PASSWORD_INPUT_MAX || username.len() > USERNAME_MAX {
+        return None;
+    }
+    // Fixed stack buffer: avoid target-dependent collection behavior in the
+    // credential hot path. Layout is exactly:
+    // domain || NUL || username || NUL || password.
+    let mut input = [0u8; 160];
+    let mut n = 0usize;
+    let mut append = |bytes: &[u8]| -> Option<()> {
+        let end = n.checked_add(bytes.len())?;
+        if end > input.len() { return None; }
+        input[n..end].copy_from_slice(bytes);
+        n = end;
+        Some(())
+    };
+    append(PASSWORD_DOMAIN)?;
+    append(&[0])?;
+    append(username.as_bytes())?;
+    append(&[0])?;
+    append(password.as_bytes())?;
+    Some(sha256(&input[..n]))
+}
+
+fn password_hash(username: &str, password: &str) -> Option<String<PASSWORD_MAX>> {
+    let digest = password_digest(username, password)?;
+    let mut encoded = [0u8; PASSWORD_MAX];
+    let prefix = PASSWORD_PREFIX.as_bytes();
+    encoded[..prefix.len()].copy_from_slice(prefix);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut off = prefix.len();
+    for byte in digest {
+        encoded[off] = HEX[(byte >> 4) as usize];
+        encoded[off + 1] = HEX[(byte & 0xf) as usize];
+        off += 2;
+    }
+    let text = core::str::from_utf8(&encoded[..off]).ok()?;
+    let mut out = String::<PASSWORD_MAX>::new();
+    out.push_str(text).ok()?;
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_encoded_digest(field: &str) -> Option<[u8; 32]> {
+    let hex = field.strip_prefix(PASSWORD_PREFIX)?.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = (hex_nibble(hex[i * 2])? << 4) | hex_nibble(hex[i * 2 + 1])?;
+    }
+    Some(out)
+}
+
+fn encoded_password(field: &str) -> bool {
+    parse_encoded_digest(field).is_some()
+}
+
+fn normalize_password(username: &str, field: &str) -> Option<String<PASSWORD_MAX>> {
+    if encoded_password(field) {
+        let mut out = String::<PASSWORD_MAX>::new();
+        out.push_str(field).ok()?;
+        Some(out)
+    } else {
+        password_hash(username, field)
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[derive(Clone)]
 struct UserRecord {
     username: String<USERNAME_MAX>,
@@ -109,7 +240,6 @@ impl UserRecord {
         if username.is_empty()
             || username.len() > USERNAME_MAX
             || password.is_empty()
-            || password.len() > PASSWORD_MAX
             || !username
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -118,8 +248,7 @@ impl UserRecord {
         }
         let mut name = String::<USERNAME_MAX>::new();
         name.push_str(username).map_err(|_| ())?;
-        let mut pwd = String::<PASSWORD_MAX>::new();
-        pwd.push_str(password).map_err(|_| ())?;
+        let pwd = normalize_password(username, password).ok_or(())?;
         Ok(Self {
             username: name,
             password: pwd,
@@ -147,6 +276,8 @@ impl UserStore {
 }
 
 static USERS: Mutex<UserStore> = Mutex::new(UserStore::new());
+static PASSWORD_MIGRATION_NEEDED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// 能力令牌台账行（securityd 侧镜像）：内核台账（号位 40/41 落账）
 /// 是唯一权威，本表只服务 `CMD_CAP_LIST`/`CMD_CAP_VERIFY` 的可观测性
@@ -175,9 +306,9 @@ pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
     println("  channel req=0x230 resp=0x231; auth/userdb/cap-issuance ready");
     loop {
         let mut message = Message::empty();
-        match userlib::ipc_receive(channels::SECURITY_USER_REQ, &mut message) {
-            Ok(_) => {
-                process_command(&mut message);
+        match userlib::ipc_receive_from(channels::SECURITY_USER_REQ, &mut message) {
+            Ok(sender) => {
+                process_command(sender, &mut message);
                 let _ = userlib::ipc_send(channels::SECURITY_USER_RESP, &message);
             }
             Err(_) => userlib::yield_now(),
@@ -205,6 +336,10 @@ fn init_user_store(bootfs_ptr: u64, bootfs_len: u64) {
             println("  LBA=4096 records; users:");
             println(names.as_str());
             let _ = count;
+            if PASSWORD_MIGRATION_NEEDED.swap(false, core::sync::atomic::Ordering::SeqCst) {
+                println("securityd: migrating legacy plaintext credentials");
+                persist_users();
+            }
             return;
         }
         RestoreOutcome::NoValidHeader => {
@@ -293,6 +428,7 @@ fn apply_user_blob(blob: &[u8]) -> bool {
         Err(_) => return false,
     };
     let mut parsed = Vec::<UserRecord, USER_CAPACITY>::new();
+    let mut migrated = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -310,7 +446,11 @@ fn apply_user_blob(blob: &[u8]) -> bool {
         if parsed.len() == parsed.capacity() {
             break;
         }
-        if let Ok(record) = UserRecord::build(name.trim(), password.trim(), role) {
+        let password = password.trim();
+        if !encoded_password(password) {
+            migrated = true;
+        }
+        if let Ok(record) = UserRecord::build(name.trim(), password, role) {
             let _ = parsed.push(record);
         }
     }
@@ -322,23 +462,26 @@ fn apply_user_blob(blob: &[u8]) -> bool {
     for record in parsed {
         let _ = store.records.push(record);
     }
+    PASSWORD_MIGRATION_NEEDED.store(migrated, core::sync::atomic::Ordering::SeqCst);
     true
 }
 
-fn process_command(msg: &mut Message) {
+fn process_command(sender: u64, msg: &mut Message) {
     match msg.code {
-        security::CMD_USER_LIST => handle_list(msg),
-        security::CMD_USER_ADD => handle_add(msg),
-        security::CMD_USER_DELETE => handle_delete(msg),
-        security::CMD_USER_PASSWD => handle_passwd(msg),
-        security::CMD_USER_VERIFY => handle_verify(msg),
-        // ── 第十三刀：capability 动态签发协议 ──────────────────────
-        security::CMD_CAP_ISSUE => handle_cap_issue(msg),
-        security::CMD_CAP_REVOKE => handle_cap_revoke(msg),
-        security::CMD_CAP_LIST => handle_cap_list(msg),
-        security::CMD_CAP_VERIFY => handle_cap_verify(msg),
+        // Credential verification is the only unauthenticated operation. A
+        // successful check binds the resulting role to the kernel-supplied PID.
+        security::CMD_USER_VERIFY => handle_verify(sender, msg),
+        security::CMD_USER_LIST if is_admin(sender) => handle_list(msg),
+        security::CMD_USER_ADD if is_admin(sender) => handle_add(msg),
+        security::CMD_USER_DELETE if is_admin(sender) => handle_delete(msg),
+        security::CMD_USER_PASSWD if is_admin(sender) => handle_passwd(msg),
+        security::CMD_CAP_ISSUE => handle_cap_issue(sender, msg),
+        security::CMD_CAP_REVOKE if is_admin(sender) => handle_cap_revoke(msg),
+        security::CMD_CAP_LIST if is_admin(sender) => handle_cap_list(msg),
+        security::CMD_CAP_VERIFY if is_admin(sender) => handle_cap_verify(msg),
         _ => {
-            msg.code = 2;
+            msg.payload.fill(0);
+            msg.code = 3; // authenticated/authorization policy denied
         }
     }
 }
@@ -424,22 +567,17 @@ fn handle_passwd(msg: &mut Message) {
         msg.code = 1;
         return;
     };
-    if password.is_empty() || password.len() > PASSWORD_MAX {
+    let Some(pwd) = password_hash(username, password) else {
         msg.code = 2;
         return;
-    }
-    let mut pwd = String::<PASSWORD_MAX>::new();
-    if pwd.push_str(password).is_err() {
-        msg.code = 2;
-        return;
-    }
+    };
     store.records[index].password = pwd;
     msg.code = 0;
     drop(store);
     persist_users();
 }
 
-fn handle_verify(msg: &mut Message) {
+fn handle_verify(sender: u64, msg: &mut Message) {
     let fields = parse_fields(&msg.payload);
     let (Some(username), Some(password)) = (fields.get(0), fields.get(1)) else {
         msg.code = 2;
@@ -450,7 +588,18 @@ fn handle_verify(msg: &mut Message) {
         msg.code = 1;
         return;
     };
-    if store.records[index].password.as_str() == *password {
+    let Some(candidate_digest) = password_digest(username, password) else {
+        msg.code = 1;
+        return;
+    };
+    let Some(stored_digest) = parse_encoded_digest(store.records[index].password.as_str()) else {
+        msg.code = 1;
+        return;
+    };
+    if constant_time_eq(&stored_digest, &candidate_digest) {
+        let role = store.records[index].role;
+        drop(store);
+        remember_authenticated(sender, role);
         msg.code = 0;
     } else {
         msg.code = 1;
@@ -462,20 +611,20 @@ fn handle_verify(msg: &mut Message) {
 /// 响应：code=0 且 payload=`token\0`；code=1 参数解析失败；
 /// code=2 内核拒绝（非 ISSUER / scope 非法 / 台账满）。
 ///
-/// 【信任模型披露】target_pid 由请求方自报（Message 无发送者身份，
-/// 见 zero_abi::protocol::security::CapIssueRequest 注释）；签发策略
-/// 本轮为"按请求放行"的参考实现——真正的防线在内核侧：CAP_ISSUER
-/// 仅本服务持有、CAP_ISSUER 不可转授、授予绑定会话且可即时撤销。
-fn handle_cap_issue(msg: &mut Message) {
+/// 调用者身份由内核 IPC envelope 提供，不能由 payload 伪造。普通已认证
+/// 用户只能给**自己**申请 CAP_SESSION；其余能力签发仅 admin 身份可用。
+/// 内核仍做第二道防线：CAP_ISSUER 不可转授、授予按 PID/会话绑定。
+fn handle_cap_issue(sender: u64, msg: &mut Message) {
     let Some(req) = parse_cap_issue(&msg.payload) else {
         msg.code = 1;
         return;
     };
-    let CapIssueRequest {
-        target_pid,
-        caps,
-        ttl,
-    } = req;
+    let CapIssueRequest { target_pid, caps, ttl } = req;
+    if !cap_issue_allowed(sender, authenticated_role(sender), &req) {
+        msg.payload.fill(0);
+        msg.code = 3;
+        return;
+    }
     match userlib::cap_grant(target_pid, caps, ttl) {
         Ok(token) => {
             // 台账镜像满：内核授予已生效，仅审计缺行——如实告警但不
@@ -736,4 +885,48 @@ mod tests {
         assert!(security::encode_cap_issue(&mut payload, &req));
         assert_eq!(parse_cap_issue(&payload), Some(req));
     }
+    #[test]
+    fn password_storage_never_keeps_plaintext() {
+        let root = UserRecord::build("root", "zero", UserRole::Admin).unwrap();
+        assert!(root.password.as_str().starts_with(PASSWORD_PREFIX));
+        assert_ne!(root.password.as_str(), "zero");
+        let again = UserRecord::build("root", root.password.as_str(), UserRole::Admin).unwrap();
+        assert_eq!(again.password.as_str(), root.password.as_str());
+        let stored = parse_encoded_digest(root.password.as_str()).unwrap();
+        assert!(constant_time_eq(&stored, &password_digest("root", "zero").unwrap()));
+        assert!(!constant_time_eq(&stored, &password_digest("root", "wrong").unwrap()));
+    }
+
+    #[test]
+    fn capability_policy_binds_identity_to_kernel_sender() {
+        let sender = 42;
+        let login = CapIssueRequest { target_pid: sender, caps: zero_abi::cap::CAP_SESSION, ttl: 0 };
+        assert!(!cap_issue_allowed(sender, None, &login));
+        assert!(cap_issue_allowed(sender, Some(UserRole::User), &login));
+        let forged_login = CapIssueRequest { target_pid: 99, ..login };
+        assert!(!cap_issue_allowed(sender, Some(UserRole::User), &forged_login));
+        let powerful = CapIssueRequest { target_pid: 99, caps: zero_abi::cap::CAP_BLOCK_DEV, ttl: 100 };
+        assert!(!cap_issue_allowed(sender, Some(UserRole::User), &powerful));
+        assert!(cap_issue_allowed(sender, Some(UserRole::Admin), &powerful));
+    }
+
+    #[test]
+    fn rootfs_default_credentials_verify_after_pre_hashing() {
+        let blob = include_bytes!("../../../kernel/rootfs/etc/users");
+        assert!(apply_user_blob(blob));
+        let mut msg = Message::empty();
+        msg.payload[..4].copy_from_slice(b"root");
+        msg.payload[5..9].copy_from_slice(b"zero");
+        handle_verify(42, &mut msg);
+        assert_eq!(msg.code, 0);
+        assert_eq!(authenticated_role(42), Some(UserRole::Admin));
+
+        let mut guest = Message::empty();
+        guest.payload[..5].copy_from_slice(b"guest");
+        guest.payload[6..11].copy_from_slice(b"guest");
+        handle_verify(43, &mut guest);
+        assert_eq!(guest.code, 0);
+        assert_eq!(authenticated_role(43), Some(UserRole::User));
+    }
+
 }

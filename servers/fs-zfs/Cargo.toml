@@ -20,3 +20,5 @@ userlib = { path = "../../userland/userlib" }
 spin = { workspace = true }
 heapless = { version = "0.8", default-features = false }
 libblkclient = { path = "../../userland/libblkclient" }
+
+useralloc = { path = "../../userland/useralloc" }

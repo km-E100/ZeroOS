@@ -11,15 +11,11 @@ const KERNEL_MEMORY_SYMBOL: &str = "__zero_memory_bytes";
 /// 从 UEFI System Table 的 config 数组抓 ACPI 2.0+ RSDP，补丁进内核
 /// 符号 `__zero_rsdp_phys`（0 = 未找到，内核回退硬编码探测路径）。
 const KERNEL_RSDP_SYMBOL: &str = "__zero_rsdp_phys";
-use uefi::data_types::Guid;
-/// ACPI 2.0 Table Guid：8868e871-e4f1-11d3-bc22-0080c73c8881
-const ACPI20_GUID: Guid = Guid::from_bytes(
-    0x8868_e871u128.to_le_bytes(),
-);
+use uefi::table::cfg::ACPI2_GUID;
 
 fn find_rsdp_phys(st: &SystemTable<Boot>) -> Option<u64> {
     for entry in st.config_table() {
-        if entry.guid == ACPI20_GUID {
+        if entry.guid == ACPI2_GUID {
             return Some(entry.address as usize as u64);
         }
     }
@@ -52,6 +48,7 @@ fn patch_kernel_rsdp(kernel: &crate::kernel_loader::KernelImage, rsdp: Option<u6
 /// 当前内核入口 (boot.S `_start`) 固定读取静态 `boot_info_struct`，
 /// 因此这里除了保存计算结果外，还会在 prepare() 阶段把 `memory_bytes`
 /// 直接补丁进已加载的内核镜像（通过 ELF 符号定位）。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct KernelBootContext {
     /// 协商出的可用物理内存字节数（0 = 未知，内核回退 512 MiB）。

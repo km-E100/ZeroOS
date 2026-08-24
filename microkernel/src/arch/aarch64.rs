@@ -51,9 +51,9 @@ __vector_table:\n\
      //   当前进程的 TrapFrame —— 存根因此无需触碰任何锁或 Rust 代码即可\n\
      //   定位保存目标。内核全程屏蔽 IRQ ⇒ 所有异常都来自 EL0 或内核自身\n\
      //   bug，TPIDR_EL1 恒有效。\n\
-     // * x16 = IP0 被用作帧指针暂存，用户 x16 不保存（AAPCS64 规定 IP0/IP1\n\
-     //   为过程间临时寄存器）；userlib 全部 svc 封装已显式声明 x16/x17\n\
-     //   clobber，编译器不会在 svc 边界跨存活值。x17 先行保存到帧内。\n\
+     // * x16/x17 必须完整保存。AAPCS64 的 caller-clobbered 规则只约束函数调用，\n\
+     //   IRQ/Data Abort 等异步异常必须透明保全它们。入口先在 EL1 栈暂存\n\
+     //   x16/x17，再用 x16 定位 TrapFrame，随后落回各自帧槽并恢复 SP。\n\
      // * SP_EL1 在异常进入时由硬件自动切换，其当前值恒为该槽内核栈顶\n\
      //   （每次 eret 前都从帧内 #272 重置），故直接存入 #272 并复位 SP，\n\
      //   保证嵌套/重入时栈指针幂等归位。\n\
@@ -62,8 +62,9 @@ __vector_table:\n\
      //   CPACR_EL1.FPEN=0b11 —— 否则本存根的 stp q*/mrs fpsr 自身就会\n\
      //   同步异常。内核态浮点约定与 lazy-save 优化路径见 process::FpuState。\n\
      .macro SAVE_TRAP_AND_CALL kind\n\
+         sub sp, sp, #16\n\
+         stp x16, x17, [sp]\n\
          mrs x16, tpidr_el1\n\
-         str x17, [x16, #136]\n\
          stp x0, x1, [x16, #0]\n\
          stp x2, x3, [x16, #16]\n\
          stp x4, x5, [x16, #32]\n\
@@ -72,6 +73,11 @@ __vector_table:\n\
          stp x10, x11, [x16, #80]\n\
          stp x12, x13, [x16, #96]\n\
          stp x14, x15, [x16, #112]\n\
+         ldr x17, [sp, #0]\n\
+         str x17, [x16, #128]\n\
+         ldr x17, [sp, #8]\n\
+         str x17, [x16, #136]\n\
+         add sp, sp, #16\n\
          stp x18, x19, [x16, #144]\n\
          stp x20, x21, [x16, #160]\n\
          stp x22, x23, [x16, #176]\n\
@@ -154,20 +160,21 @@ __vector_irq_el0_64:\n\
      SAVE_TRAP_AND_CALL 1\n\
 \n\
      // ─── SMP 副核入口（第十四刀立项 · 阶段 1）─────────────────────\n\
-     // PSCI CPU_ON 以 EL1h/IRQ 屏蔽跳入，x0 未定义——自行读 MPIDR。\n\
-     // 栈：SMP_SECONDARY_STACKS[idx]；TPIDR_EL1 ← SMP_IDLE_FRAMES[idx]\n\
+     // PSCI CPU_ON 以 EL1h/IRQ 屏蔽跳入；x0=context_id（逻辑 CPU 号）。\n\
+     // 栈：SMP_SECONDARY_STACKS[idx]；TPIDRRO_EL0 保存逻辑 CPU 号；\n\
+     // TPIDR_EL1 ← SMP_IDLE_FRAMES[idx]。\n\
      // （异常保存目标即刻有效）。随后进 Rust 初始化 GICC/定时器。\n\
      .section .text.smp_entry,\"ax\"\n\
      .global __secondary_entry\n\
 __secondary_entry:\n\
      msr daifset, #0xf\n\
-     mrs x0, mpidr_el1\n\
-     and x0, x0, #0xff\n\
+     msr tpidrro_el0, x0\n\
      ldr x1, =SMP_SECONDARY_STACKS\n\
      mov x2, #65536\n\
      mul x2, x0, x2\n\
      add x1, x1, x2\n\
-     add sp, x1, x2\n\
+     mov x3, #65536\n\
+     add sp, x1, x3\n\
      ldr x1, =SMP_IDLE_FRAMES\n\
      mov x2, #832\n\
      mul x2, x0, x2\n\
@@ -428,10 +435,6 @@ pub unsafe fn end_irq(id: u32) {
 #[inline(always)]
 pub fn is_timer_irq(id: u32) -> bool {
     gic::is_timer_interrupt(id)
-}
-
-pub fn gic_sgi_resched() -> u32 {
-    gic::SGI_RESCHED
 }
 
 pub unsafe fn gic_init_cpu_interface() {

@@ -5,6 +5,10 @@ extern crate alloc;
 
 use alloc::string::String;
 use core::panic::PanicInfo;
+use useralloc::StaticFreeList;
+
+#[global_allocator]
+static ALLOCATOR: StaticFreeList<{ 32 * 1024 }> = StaticFreeList::new();
 
 use libfsclient::{
     delete_file, install_device, list_devices, list_entries, open, write_file, DeviceSummary,
@@ -258,7 +262,7 @@ fn format_error(msg: &mut String, err: libfsclient::FsError) {
         NoDescriptor => msg.push_str("bad descriptor"),
         DeviceError => msg.push_str("device error"),
         Ipc(_) => msg.push_str("ipc error"),
-        FsError::Syscall(_) => msg.push_str("syscall error"),
+        Syscall(_) => msg.push_str("syscall error"),
         Unknown(code) => {
             msg.push_str("code ");
             let _ = core::fmt::Write::write_fmt(msg, format_args!("{}", code));

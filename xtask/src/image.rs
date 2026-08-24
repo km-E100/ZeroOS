@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use xshell::{cmd, Shell};
 
 const ESP_IMAGE_NAME: &str = "esp.img";
@@ -10,6 +11,8 @@ const ESP_IMAGE_NAME: &str = "esp.img";
 const ESP_SIZE_MB: u32 = 96;
 
 pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
+    // Capture source provenance before build-rootfs sync rewrites tracked blob files.
+    let source_provenance = source_provenance(&sh.current_dir());
     build_components(sh)?;
 
     let project_root = sh.current_dir();
@@ -23,6 +26,8 @@ pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
     let efi_zeroos_dir = iso_dir.join("EFI").join("ZEROOS");
     fs::create_dir_all(&efi_boot_dir)?;
     fs::create_dir_all(&efi_zeroos_dir)?;
+
+    fs::write(efi_zeroos_dir.join("build-info.txt"), &source_provenance)?;
 
     let kernel = project_root.join("target/aarch64-unknown-none/debug/zero-kernel");
     if !kernel.exists() {
@@ -42,6 +47,14 @@ pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
         ));
     }
     fs::copy(&rootfs_img, efi_zeroos_dir.join("zero-rootfs.img"))?;
+
+    let artifact_info = format!(
+        "{}kernel_sha256={}\nrootfs_sha256={}\n",
+        source_provenance,
+        crate::hash::hash_file(&kernel)?,
+        crate::hash::hash_file(&rootfs_img)?,
+    );
+    fs::write(efi_zeroos_dir.join("build-info.txt"), artifact_info)?;
 
     let boot_cfg = "\
 # Zero OS boot configuration
@@ -94,7 +107,6 @@ if exist fs3:\\EFI\\BOOT\\BOOTAA64.EFI then\r\n  fs3:\\EFI\\BOOT\\BOOTAA64.EFI\r
     let userland_dir = iso_dir.join("userland");
     fs::create_dir_all(&userland_dir)?;
     for bin in [
-        "zero-launchd",
         "zero-fs-zfs",
         "zero-fsd",
         "zero-blkdrv",
@@ -141,6 +153,7 @@ fn build_components(sh: &Shell) -> Result<()> {
     // 上次手动构建的陈旧 blob 打进镜像 —— 源码改动“神秘失效”皆源于此。
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd -p zero-fsd -p zero-blkdrv --release").run()?;
 
     // 在 build-rootfs 打包之前，把刚构建的用户态裸机 ELF 同步进 kernel/rootfs
     // （zero-shell / zero-launchd；产物缺失时回退仓库已有 blob 并 warn）。
@@ -152,6 +165,17 @@ fn build_components(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-kernel").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-uefi -p bootloader-uefi").run()?;
     Ok(())
+}
+
+fn source_provenance(project_root: &Path) -> String {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").args(args).current_dir(project_root).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let status = git(&["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default();
+    let dirty = if status.is_empty() { "false" } else { "true" };
+    format!("commit={commit}\ndirty={dirty}\n")
 }
 
 fn find_bootloader_image(project_root: &Path) -> Result<PathBuf> {

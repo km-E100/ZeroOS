@@ -63,6 +63,8 @@ pub fn now() -> u64 {
 pub enum IssueError {
     /// 能力位图为空或包含 CAP_ISSUER（不可转授）。
     InvalidScope,
+    /// 目标 PID 当前不存在。禁止给“未来 PID”预埋授权。
+    NoSuchProcess,
     /// 台账已满。
     TableFull,
 }
@@ -301,6 +303,9 @@ pub fn effective_caps(pid: ProcessId) -> u32 {
 
 /// 动态签发（号位 40 内核臂）。目标会话取自进程表现值。
 pub fn issue_grant(target: ProcessId, caps: u32, ttl: u64) -> Result<u64, IssueError> {
+    if crate::process::slot_for_pid(target).is_none() {
+        return Err(IssueError::NoSuchProcess);
+    }
     let target_session = crate::process::session_of_pid(target);
     let now = now();
     with_book(|book| book.issue(target, caps, ttl, target_session, now))

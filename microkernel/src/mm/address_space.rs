@@ -134,7 +134,7 @@ impl AddressSpace {
 /// 2GiB（0x8000_0000），栈顶之下没有任何映射覆盖 guard 页：
 /// - 栈溢出向下滑入 guard 页 → 立即 translation fault（响亮失败）；
 /// - 当前选择"隐式 guard"而非显式映射一张无效页：显式无效页需要为
-///   每个进程多写一个 L3 表项，且在 fork eager-copy / 未来 brk 下探时
+///   每个进程多写一个 L3 表项，且在 fork COW 克隆 / brk 下探时
 ///   需要额外的"拷贝时跳过 guard"逻辑，收益为零（隐式本就无效）。
 ///   若未来用户堆向栈下方扩展，必须恢复显式 guard 页设计（见注释
 ///   `map_user_stack`）。

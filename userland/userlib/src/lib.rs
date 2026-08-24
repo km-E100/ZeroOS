@@ -175,9 +175,9 @@ fn unpack_wait_result(value: u64) -> Result<(u64, i32), SysError> {
 /// - 父进程：`Ok(child_pid)` —— 内核新分配的子进程 PID；
 /// - 子进程：`Ok(0)` —— 内核把子进程 TrapFrame 的 x0 清零。
 ///
-/// 语义：子进程获得父进程用户地址空间的 eager-copy 副本（独立物理页、
-/// 同一虚拟布局），从 svc 返回点之后继续执行；内核栈与 TrapFrame 各自
-/// 独立。错误码见 `SysError`（NoMemory=克隆失败/表满，NotFound=无当前进程）。
+/// 语义：可写用户页以 COW 方式共享、只读页直接共享；任一方首写时
+/// 内核复制该页并重放故障指令。内核栈、TrapFrame 与页表树仍各自独立。
+/// 错误码见 `SysError`（NoMemory=克隆失败/表满，NotFound=无当前进程）。
 pub fn fork() -> Result<u64, SysError> {
     let ret = svc_call(2, [0, 0, 0, 0]);
     decode_result(ret)
@@ -236,9 +236,14 @@ pub fn ipc_send(channel: u32, message: &Message) -> Result<(), SysError> {
 ///
 /// 队列空时返回 `Err(WouldBlock)` —— 服务器主循环的标准写法是
 /// 收到 `WouldBlock` 后 [`yield_now`] 再重收。
-pub fn ipc_receive(channel: u32, message: &mut Message) -> Result<(), SysError> {
+pub fn ipc_receive_from(channel: u32, message: &mut Message) -> Result<u64, SysError> {
     let ret = svc_call(1, [channel as u64, message as *mut Message as u64, 0, 0]);
-    decode_result(ret).map(|_| ())
+    decode_result(ret)
+}
+
+/// 兼容包装：忽略发送者身份。安全敏感服务应使用 [`ipc_receive_from`]。
+pub fn ipc_receive(channel: u32, message: &mut Message) -> Result<(), SysError> {
+    ipc_receive_from(channel, message).map(|_| ())
 }
 
 /// 按 LBA 读块设备（号位 7）。`buffer.len()` 必须是 512 的倍数。

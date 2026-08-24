@@ -133,12 +133,12 @@ pub fn complete_receive(slot: usize, chan: u32) {
     let frame = unsafe { crate::process::trap_frame(slot) };
     loop {
         match crate::ipc::receive(pid, chan) {
-            Ok(message) => {
+            Ok((sender, message)) => {
                 unsafe {
                     let user_buffer = (*frame).regs[2] as usize;
                     let result = copy_message_to_user(user_buffer, &message);
                     (*frame).regs[0] =
-                        crate::trap::encode_result(result.map(|_| 0));
+                        crate::trap::encode_result(result.map(|_| sender.raw()));
                 }
                 return;
             }
@@ -175,11 +175,11 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let caller_pid =
                 crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
             match crate::ipc::receive(caller_pid, channel) {
-                Ok(message) => {
+                Ok((sender, message)) => {
                     unsafe {
                         copy_message_to_user(user_buffer, &message)?;
                     }
-                    Ok(0)
+                    Ok(sender.raw())
                 }
                 Err(crate::ipc::IpcError::Empty) => {
                     // 阻塞语义（对照 Mach mach_msg）：队列空 → 登记等待者
@@ -318,7 +318,6 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let (child_pid, _) =
                 crate::process::fork(caller_slot, parent_frame).map_err(map_process_error)?;
             crate::scheduler::enqueue(child_pid);
-            crate::error!("FORK-DONE parent_slot={} child={}", caller_slot, child_pid.raw());
             Ok(child_pid.raw())
         }
         // ═══ 号位 3：execve 最小完备版（第九刀，破坏性升级）═══
@@ -562,13 +561,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 Ok(crate::process::WaitStep::Completed(value)) => Ok(value),
                 Ok(crate::process::WaitStep::Blocked) => crate::scheduler::block_current(),
                 Ok(crate::process::WaitStep::WouldBlock) => Ok(0),
-                Err(e) => {
-                    // 第十七刀🥇取证：NotFound 即转储全表（定位被覆写的 pid）
-                    if e == SysError::NotFound {
-                        crate::process::debug_dump_table();
-                    }
-                    Err(e)
-                }
+                Err(e) => Err(e)
             }
         }
     }
@@ -676,6 +669,7 @@ fn map_ipc_error(err: crate::ipc::IpcError) -> SysError {
 fn map_issue_error(err: crate::security::IssueError) -> SysError {
     match err {
         crate::security::IssueError::InvalidScope => SysError::InvalidArgument,
+        crate::security::IssueError::NoSuchProcess => SysError::NotFound,
         crate::security::IssueError::TableFull => SysError::NoMemory,
     }
 }

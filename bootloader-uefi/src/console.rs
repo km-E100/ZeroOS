@@ -49,6 +49,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 #[derive(Copy, Clone)]
 pub enum LogLevel {
     Debug,

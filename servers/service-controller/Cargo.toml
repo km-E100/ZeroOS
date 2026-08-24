@@ -18,3 +18,5 @@ userlib = { path = "../../userland/userlib" }
 heapless = { version = "0.8", default-features = false }
 itoa = "1"
 spin = { workspace = true }
+
+useralloc = { path = "../../userland/useralloc" }

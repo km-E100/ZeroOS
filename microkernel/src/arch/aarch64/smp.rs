@@ -34,8 +34,9 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// 多核模式总闸：翻转后 FP 走全急切、调度器跳过惰性降门。
 static MULTI_CORE: AtomicBool = AtomicBool::new(false);
 
-/// 当前核序号（MPIDR aff0）。⚠ 宿主单测在 EL0 执行，读 MPIDR 会
-/// SIGILL——测试桩恒回 0（单测只验证纯逻辑，不依赖真核号）。
+/// 当前逻辑 CPU 序号。PSCI CPU_ON 的 context_id 在副核入口 x0，
+/// 入口写入 TPIDRRO_EL0；主核在 boot_secondaries 开头写 0。
+/// 因此不依赖 MPIDR 必须落在 Aff0，真实硬件的 Aff1/Aff2 拓扑也安全。
 #[inline(always)]
 pub fn cpu_id() -> usize {
     #[cfg(test)]
@@ -44,10 +45,9 @@ pub fn cpu_id() -> usize {
     }
     #[cfg(not(test))]
     {
-        let mpidr: u64;
-        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
-        // QEMU virt：Aff0[7:0] 即核序号（每 cluster 单核）。
-        (mpidr & 0xff) as usize
+        let id: u64;
+        unsafe { core::arch::asm!("mrs {}, tpidrro_el0", out(reg) id) };
+        (id as usize).min(MAX_CPUS - 1)
     }
 }
 
@@ -73,6 +73,7 @@ pub fn online_mask() -> u32 {
 /// 再发 CPU_ON——副核一上线就可能与主核并发跑调度/陷阱，FP 语义
 /// 必须先行切换到"帧相对急切"这一跨核安全的形态。
 pub fn boot_secondaries() {
+    unsafe { core::arch::asm!("msr tpidrro_el0, {}", in(reg) 0u64) };
     MULTI_CORE.store(true, Ordering::SeqCst);
     // FP 门位全开（EL0 不再因 FP 陷阱进内核）；FPU_DIRTY 冻结 NONE，
     // 入口存根的门控比较从此恒走"急切保存"分支。
@@ -80,34 +81,42 @@ pub fn boot_secondaries() {
     crate::arch::fpu_freeze_none();
     // GICD 已由主核初始化；SGI0（RESCHED）在 GICv2 恒使能，无需配置。
 
-    // 目标 MPIDR 蛮力扫描：aff0/aff1/aff2 三维度 × bit31 有无。
-    // 命中即停；全部落空则如实记录放弃多核（单核语义不受影响）。
-    'outer: for cpu in 1..MAX_CPUS {
-        for (shift, use_res1) in [
-            (0u32, true),
-            (0, false),
-            (8, true),
-            (8, false),
-            (16, true),
-            (16, false),
-        ] {
-            let mut mpidr = (cpu as u64) << shift;
-            if use_res1 {
-                mpidr |= 0x8000_0000;
-            }
-            let result = psci_cpu_on(mpidr, unsafe { &__secondary_entry } as *const u8 as usize);
+    // 优先按 ACPI MADT 枚举；无 ACPI 时保留 legacy 探测。
+    let madt = crate::acpi::cpu_mpidrs();
+    if madt.len() > 1 {
+        // MADT does not promise that the boot CPU is entry 0. Compare only
+        // architectural affinity fields (Aff3..Aff0), ignoring MPIDR flags.
+        const AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
+        let boot_mpidr: u64;
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) boot_mpidr) };
+        let boot_affinity = boot_mpidr & AFFINITY_MASK;
+        let mut logical = 1usize;
+        for mpidr in madt.into_iter() {
+            if mpidr & AFFINITY_MASK == boot_affinity { continue; }
+            if logical >= MAX_CPUS { break; }
+            let result = psci_cpu_on(mpidr, unsafe { &__secondary_entry } as *const u8 as usize, logical);
             if result.ok {
-                crate::info!("smp: cpu{} UP via mpidr={:#010x}", cpu, mpidr);
-                continue 'outer;
+                crate::info!("smp: cpu{} UP via MADT mpidr={:#x}", logical, mpidr);
+                logical += 1;
+            } else {
+                crate::warn!("smp: MADT CPU_ON mpidr={:#x} failed={}", mpidr, result.raw);
             }
-            crate::debug!(
-                "smp-probe: CPU_ON mpidr={:#010x} -> {:#010x}",
-                mpidr,
-                result.raw as i32 as u32
-            );
         }
-        crate::info!("smp: cpu{} exhausted, online={}", cpu, online_count());
-        break;
+    } else {
+        'outer: for cpu in 1..MAX_CPUS {
+            for (shift, use_res1) in [(0u32, true), (0, false), (8, true), (8, false), (16, true), (16, false)] {
+                let mut mpidr = (cpu as u64) << shift;
+                if use_res1 { mpidr |= 0x8000_0000; }
+                let result = psci_cpu_on(mpidr, unsafe { &__secondary_entry } as *const u8 as usize, cpu);
+                if result.ok {
+                    crate::info!("smp: cpu{} UP via legacy mpidr={:#010x}", cpu, mpidr);
+                    continue 'outer;
+                }
+                crate::debug!("smp-probe: CPU_ON mpidr={:#010x} -> {:#010x}", mpidr, result.raw as i32 as u32);
+            }
+            crate::info!("smp: cpu{} exhausted, online={}", cpu, online_count());
+            break;
+        }
     }
     crate::info!(
         "smp: boot_secondaries done, online={} multi_core={}",
@@ -144,7 +153,7 @@ struct PsciResult {
 }
 
 /// entry 以 EL1h/屏蔽中断进入（PSCI 规范保证）。
-fn psci_cpu_on(target_mpidr: u64, entry: usize) -> PsciResult {
+fn psci_cpu_on(target_mpidr: u64, entry: usize, logical_cpu: usize) -> PsciResult {
     let ret: i64;
     unsafe {
         core::arch::asm!(
@@ -152,7 +161,7 @@ fn psci_cpu_on(target_mpidr: u64, entry: usize) -> PsciResult {
             in("x0") PSCI_FN_CPU_ON,
             in("x1") target_mpidr,
             in("x2") entry,
-            in("x3") 0usize, // context：不用，入口自行取 MPIDR
+            in("x3") logical_cpu, // context_id：副核入口 x0 收到逻辑 CPU 号
             lateout("x0") ret,
             options(nostack)
         );

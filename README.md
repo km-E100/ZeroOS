@@ -10,17 +10,22 @@ Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统
 | --- | --- |
 | **多核** | 4 核 SMP：PSCI CPU_ON 点亮、全局 MLFQ 跨核调度、RESCHED SGI、per-CPU 状态 |
 | **调度** | 多级反馈队列（4 级）、Sleep(ticks) 定时器轮、软看门狗 |
-| **内存** | COW fork 基建（开关见下）、brk 用户堆、pstore 崩溃落盘 + bootloader 取回、KASLR 栈随机化 |
+| **内存** | COW fork 默认启用（可写页共享、首写断链；只读页直映射）、brk 用户堆、pstore 崩溃落盘 + bootloader 取回、KASLR 栈随机化 |
 | **线程** | CreateThread 共享地址空间线程、tid 可 join、FutexWait/Wake + UserMutex（CAS 快路径/futex 慢路径） |
 | **进程** | 动态槽位（256）、execve 五阶段原子换映像、信号位图、精确 wait/join、孤儿收养 |
-| **安全** | capability 动态签发/撤销（TTL 活算台账）、通道 RX/TX 权限位图、登录会话（login/su/sessions） |
-| **文件系统** | fsd 目录树（mkdir/rmdir/unlink/LIST 路径版）、cat/ls、fstest/fsdemo 端到端 |
-| **可靠性** | GitHub Actions CI、abi 解码模糊测试、堆 canary+分配史取证工具、性能基线脚本 |
+| **安全** | 内核盖章 IPC sender PID、capability 动态签发/撤销（TTL 活算台账）、管理员策略、哈希 userdb + 旧明文自动迁移、登录会话 |
+| **文件系统** | 当前运行时为轻量 `zero-fsd` 块后端目录树（mkdir/rmdir/unlink/LIST）、cat/ls、fstest/fsdemo；`zero-fs-zfs`/`zfs-core` 为独立实现资产，尚未替换默认服务 |
+| **可靠性** | GitHub Actions CI、host/mm 回归矩阵、ABI 模糊测试、可回收 user allocator、ISO commit/dirty/hash provenance、性能基线脚本 |
 | **ACPI** | RSDP/XSDT/MADT 静态解析（GICC 核列表/GICD），SMP 枚举正规化；AML 不做 |
 
-> 已知限制：COW 共享 fork 默认关闭（`table_walk::COW_SHARED_FORK`）——
-> 与新调度器存在待解交互回归，调查文档
-> `docs/mm_heap_corruption_investigation.md`；eager 复制路径全绿。
+> 当前 COW 已默认开启。2026-08-25 收口时定位到历史回归根因：
+> AArch64 `TLBI VAAE1IS` 的寄存器操作数误传完整 byte VA，正确编码应为
+> `VA >> 12`，导致父进程残留 RW TLB 翻译并静默写穿共享栈页。
+> 同轮还修复 free-list “不足最小块的尾巴未并入分配”造成的幽灵 gap。
+> 详见 `docs/mm_heap_corruption_investigation.md`。
+
+> 仍属路线图而非当前默认能力：镜像级 KASLR、AML，以及把
+> `zero-fs-zfs` 切成默认运行时文件服务。
 
 ## 快速开始
 

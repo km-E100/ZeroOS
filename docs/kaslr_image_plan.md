@@ -27,7 +27,7 @@
 3. **微内核跟进**：恒等映射改为「物理随机基址 + VA=PA+offset」双映射，
    kernel_main 相对寻址自举（参照 Linux `CONFIG_RELOCATABLE` 的
    relocate_kernel 做法）。
-4. **验收**：连续 20 次 `-smp 4` 启动，dump 内核基址分布；13/13 验收
+4. **验收**：连续 20 次 `-smp 4` 启动，dump 内核基址分布；15/15 验收
    全绿；threaddemo/forktest 压力无回归。
 
 ## 与既有安全层的关系

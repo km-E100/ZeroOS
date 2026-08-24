@@ -69,6 +69,7 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_DYNSYM: u32 = 11;
 const SHN_UNDEF: u16 = 0;
 
+#[allow(dead_code)]
 pub struct LoadedSegment {
     pub virtual_addr: u64,
     pub physical_addr: u64,
@@ -109,7 +110,7 @@ impl ElfImage {
             log_error!("ELF file too small");
             return Err(Status::INVALID_PARAMETER);
         }
-        let header = unsafe { *(data.as_ptr() as *const Elf64Ehdr) };
+        let header = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Ehdr) };
         if header.e_ident[..4] != ELF_MAGIC {
             log_error!("invalid ELF magic");
             return Err(Status::INVALID_PARAMETER);
@@ -130,7 +131,7 @@ impl ElfImage {
                 log_error!("program header out of range");
                 return Err(Status::INVALID_PARAMETER);
             }
-            let ph = unsafe { *(data.as_ptr().add(offset) as *const Elf64Phdr) };
+            let ph = unsafe { core::ptr::read_unaligned(data.as_ptr().add(offset) as *const Elf64Phdr) };
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -200,7 +201,7 @@ fn parse_symbol_table(
         if offset + shentsize > data.len() {
             break;
         }
-        let sh = unsafe { *(data.as_ptr().add(offset) as *const Elf64Shdr) };
+        let sh = unsafe { core::ptr::read_unaligned(data.as_ptr().add(offset) as *const Elf64Shdr) };
         sections.push((sh.sh_type, sh.sh_offset as usize, sh.sh_size as usize, sh.sh_link as usize));
     }
 
@@ -222,7 +223,7 @@ fn parse_symbol_table(
             if pos + entsize > data.len() {
                 break;
             }
-            let sym = unsafe { *(data.as_ptr().add(pos) as *const Elf64Sym) };
+            let sym = unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos) as *const Elf64Sym) };
             if sym.st_shndx == SHN_UNDEF || sym.st_name == 0 {
                 continue;
             }

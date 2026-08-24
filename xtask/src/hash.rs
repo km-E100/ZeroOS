@@ -5,12 +5,6 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-pub fn hash_bytes(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    hex(&h.finalize())
-}
-
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut h = Sha256::new();

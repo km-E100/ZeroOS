@@ -1,8 +1,9 @@
 use spin::Mutex;
 use zero_abi::ProcessId;
 
-use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(test)]
+use alloc::vec;
 use crate::mm::address_space::AddressSpace;
 use crate::process::{self, ProcessState};
 
@@ -61,8 +62,8 @@ pub const BOOST_EVERY_TICKS: u64 = 200;
 const SLEEP_QUEUE_CAP: usize = 128;
 
 /// 每槽当前 MLFQ 级别（u8 原子数组避免持锁；tick 路径在 IRQ 内）。
-static PROC_LEVEL: [core::sync::atomic::AtomicU8; 64] =
-    [const { core::sync::atomic::AtomicU8::new(0) }; 64];
+static PROC_LEVEL: [core::sync::atomic::AtomicU8; crate::process::MAX_PROCESSES] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::process::MAX_PROCESSES];
 
 /// 内核单调 tick 计数（每次定时器中断 +1）。睡眠唤醒的时钟基准。
 static TICK_NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -133,8 +134,8 @@ static SCHED_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 pub const SLICE_TICKS: u32 = 4;
 
 /// 每槽已消耗 tick 记账。u32 原子数组避免持锁（tick 路径在 IRQ 内）。
-static SLICE_USED: [core::sync::atomic::AtomicU32; 64] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 64];
+static SLICE_USED: [core::sync::atomic::AtomicU32; crate::process::MAX_PROCESSES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::process::MAX_PROCESSES];
 
 pub fn init() {
     RUNQUEUE.lock().clear();
@@ -306,7 +307,7 @@ impl RunQueue {
     }
 
     /// 入队。满即 assert（而非返回 Err），理由：
-    ///  1. 容量与进程槽位上限相等（64 = 64），队列满 ⇒ 同一 pid 重复
+    ///  1. 容量与进程槽位上限相等（当前 256 = 256），队列满 ⇒ 同一 pid 重复
     ///     入队（状态机错误）或内存被踩 —— 是内核 bug，不是可恢复的
     ///     用户错误；assert 在最接近 BUG 的位置暴露。
     ///  2. 返回 Err 需要所有调用点（yield_current / enqueue / fork /

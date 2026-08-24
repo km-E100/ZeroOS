@@ -56,9 +56,7 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
     if !should_log(level) {
         return;
     }
-    let mut sink = SerialSink;
-    let _ = sink.write_fmt(args);
-    let _ = sink.write_str("\n");
+    serial::write_fmt_line(args);
 }
 
 /// 错误级：内核故障、无法恢复的不变量破坏。正常运行期不应出现。
