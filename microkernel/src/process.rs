@@ -1151,6 +1151,9 @@ fn full_reap(seed: usize) {
 /// TRAP_FRAMES/KERNEL_STACKS 是 64×16KiB 静态数组，槽位回用即可。
 pub fn remove_slot(slot: usize) {
     assert!(slot < MAX_PROCESSES, "remove_slot: slot {} out of range", slot);
+    if let Some(rec) = PROCESS_TABLE.lock().get(slot).and_then(|e| *e) {
+        crate::error!("REMOVE slot={} pid={}", slot, rec.pid.raw());
+    }
     full_reap(slot);
 }
 
@@ -2115,7 +2118,15 @@ mod exec_tests {
         assert_eq!(frame.owner_slot, u64::MAX);
         assert_eq!(frame.elr_el1, 0x20_0000);
         assert_eq!(frame.spsr_el1, 0); // EL0t
-        assert_eq!(frame.sp_el0, 0xFFFF_F000);
+        // KASLR 阶段1（第十五刀）：栈顶随机下移 ≤256 页，页对齐。
+        let sp = frame.sp_el0 as usize;
+        assert!(
+            sp <= 0xFFFF_F000
+                && sp > 0xFFFF_F000 - 256 * PAGE_SIZE
+                && sp % PAGE_SIZE == 0,
+            "sp_el0 KASLR out of window: {:#x}",
+            sp
+        );
         assert_eq!(frame.sp_el1, 0x8888_0000);
         assert_eq!(frame.regs[0], 0x1000); // bootfs 表首址
         assert_eq!(frame.regs[1], 8); // bootfs 条目数

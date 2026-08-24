@@ -9,18 +9,34 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static STATE: AtomicU64 = AtomicU64::new(0);
 
+/// ⚠ 宿主单测在 EL0 执行，读计数器/MPIDR 会 SIGILL——测试桩返回常量
+/// （splitmix 混合逻辑仍被真实覆盖，仅熵源退化为确定性）。
 #[inline(always)]
 fn counter() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v) };
-    v
+    #[cfg(test)]
+    {
+        0x5EED_C0DE_FEED
+    }
+    #[cfg(not(test))]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v) };
+        v
+    }
 }
 
 #[inline(always)]
 fn mpidr() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) v) };
-    v
+    #[cfg(test)]
+    {
+        0x8000_0000
+    }
+    #[cfg(not(test))]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) v) };
+        v
+    }
 }
 
 /// 取一个伪随机 u64（splitmix64 终结；CAS 步进防跨核重样）。

@@ -18,6 +18,9 @@
 
 use core::alloc::Layout;
 use core::ptr;
+
+/// 第十七刀堆损坏猎杀：全量分配轨迹（串口逐条打印）。定位后关闭。
+const TRACE_HEAP: bool = false;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex as HistLock;
 
@@ -134,7 +137,9 @@ impl FreeListHeap {
                 let ptr = cur + HEADER + pad;
                 self.write_back(ptr, cur);
                 self.write_footer_used(cur, used);
-                hist_push(ptr as usize, used);
+                if TRACE_HEAP {
+                    crate::error!("HA {:#x} {}", ptr as usize, used);
+                }
                 return ptr as *mut u8;
             }
             prev = cur;
@@ -145,7 +150,9 @@ impl FreeListHeap {
 
     /// 释放 `alloc` 返回的指针，合并相邻空闲块后挂回空闲链表。
     pub fn dealloc(&mut self, ptr: *mut u8) {
-        self.dump_if_suspicious(ptr as usize);
+        if TRACE_HEAP {
+            crate::error!("HF {:#x}", ptr as usize);
+        }
         assert!(!ptr.is_null(), "FreeListHeap: dealloc(null)");
         let p = ptr as usize;
         assert!(

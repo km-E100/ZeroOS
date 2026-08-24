@@ -40,3 +40,20 @@ fstest/fsdemo/blktest 全崩；eager 模式（false）13/13 全绿。
 heap_free_list::dump_if_suspicious / HIST_RING（16 条分配史环形缓冲）：
 dealloc 入口自动校验下一块 header，异常即打印最近分配序列。
 生产保留无害（校验 O(1)）；定位完成后可移除。
+
+## 追加取证（2026-08-24 深夜 · 全量堆轨迹 + 生命周期探针轮）
+
+1. **内核堆完全干净**：sleepdemo 全窗口 alloc/dealloc 轨迹逐条核验，
+   地址/尺寸序列合法，无任何越界或重叠——损坏不在堆分配器。
+2. **父进程路径正确**：恰好一次睡眠登记、一次唤醒、elapsed 打印，
+   随后阻塞 join——符合预期。
+3. **子进程三怪象**：① 仅一次成功 COW-BREAK（far=栈页 ✓ ok=true）后
+   静默自旋（反复 DISP 同一 pid、零输出零退出）；② 最终其记录**凭空
+   消失**（父 wait 得 NotFound(3)）；③ 无任何 trap 终止日志。
+4. 结论修正：损坏的「日志串覆写」表象可能是果不是因——子进程记录
+   字段被破坏在先，后续 dealloc 读到被挪用的相邻块。
+
+## 下会话首选工具
+`qemu -d int -D int.log` 抓 fork 窗口全异常流；重点核对：
+dispatch→switch_to 对「started=true 的 COW 子进程」首次恢复路径 vs
+knife10 分支同路径的差异（含 TTBR0 activate 时序 × KASLR 栈偏移）。

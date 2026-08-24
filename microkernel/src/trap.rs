@@ -126,10 +126,21 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 // restore_frame，eret 重放同一条访存指令（不杀不重启）。
                 // 非 COW 页原样落入下方 SIGSEGV 路径。
                 if let SyncExceptionKind::DataAbort(info) = decoded.kind {
-                    if info.kind == FaultKind::Permission
-                        && process::handle_cow_write_fault(ctx.far as usize)
-                    {
-                        unsafe { crate::arch::restore_frame(frame) }
+                    if info.kind == FaultKind::Permission {
+                        let broken =
+                            process::handle_cow_write_fault(ctx.far as usize);
+                        if broken {
+                            unsafe { crate::arch::restore_frame(frame) }
+                        } else {
+                            // 第十七刀探针：断链失败=不可恢复写越权，转储现场
+                            crate::error!(
+                                "COW-MISS far={:#x} elr={:#x} slot={:?} pid={:?}",
+                                ctx.far,
+                                ctx.elr,
+                                ctx.slot,
+                                ctx.pid
+                            );
+                        }
                     }
                 }
                 // 用户态故障：审计行保留 info，然后按默认动作投递信号终止。
