@@ -1,47 +1,57 @@
 # Zero OS
 
-Zero OS 是一款基于 ARM64 的实验性微内核操作系统，目标是提供类 Unix 的多用户环境、与 macOS 相似的安全等级，并通过 Zero File System (ZFS) 和 `.app` 应用包格式实现现代化应用分发。
+Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统：QEMU virt
+上四核 SMP 稳定运行，具备进程/线程双模型、能力安全模型、块设备文件系统
+与包管理格式。Rust 实现，`#![no_std]`，主机测试 166+，实机验收矩阵 15 项。
 
-## 特性概览
-- **微内核 + 用户态服务器**：进程管理、IPC、文件系统、权限服务均在用户态运行，内核仅负责调度与消息传递。
-- **Zero File System (ZFS)**：全新磁盘格式，支持快照、日志、`.app` 原子安装。
-- **`.app` 应用包**：每个包至少包含 `main` 与 `config`，系统默认执行 `main` 并依据 `config` 管理应用数据目录。
-- **安全模型**：多用户、能力令牌、强制访问控制、恢复模式。
-- **文本控制台**：内置多用户登录、账户管理、`su`/`adduser` 等命令，可直接在串口下完成基本维护。
-- **安装生态**：提供安装镜像、恢复镜像、ZeroPkg 包管理。
+## 能力一览（截至第十八刀）
 
-## 仓库结构
-- `boot/`：引导代码与链接脚本。
-- `microkernel/`：Rust 实现的微内核核心。
-- `servers/`：用户态核心服务（IPC、ZFS、launchd、安全服务）。
-- `libs/`：ABI、ZFS 核心逻辑等共享库。
-- `installer/`：文本安装器，负责分区、创建管理员用户、部署 `.app`。
-- `recovery/`：恢复模式环境。
-- `userapps/`：示例 `.app` 模板。
-- `docs/`：设计文档、规范说明。
-- `kernel/rootfs`：随内核打包的最小系统目录；`kernel/rootfs-recovery` 则提供恢复模式使用的只读根。
+| 域 | 能力 |
+| --- | --- |
+| **多核** | 4 核 SMP：PSCI CPU_ON 点亮、全局 MLFQ 跨核调度、RESCHED SGI、per-CPU 状态 |
+| **调度** | 多级反馈队列（4 级）、Sleep(ticks) 定时器轮、软看门狗 |
+| **内存** | COW fork 基建（开关见下）、brk 用户堆、pstore 崩溃落盘 + bootloader 取回、KASLR 栈随机化 |
+| **线程** | CreateThread 共享地址空间线程、tid 可 join、FutexWait/Wake + UserMutex（CAS 快路径/futex 慢路径） |
+| **进程** | 动态槽位（256）、execve 五阶段原子换映像、信号位图、精确 wait/join、孤儿收养 |
+| **安全** | capability 动态签发/撤销（TTL 活算台账）、通道 RX/TX 权限位图、登录会话（login/su/sessions） |
+| **文件系统** | fsd 目录树（mkdir/rmdir/unlink/LIST 路径版）、cat/ls、fstest/fsdemo 端到端 |
+| **可靠性** | GitHub Actions CI、abi 解码模糊测试、堆 canary+分配史取证工具、性能基线脚本 |
+| **ACPI** | RSDP/XSDT/MADT 静态解析（GICC 核列表/GICD），SMP 枚举正规化；AML 不做 |
 
-## 构建
+> 已知限制：COW 共享 fork 默认关闭（`table_walk::COW_SHARED_FORK`）——
+> 与新调度器存在待解交互回归，调查文档
+> `docs/mm_heap_corruption_investigation.md`；eager 复制路径全绿。
+
+## 快速开始
+
 ```bash
-cargo run -p xtask -- build-kernel
-cargo run -p xtask -- build-servers
-# 构建安装器、恢复镜像等
-cargo run -p xtask -- build-installer
-cargo run -p xtask -- build-recovery
-# 生成 rootfs.bundle
-cargo run -p xtask -- build-rootfs
-# 调用安装器产出 rootfs 镜像
-cargo run -p zero-installer
-# 生成可启动 ISO 镜像
-cargo run -p xtask -- build-iso
+cargo run -p xtask -- build-iso     # 构建镜像（超 3GB 自动拒绝，purge 自救）
+./run-qemu.sh                       # 单核交互串口
+scripts/acceptance.sh --no-build    # 实机验收矩阵（15 项，exit 0 = ALL PASS）
+scripts/stress-loop.sh 3            # -smp4 四核压力循环
+scripts/perf-baseline.sh            # 性能基线采集
 ```
 
-ISO 打包流程会顺便编译 `bootloader-uefi`，将生成的二进制同时复制到 `EFI/BOOT/BOOTAA64.EFI`、`EFI/ZEROOS/zero-normal.efi` 与 `EFI/ZEROOS/zero-recovery.efi`。Zero OS 自研 UEFI Loader 会解析 `EFI/ZEROOS/boot.cfg`、`boot.env`（失败计数）、`zero-rootfs.img` 等文件，默认安静引导正常模式。如连续 3 次标记为失败，将自动切换至恢复模式。
+多核验证：给 QEMU 加 `-smp 4` 即进入多核模式（副核 PSCI CPU_ON 点亮）。
 
-系统成功启动后请在用户态运行 `bootctl`（默认操作 `/boot/EFI/ZEROOS/boot.env`）把 `boot_success` 置为 1、`boot_failures` 清零，下一次启动即恢复正常模式。Loader 同样会解析 UEFI load options（例如 `rootfs=... log=debug ramdisk=1`），便于安装器或外部工具在链式引导时覆盖配置。
+## 仓库结构
 
-## 下一步
-- 填充微内核上下文切换、系统调用实现。
-- 实现 Zero File System 块分配器与日志恢复。
-- 完成 ZeroPkg 与 `.app` 安装命令行工具。
-- 构建完整的 QEMU 启动流程与测试套件。
+- `microkernel/`：微内核核心（调度/进程/线程/mm/中断/ACPI/security）
+- `servers/`：用户态服务（launchd / fsd / blkdrv / securityd / ipc-router）
+- `userland/`：shell 与演示命令（forktest/threaddemo/mutextest/secdemo/fstest/fsdemo…）
+- `libs/`：`zero-abi`（系统调用契约）/ `zfs-core` 等
+- `bootloader-uefi/`：UEFI 引导（ELF 加载/pstore 取回/RSDP 抓取）
+- `docs/`：设计文档与立项计划（KASLR/ZeroPkg/ACPI/堆损坏调查）
+- `scripts/`：acceptance / stress-loop / perf-baseline
+
+## 设计文档索引
+
+- ABI 冻结契约：`docs/abi_syscall_reference.md`
+- 内存/COW 调查：`docs/memory_management.md`、`docs/mm_heap_corruption_investigation.md`
+- 文件系统与包格式：`docs/zero_file_system_spec.md`、`docs/app_bundle_format.md`
+- 待实施立项：`docs/kaslr_image_plan.md`、`docs/zeropkg_inos_plan.md`、`docs/acpi_static_plan.md`
+- 断点存档：`STATUS.md`（每轮会话先读它接续进度）
+
+## 许可
+
+MIT OR Apache-2.0
