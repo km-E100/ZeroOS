@@ -92,6 +92,7 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | SMP 阶段 3 · COW 重开 | docs/mm_heap_corruption_investigation.md | 阻塞于内核堆损坏 bug（trap 日志串覆写空闲链/进程表）；自动捕获工具已转正；行动清单四步 |
 | 镜像级 KASLR | docs/kaslr_image_plan.md | 推荐 PIE 方案四步走，用户态先行；阶段1栈随机化已交付 |
 | ZeroPkg 生态 | docs/zeropkg_inos_plan.md | 宿主侧已成型；缺口=设备内 pkg ls/install/remove 四步刀次；依赖 fsd 树+session 均已交付 |
+| ACPI 静态表 | docs/acpi_static_plan.md | QEMU+edk2 即有全表，不受真机限制；WS-A~D 四步（RSDP 抓取/bootinfo 扩展/no_std 解析器/替换蛮力探测）；AML 明确不做 |
 
 ## 第十七刀（进行中 · 四档菜单全干）
 
