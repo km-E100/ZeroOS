@@ -90,8 +90,19 @@ free-list header 发生 8 字节级覆写（内容为 trap 日志串片段）；
 eager 模式同样走此代码却全绿 ⇒ 差异必然在 **COW 特有的克隆路径
 （bbm/tlbi/refcount 触碰了什么共享状态）× Vec 生长的叠加**。
 
-## 下会话行动（按性价比排序）
-1. fork 内强制预扩容：clone 前 `table.reserve(MAX-len)` 消除 fork 窗口
-   的 Vec 生长（一行级改动，若修复即实锤）；
-2. `-d int,in_asm -D file` 包裹 fork 窗口，对照 eager/COW 异常流；
-3. `handle_cow_fault` 与 `alloc_table_slot_locked` 的交叉断点单步。
+## 已排除（2026-08-24 深夜追加）
+- ~~fork 窗口 Vec 生长~~：预扩容实验（clone 前 reserve至上限）未修复，
+  仍 2/15 败（secdemo/sleepdemo）——排除表生长错位假说。
+- 分配器算法：全量轨迹合法。
+- 父侧 BBM 断链/屏障序：跳过实验仍崩。
+
+## 剩余差异面（eager 与 COW 的全部区别）
+1. 子页表含指向**父物理页**的 RO+COW 描述符（vs 私有 RW 副本）；
+2. 父侧 PTE 经 BBM 改写 + TLBI 击落；
+3. 运行期子进程首写触发断链（alloc+copy+remap+tlbi）；
+4. retain/free 引用计数记账。
+
+## 下会话首选
+`qemu -d int,in_asm -D trace.log` 包裹 sleepdemo fork→首断链窗口，
+eager/COW 各跑一次 diff 异常流；重点核对断链后**重取指的翻译来源**
+（TLB vs 页表）与子页表 L1/L2 新建表的内核别名可见性。

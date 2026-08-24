@@ -1764,6 +1764,17 @@ pub fn fork(
     let child_slot;
     let child_pid = alloc_pid();
 
+    // 第十七刀🥇行动清单 #1：clone 前**预扩容**进程表至上限——消除
+    // 整个 fork 窗口内 Vec 生长（realloc 搬移）的可能性。若堆损坏随此
+    // 一并消失，即实锤「COW 路径 × 表生长」叠加为根因。
+    {
+        let mut table = PROCESS_TABLE.lock();
+        if table.len() < MAX_PROCESSES {
+            let spare = MAX_PROCESSES - table.len();
+            table.reserve(spare);
+        }
+    }
+
     // 地址空间克隆必须在持锁外进行（分配物理页/可能失败）。
     // 第十刀 COW：clone 不再逐页 memcpy——父子共享数据页（双侧只读 +
     // DESC_SW_COW），首写 Permission fault 时才断链复制；共享/复制统计
