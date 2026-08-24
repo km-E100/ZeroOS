@@ -691,6 +691,17 @@ pub unsafe fn idle_trap_frame() -> *mut TrapFrame {
     IDLE_FRAME.get()
 }
 
+/// SMP（第十四刀）：每核一份 idle scratch 帧——副核入口汇编直接以
+/// MPIDR aff0 索引本数组设 TPIDR_EL1，故必须 #[no_mangle] 平铺。
+/// 尺寸 832 与入口汇编的 stride 立即数由下方断言钉死。
+#[no_mangle]
+pub static SMP_IDLE_FRAMES: [TrapFrameCell; crate::arch::smp::MAX_CPUS] =
+    [const { TrapFrameCell::new() }; crate::arch::smp::MAX_CPUS];
+
+pub unsafe fn idle_trap_frame_for(cpu: usize) -> *mut TrapFrame {
+    SMP_IDLE_FRAMES[cpu.min(crate::arch::smp::MAX_CPUS - 1)].get()
+}
+
 pub type Context = TrapFrame;
 
 pub unsafe fn context_ptr(slot: usize) -> *mut Context {

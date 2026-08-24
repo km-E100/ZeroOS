@@ -212,6 +212,10 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
                 crate::scheduler::yield_current()
             }
             crate::arch::restore_frame(frame)
+        } else if irq == crate::arch::SGI_RESCHED {
+            // 跨核唤醒 SGI（第十四刀阶段 2）：EOI 后按上下文分流。
+            crate::arch::end_irq(raw);
+            crate::scheduler::handle_resched_sgi()
         } else {
             let handled = crate::drivers::handle_irq(irq);
             crate::arch::end_irq(raw);

@@ -1,4 +1,6 @@
 use core::arch::{asm, global_asm};
+
+pub mod smp;
 use core::hint::spin_loop;
 use zero_abi::BootInfo;
 
@@ -149,12 +151,35 @@ __vector_sync_el0_64:\n\
      SAVE_TRAP_AND_CALL 0\n\
      .global __vector_irq_el0_64\n\
 __vector_irq_el0_64:\n\
-     SAVE_TRAP_AND_CALL 1\n"
+     SAVE_TRAP_AND_CALL 1\n\
+\n\
+     // ─── SMP 副核入口（第十四刀立项 · 阶段 1）─────────────────────\n\
+     // PSCI CPU_ON 以 EL1h/IRQ 屏蔽跳入，x0 未定义——自行读 MPIDR。\n\
+     // 栈：SMP_SECONDARY_STACKS[idx]；TPIDR_EL1 ← SMP_IDLE_FRAMES[idx]\n\
+     // （异常保存目标即刻有效）。随后进 Rust 初始化 GICC/定时器。\n\
+     .section .text.smp_entry,\"ax\"\n\
+     .global __secondary_entry\n\
+__secondary_entry:\n\
+     msr daifset, #0xf\n\
+     mrs x0, mpidr_el1\n\
+     and x0, x0, #0xff\n\
+     ldr x1, =SMP_SECONDARY_STACKS\n\
+     mov x2, #65536\n\
+     mul x2, x0, x2\n\
+     add x1, x1, x2\n\
+     add sp, x1, x2\n\
+     ldr x1, =SMP_IDLE_FRAMES\n\
+     mov x2, #832\n\
+     mul x2, x0, x2\n\
+     add x1, x1, x2\n\
+     msr tpidr_el1, x1\n\
+     bl __smp_secondary_rust\n"
 );
 
 extern "C" {
     static __vector_table: u8;
     fn __zero_trap_handler(frame: *mut Context, kind: u64) -> !;
+    static __secondary_entry: u8;
 }
 
 pub fn init(_boot_info: &BootInfo) {
@@ -232,6 +257,17 @@ pub fn init(_boot_info: &BootInfo) {
 #[inline(always)]
 pub unsafe fn switch_to(next: *mut Context) -> ! {
     restore_context(next)
+}
+
+/// SMP 副核 Rust 入口（汇编跳板 bl 到此，noreturn）。
+#[no_mangle]
+extern "C" fn __smp_secondary_rust(cpu: usize) -> ! {
+    super::aarch64::smp::smp_secondary_main(cpu)
+}
+
+/// 冻结 FPU_DIRTY=NONE（SMP 翻闸时调用）：入口存根门控从此恒走急切保存。
+pub fn fpu_freeze_none() {
+    FPU_DIRTY.store(FPU_OWNER_NONE, Relaxed);
 }
 
 // ═══ 第十一刀：FPU/NEON 惰性保存 ═══════════════════════════════════
@@ -394,6 +430,18 @@ pub fn is_timer_irq(id: u32) -> bool {
     gic::is_timer_interrupt(id)
 }
 
+pub fn gic_sgi_resched() -> u32 {
+    gic::SGI_RESCHED
+}
+
+pub unsafe fn gic_init_cpu_interface() {
+    gic::init_cpu_interface()
+}
+
+pub fn send_resched_sgi(target_mask: u8) {
+    gic::send_resched_sgi(target_mask)
+}
+
 #[inline(always)]
 pub unsafe fn program_next_tick() {
     timer::program_next_tick();
@@ -492,6 +540,7 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
     // 重放的正是那条用户 FP 指令，会立刻再陷阱成死循环。门位由
     // 调度器在真正的上下文切换点（dispatch）统一下调，见
     // scheduler::dispatch → fpu_set_lazy_gate。
+    let eager_fp = crate::arch::smp::multi_core_active();
     asm!(
         // TPIDR_EL1 := 帧指针 —— 异常入口存根靠它零成本定位保存目标。
         // 必须在任何 eret 前生效；x21 此刻仍持有 frame。
@@ -508,11 +557,37 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
          // x16 作暂存（随后被 ldp x16, x17 从帧内覆盖，无副作用）。
          ldr x16, [x20, #280]
          msr tpidr_el0, x16
+         // ── FP 恢复双模（第十四刀 SMP）：x19=1（MULTI_CORE）走全量
+         // 急切装载——帧相对、TPIDR 每 core 一份，跨核天然安全；
+         // x19=0（单核）保持第十一刀惰性门：eret 前不装载不降门，
+         // 用户首条 FP/SIMD 经 EC=0x07 断链。
+         cbz x11, 55f
          // ── FPU 惰性恢复（第十一刀）：eret 前从不主动装载 frame.fpu，
          // 也不改写 FPU_DIRTY——活寄存器保持旧属主状态，用户首条
          // FP/SIMD 指令触发 EC=0x07 → fpu_trap_replay 断链装载后重放。
          // 非 FP 用户从此彻底零 FPU 开销；FP 用户跨切换只付一次陷阱。
          // （FPEN=0b01 由 arch::init 置定：EL1 自由、EL0 陷阱。）
+         ldp q0, q1, [x20, #288]
+         ldp q2, q3, [x20, #320]
+         ldp q4, q5, [x20, #352]
+         ldp q6, q7, [x20, #384]
+         ldp q8, q9, [x20, #416]
+         ldp q10, q11, [x20, #448]
+         ldp q12, q13, [x20, #480]
+         ldp q14, q15, [x20, #512]
+         ldp q16, q17, [x20, #544]
+         ldp q18, q19, [x20, #576]
+         ldp q20, q21, [x20, #608]
+         ldp q22, q23, [x20, #640]
+         ldp q24, q25, [x20, #672]
+         ldp q26, q27, [x20, #704]
+         ldp q28, q29, [x20, #736]
+         ldp q30, q31, [x20, #768]
+         ldr w16, [x20, #800]
+         msr fpsr, x16
+         ldr w16, [x20, #804]
+         msr fpcr, x16
+         55:
          ldp x0, x1, [x20, #0]
          ldp x2, x3, [x20, #16]
          ldp x4, x5, [x20, #32]
@@ -533,6 +608,7 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
          eret",
         in("x20") frame,
         in("x21") frame,
+        in("x11") eager_fp as usize,
         options(noreturn)
     )
 }

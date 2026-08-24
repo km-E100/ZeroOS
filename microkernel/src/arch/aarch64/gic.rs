@@ -70,6 +70,28 @@ pub unsafe fn init() {
     crate::debug!("gic: GIC-400 初始化完成");
 }
 
+/// 副核专用：只初始化本核 banked 的 CPU 接口（GICD 由主核一次配好）。
+/// GICv2 的 SGI（INTID 0-15）恒使能，RESCHED SGI 无需额外配置。
+pub unsafe fn init_cpu_interface() {
+    write_volatile(gicc_reg(PMR_OFFSET), 0xFF);
+    write_volatile(gicc_reg(CTLR_OFFSET), 1);
+}
+
+/// RESCHED SGI 的 INTID（GICv2 SGI 恒使能，ID0 安全）。
+pub const SGI_RESCHED: u32 = 0;
+
+/// 向目标核掩码广播 RESCHED SGI（GICD_SGIR，filter=00 按目标列表）。
+/// mask bit i ↔ MPIDR aff0=i。调用方须先扣掉自己（filter=01 是"除己
+/// 全体"，这里用显式掩码以便精确控制）。
+pub fn send_resched_sgi(target_mask: u8) {
+    if target_mask == 0 {
+        return;
+    }
+    let word: u32 =
+        ((target_mask as u32 & 0xFF) << 16) | (SGI_RESCHED & 0xF);
+    unsafe { write_volatile(gicd_reg(0xF00), word) };
+}
+
 /// 读取并确认中断，返回 INTID（剥掉高 22 位状态）。
 /// spurious（1023）原样返回，由调用方 end 并继续。
 pub unsafe fn acknowledge() -> u32 {

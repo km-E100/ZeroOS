@@ -68,6 +68,31 @@
 ## 结构性天花板（架构级决策，单独立项）
 SMP 多核 / 线程模型（ABI 级约定）/ KASLR / 动态进程槽
 
+### SMP 多核立项（2026-08-24 定稿，四阶段）
+> 裁决：先 SMP 后 ACPI。virt 上副核启动走 PSCI CPU_ON（conduit 已验证），
+> 不依赖 ACPI；ACPI 的兑现点（MADT 枚举/GTDT/电源）在多核之后才有价值，
+> 届时作为 bootloader-uefi 抓 RSDP 塞 bootinfo 的前置子任务并入。
+
+| 阶段 | 内容 | 验收 | 状态 |
+| --- | --- | --- | --- |
+| 0 | per-CPU 地基：CURRENT_SLOT/看门狗逐核化；每核 idle scratch 帧；自旋锁跨核纪律成文 | `-smp 1` 全功能零回归 | ✅2026-08-24 |
+| 1 | 副核点亮：PSCI CPU_ON 探测 1..MAX → 入口汇编（独立栈+TPIDR+GICC 初始化）→ 进调度循环 | `-smp 4` cpu1-3 online 日志 | ✅2026-08-24 |
+| 2 | 调度多核化：全局队列跨核消费；wake() 广播 RESCHED SGI 踢醒 WFI 核 | `-smp 4` forktest/sleepdemo/fstest/fsdemo/secdemo 全绿 | ✅2026-08-24 |
+| 3 | TLB 击落/IPI 深化 + 重开 COW_SHARED_FORK（跨核页表竞态收口） | COW 实机 copied=0 且 demo 全绿 | 未开工 |
+
+> **实机战报**：`-smp 4` 下 forktest/sleepdemo/fstest/fsdemo/secdemo 全 PASS；
+> `-smp 1` 标准验收 13/13 零回归。两个关键坑：
+> ① PSCI 目标 MPIDR 不带 AArch64 的 RES1 位（bit31）——按 DT reg 原值
+>    （0x0/0x1/...）匹配，带位反而 INVALID_PARAMETERS；
+> ② QEMU virt 默认拓扑把逻辑核放 Aff0，但真机/socket 拓扑在 Aff1——
+>    双格式候选探测通吃。
+> FP 语义：MULTI_CORE 翻闸即 FPEN=0b11 + 入口恒急切保存 + exit 急切
+> 装载（restore_context x11 选择子双分支）；单核惰性门完整保留。
+
+FP 语义裁决：MULTI_CORE 激活后 FPEN=0b11 + 帧回写全急切（第八刀语义，
+天然核安全）；单核保留第十一刀惰性门。惰性方案的跨核化（TPIDRRO_EL0
+per-cpu 基址方案）与阶段 3 一并立项。
+
 ## 构建与实机验证
 cargo run -p xtask -- build-iso          # 超 3072MB 锁死，purge 自救
                                          # ⚠ user-app 已纳入自动构建

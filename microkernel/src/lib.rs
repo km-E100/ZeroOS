@@ -63,6 +63,12 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     security::init();
     scheduler::init();
 
+    // SMP 阶段 1-2（第十四刀立项）：用户态拉起前点亮副核——服务与
+    // shell 经全局队列自然散布到各核。QEMU 默认 -smp 1 时 CPU_ON
+    // 探测立即 NOT_SUPPORTED，MULTI_CORE 翻了闸但无副核，FP 急切模式
+    // 单核同样正确（语义是超集）。
+    arch::boot_secondaries();
+
     info!("Zero OS microkernel ready; launching userland servers");
     services::launch_core(boot_info);
     info!("kernel_main: services::launch_core returned");

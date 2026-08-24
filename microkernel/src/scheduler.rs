@@ -31,7 +31,14 @@ use crate::process::{self, ProcessState};
 // ═══════════════════════════════════════════════════════════════════════
 
 static RUNQUEUE: Mutex<Mlfq> = Mutex::new(Mlfq::new());
-static CURRENT_SLOT: Mutex<Option<usize>> = Mutex::new(None);
+/// 每核"当前进程槽位"。SMP（第十四刀）：核间无共享此状态——各核的
+/// TPIDR_EL1 各自指向本核当前帧，本数组与之严格同步（dispatch 写入 /
+/// clear_current_slot_if 清除）。
+static CURRENT_SLOT: [Mutex<Option<usize>>; crate::arch::smp::MAX_CPUS] =
+    [const { Mutex::new(None) }; crate::arch::smp::MAX_CPUS];
+/// 每核 idle 标志：wake() 据此决定是否向该核广播 RESCHED SGI。
+static CPU_IDLE: [core::sync::atomic::AtomicBool; crate::arch::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::arch::smp::MAX_CPUS];
 
 // ═══ 第十一刀：多级反馈队列（MLFQ）与睡眠唤醒 ═══════════════════════
 //
@@ -59,8 +66,9 @@ static PROC_LEVEL: [core::sync::atomic::AtomicU8; 64] =
 
 /// 内核单调 tick 计数（每次定时器中断 +1）。睡眠唤醒的时钟基准。
 static TICK_NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// 软看门狗：连续无 Running 进程的 tick 数（第十四刀）。
-static IDLE_STREAK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 软看门狗：连续无 Running 进程的 tick 数（第十四刀，逐核记账）。
+static IDLE_STREAK: [core::sync::atomic::AtomicU32; crate::arch::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
 /// 告警阈值：600 tick（约 60s @100Hz；对照 Linux kernel panic 10s 的
 /// 宽松化——本内核 idle 属常态而非故障）。
 const WATCHDOG_IDLE_TICKS: u32 = 600;
@@ -130,7 +138,9 @@ static SLICE_USED: [core::sync::atomic::AtomicU32; 64] =
 
 pub fn init() {
     RUNQUEUE.lock().clear();
-    *CURRENT_SLOT.lock() = None;
+    for slot in CURRENT_SLOT.iter() {
+        *slot.lock() = None;
+    }
 }
 
 pub fn enqueue(pid: ProcessId) {
@@ -146,6 +156,17 @@ pub fn enqueue(pid: ProcessId) {
 pub fn run() -> ! {
     crate::info!("scheduler::run: entering main loop");
     SCHED_STARTED.store(true, core::sync::atomic::Ordering::Release);
+    schedule_loop()
+}
+
+/// 副核入口（第十四刀阶段 1）：主核已置 SCHED_STARTED，直接进循环。
+/// 全局 Mlfq 跨核消费由 RUNQUEUE 互斥保护；pop 互斥保证同一 pid 同一
+/// 时刻只被一个核取走。
+pub fn secondary_run() -> ! {
+    schedule_loop()
+}
+
+fn schedule_loop() -> ! {
     loop {
         let next = RUNQUEUE.lock().pop();
         match next {
@@ -162,16 +183,17 @@ fn dispatch(pid: ProcessId) -> ! {
     SLICE_USED[next_slot].store(0, core::sync::atomic::Ordering::Relaxed);
 
     // 持锁窗口：读出上一个 current 并写入新的，单语句块结束即释放。
-    let current_slot = {
-        let mut current = CURRENT_SLOT.lock();
+    let previous_slot = {
+        let mut current = CURRENT_SLOT[my_cpu()].lock();
         let previous = *current;
         *current = Some(next_slot);
         previous
     };
+    CPU_IDLE[my_cpu()].store(false, core::sync::atomic::Ordering::Relaxed);
 
     // crate::arch::fpu_set_lazy_gate(); ← 二分排查：暂缓切换点降门
 
-    if let Some(slot) = current_slot {
+    if let Some(slot) = previous_slot {
         // 仅 Running → Runnable。Blocked（阻塞等 IPC）/ Dying 的进程
         // 绝不能被 dispatch 的换出逻辑"复活"——否则状态声称可运行却
         // 不在就绪队列，造成永久饥饿。
@@ -218,13 +240,15 @@ fn dispatch(pid: ProcessId) -> ! {
 }
 
 fn idle() -> ! {
+    let cpu = my_cpu();
     // ⚠ 第十一刀关键修复：空转前把异常保存目标切到 idle scratch 帧。
     // 否则 TPIDR_EL1 仍指向最后那个 Blocked 进程的帧——idle 窗口的
     // 每个定时器中断都会用 idle 的 EL1 现场覆盖它的保存区，进程被
     // 唤醒后恢复出垃圾上下文（sleepdemo 实机抓获）。
     unsafe {
-        crate::arch::set_tpidr_el1(process::idle_trap_frame() as usize);
+        crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize);
     }
+    CPU_IDLE[cpu].store(true, core::sync::atomic::Ordering::Release);
     // 无可运行进程：WFI 休眠等待中断（对照 Linux do_idle 的 default_idle）。
     // 唤醒源：定时器 tick（idle 循环里必须持续重编程，否则睡死）。
     //
@@ -241,11 +265,14 @@ fn idle() -> ! {
                 options(nostack)
             );
         }
+        // 唤醒源已消费：本核不再视为 idle（RESCHED SGI 不必再来）。
+        CPU_IDLE[cpu].store(false, core::sync::atomic::Ordering::Relaxed);
         // 被唤醒：可能有进程入队。重新调度。
         let next = { RUNQUEUE.lock().pop() };
         if let Some(pid) = next {
             dispatch(pid)
         }
+        CPU_IDLE[cpu].store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -342,23 +369,31 @@ impl Mlfq {
     }
 }
 
+#[inline(always)]
+fn my_cpu() -> usize {
+    crate::arch::smp::cpu_id()
+}
+
 pub fn current_slot() -> usize {
-    // 最短持锁窗口：仅一次读。
-    (*CURRENT_SLOT.lock()).expect("scheduler: no current slot")
+    // 最短持锁窗口：仅一次读。SMP：读本核槽位。
+    (*CURRENT_SLOT[my_cpu()].lock()).expect("scheduler: no current slot")
 }
 
 pub fn current_slot_opt() -> Option<usize> {
     // 最短持锁窗口：仅一次读。
-    *CURRENT_SLOT.lock()
+    *CURRENT_SLOT[my_cpu()].lock()
 }
 
 /// 若 CURRENT_SLOT 正指向该槽（典型场景：进程自退出），清空之。
 /// 由 process::remove_slot 在槽位回收后调用，避免后续 dispatch 把
 /// 已被回收的槽当作"上一个进程"置回 Runnable。
 pub fn clear_current_slot_if(slot: usize) {
-    let mut current = CURRENT_SLOT.lock();
-    if *current == Some(slot) {
-        *current = None;
+    // SMP：目标进程可能死在任意一核上——逐核清陈旧指向。
+    for entry in CURRENT_SLOT.iter() {
+        let mut current = entry.lock();
+        if *current == Some(slot) {
+            *current = None;
+        }
     }
 }
 
@@ -448,7 +483,7 @@ pub fn on_tick_consume() -> bool {
         .map(|slot| process::state_slot(slot) != Some(ProcessState::Running))
         .unwrap_or(true)
     {
-        let streak = IDLE_STREAK.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        let streak = IDLE_STREAK[my_cpu()].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if streak == WATCHDOG_IDLE_TICKS {
             crate::error!(
                 "watchdog: no Running process for {} ticks (idle streak), tick_now={}",
@@ -458,7 +493,7 @@ pub fn on_tick_consume() -> bool {
         }
         return false;
     }
-    IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
+    IDLE_STREAK[my_cpu()].store(0, core::sync::atomic::Ordering::Relaxed);
 
     // ── 当前进程时间片记账与降级 ──
     // 守门（第十一刀实机排障结论）：CURRENT_SLOT 在进程 Blocking 后
@@ -524,7 +559,39 @@ pub fn wake(pid: ProcessId) {
         return;
     }
     process::set_state(pid, ProcessState::Runnable);
-    enqueue(pid);
+    enqueue(pid); // 唤醒即最高级：交互/定时器路径的延迟最优
+    kick_idle_cores();
+}
+
+/// 广播 RESCHED SGI 给"其他在线且正 idle 的核"（第十四刀阶段 2）：
+/// 目标核在 WFI 中被 SGI 打断 → reschedule 立即取队首，省掉等下一
+/// tick 的延迟。忙核不需要踢——它跑完当前片自然回队列竞争。
+fn kick_idle_cores() {
+    if !crate::arch::smp::multi_core_active() {
+        return;
+    }
+    let self_cpu = my_cpu();
+    let mut mask: u8 = 0;
+    for cpu in 0..crate::arch::smp::MAX_CPUS.min(crate::arch::smp::online_count()) {
+        if cpu != self_cpu
+            && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire)
+        {
+            mask |= 1 << cpu;
+        }
+    }
+    crate::arch::send_resched_sgi(mask);
+}
+
+/// RESCHED SGI 处理（trap.rs 的 IRQ 分支转交）：按被打断上下文分流——
+/// 真 Running 进程被 SGI 打断 ⇒ 让出重排队（可能仍选中自己）；idle/
+/// 陈旧上下文 ⇒ 直接重新决策（多半取到刚入队的进程）。
+pub fn handle_resched_sgi() -> ! {
+    match current_slot_opt() {
+        Some(slot) if process::state_slot(slot) == Some(ProcessState::Running) => {
+            yield_current()
+        }
+        _ => reschedule(),
+    }
 }
 
 #[cfg(test)]

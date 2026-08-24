@@ -5,6 +5,12 @@ use crate::process::{Context, TrapFrame};
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 
+/// 供 crate::arch::smp 路径访问（process.rs/scheduler.rs 引用 MAX_CPUS 等）。
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod aarch64_path {
+    pub use super::aarch64::smp;
+}
+
 pub fn init(boot_info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -75,6 +81,50 @@ pub unsafe fn program_next_tick() {
     #[cfg(target_arch = "aarch64")]
     {
         aarch64::program_next_tick();
+    }
+}
+
+pub use aarch64_path::smp;
+
+/// RESCHED SGI 的 INTID（GICv2 SGI 恒使能；与 gic.rs 冻结值一致）。
+pub const SGI_RESCHED: u32 = 0;
+
+pub fn boot_secondaries() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::smp::boot_secondaries();
+    }
+}
+
+pub fn fpu_arm_full_access() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fpu_arm_full_access();
+    }
+}
+
+pub fn fpu_freeze_none() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fpu_freeze_none();
+    }
+}
+
+pub unsafe fn gic_init_cpu_interface() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::gic_init_cpu_interface();
+    }
+}
+
+pub fn send_resched_sgi(target_mask: u8) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::send_resched_sgi(target_mask);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = target_mask;
     }
 }
 
