@@ -105,6 +105,10 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | ➕ | **第十八刀·ACPI 静态表 WS-A~D 全交付**：RSDP 经 UEFI config table 抓取→boot.S 槽位补丁→no_std 解析器(host矩阵测试)→SMP 按 MADT 点亮(legacy 回退保留)；AML 不做 | ✅-smp4 实机验证 |
 
 **验收现状：15/15 ALL PASS**（含 threaddemo/mutextest 新项）
+**压力长跑：-smp4 三轮 6/6 functional 全绿**（scripts/stress-loop.sh）
+**P1-P3 收口**：stress-loop 脚本入库 / README 现代化 / perf-history 首期
+入库 / knife10~13 worktree 与分支清理。剩余待实施仅三项设计文档对应
+的实施工作（堆损坏修复→COW 重开、ZeroPkg WS-B~D、镜像级 KASLR）。
 
 完成后解锁路径：堆损坏结案 → COW_SHARED_FORK 一键翻转 → SMP 阶段 3 收口。
 结构性天花板剩余：镜像级 KASLR 实施（设计已冻结）。
