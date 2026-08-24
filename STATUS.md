@@ -99,7 +99,7 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | 档 | 内容 | 状态 |
 | --- | --- | --- |
 | 🥇 | 堆损坏猎杀：canary+分配史工具转正常驻；根因未破但取证决定性收窄；COW 重开阻塞立案 | ✅工具交付·修复待续 |
-| 🥈 | ZeroPkg 设备内：WS-A 已交付（abi::zpkg，feature 门控）；WS-B~D 待续 | ✅WS-A·余待续 |
+| 🥈 | ZeroPkg 设备内：WS-A(abi::zpkg 解析核)+WS-B(fsd CMD_RENAME 原子改名)+WS-C(shell pkg ls/rename) 已交付；WS-D 安装全流待卷预置链路 | ✅WS-A~C·实机 15/15 |
 | 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex + mutextest | ✅实机 PASS |
 | 小件 | threaddemo+mutextest 注入 acceptance（15 项）；crashlog 缓行 | ✅ |
 | ➕ | **第十八刀·ACPI 静态表 WS-A~D 全交付**：RSDP 经 UEFI config table 抓取→boot.S 槽位补丁→no_std 解析器(host矩阵测试)→SMP 按 MADT 点亮(legacy 回退保留)；AML 不做 | ✅-smp4 实机验证 |
