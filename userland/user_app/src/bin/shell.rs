@@ -684,6 +684,8 @@ fn sleepdemo_command() {
     println("): forking sleeper child (child sleeps 12 ticks)");
     match userlib::fork() {
         Ok(0) => {
+            // 第十七刀🥇诊断：getpid 先行——若能成功而后续 println 静默，
+            // 则「COW 断链后首个 console_write」为特殊失败点。
             let cpid = userlib::getpid().unwrap_or(8888);
             print("[C] child alive pid=");
             print_u64(cpid);

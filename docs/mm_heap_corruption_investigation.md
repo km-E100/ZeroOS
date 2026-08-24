@@ -75,3 +75,23 @@ free-list header 发生 8 字节级覆写（内容为 trap 日志串片段）；
 对照 eager/COW 两次运行的异常流差异；同时审查 `cow_share_leaf`/
 `install_leaf_descriptor` 与 `map_physical_page` 在**子表新建 L1/L2**
 时对 `KERNEL_SHARED_L1` 的处理是否与 eager 路径存在别名差异。
+
+## 终极隔离实验（2026-08-24 · 子进程立即退出诊断模式）
+子进程首语句改为 `exit(0x42)`（无任何打印/syscall 前置）：
+- 结果：父 elapsed=0、wait NotFound(3)、**exit(0x42) 从未被收集**
+- ⇒ 子进程在 fork 返回后**一条用户指令都没执行**
+- ⇒ 且父进程的 Sleepticks 回写同样丢失（elapsed=0）
+- 双症状同窗：fork 完成 → enqueue(child) → 父阻塞 → 调度切换窗口
+
+## 收窄后唯一自洽的事故模型
+`alloc_table_slot_locked` 在 fork 中可能触发 **Vec 重分配**（表生长），
+而 COW clone 之后、记录写入之前存在一个窗口——若此刻发生槽位/索引
+错位（Vec realloc 搬移 × 快照序号），父子帧与表的映射即错乱。
+eager 模式同样走此代码却全绿 ⇒ 差异必然在 **COW 特有的克隆路径
+（bbm/tlbi/refcount 触碰了什么共享状态）× Vec 生长的叠加**。
+
+## 下会话行动（按性价比排序）
+1. fork 内强制预扩容：clone 前 `table.reserve(MAX-len)` 消除 fork 窗口
+   的 Vec 生长（一行级改动，若修复即实锤）；
+2. `-d int,in_asm -D file` 包裹 fork 窗口，对照 eager/COW 异常流；
+3. `handle_cow_fault` 与 `alloc_table_slot_locked` 的交叉断点单步。
