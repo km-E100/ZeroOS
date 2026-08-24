@@ -7,6 +7,7 @@ use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
 use crate::rootfs;
 use crate::user_elf;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +15,8 @@ use spin::Mutex;
 use zero_abi::syscall::SysError;
 use zero_abi::{ProcessId, ThreadEntry};
 
-pub(crate) const MAX_PROCESSES: usize = 64;
+/// 进程槽位上限（第十五刀动态化：按需生长到此上限，不再固定 64）。
+pub(crate) const MAX_PROCESSES: usize = 256;
 
 /// init（launchd）的 pid，孤儿收养的目标（对标 Linux pid==1 /
 /// child_subreaper 的 reparent 目标）。恒为 2 的依据：NEXT_PID 从 2
@@ -314,8 +316,24 @@ pub(crate) fn alloc_pid() -> ProcessId {
         }
     }
 }
-static PROCESS_TABLE: Mutex<[Option<ProcessRecord>; MAX_PROCESSES]> =
-    Mutex::new([const { None }; MAX_PROCESSES]);
+/// 动态进程表（第十五刀）：空表起步，spawn 时无空闲槽则追加一格，
+/// 上限 MAX_PROCESSES。槽号 = Vec 下标，只增不减（进程记录摘除留
+/// None 空洞复用），故全部既有下标语义不变。
+static PROCESS_TABLE: Mutex<Vec<Option<ProcessRecord>>> = Mutex::new(Vec::new());
+
+/// 取一个空闲槽位：优先复用空洞；无可复用且未达上限则追加。
+/// 调用方必须已持 PROCESS_TABLE 锁（本函数不加锁）。
+fn alloc_table_slot_locked(table: &mut Vec<Option<ProcessRecord>>) -> Option<usize> {
+    if let Some(idx) = table.iter().position(|slot| slot.is_none()) {
+        return Some(idx);
+    }
+    if table.len() < MAX_PROCESSES {
+        let idx = table.len();
+        table.push(None);
+        return Some(idx);
+    }
+    None
+}
 #[repr(C, align(16))]
 struct TrapFrameCell(UnsafeCell<TrapFrame>);
 impl TrapFrameCell {
@@ -384,11 +402,9 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
     let pid = alloc_pid();
 
     let mut table = PROCESS_TABLE.lock();
-    let (slot_index, slot) = table
-        .iter_mut()
-        .enumerate()
-        .find(|(_, slot)| slot.is_none())
-        .ok_or(ProcessError::TableFull)?;
+    let slot_index =
+        alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
+    let slot = &mut table[slot_index];
 
     let user_sp = user_stack_top_raw(slot_index);
     let kernel_sp = kernel_stack_top_raw(slot_index);
@@ -985,7 +1001,9 @@ fn audit_warn(_args: core::fmt::Arguments<'_>) {}
 /// 完全回收 seed 槽，并级联处理其 Zombie 后代（显式栈迭代，非递归）。
 /// 锁外销毁地址空间；全程零堆分配。槽已空则幂等跳过。
 fn full_reap(seed: usize) {
-    let mut stack = [0usize; MAX_PROCESSES];
+    // 第十五刀动态槽：级联缓冲改堆分配——256 槽 × AddressSpace 的
+    // 栈上数组会压穿 16KiB 内核栈。
+    let mut stack = alloc::vec![0usize; MAX_PROCESSES];
     let mut top = 0usize;
     stack[top] = seed;
     top += 1;
@@ -1000,10 +1018,10 @@ fn full_reap(seed: usize) {
                 None => None, // 并发已回收：幂等
                 Some(record) => {
                     let dying = record.pid;
-                    let mut casc_pids = [0u64; MAX_PROCESSES];
-                    let mut casc_slots = [0usize; MAX_PROCESSES];
-                    let mut casc_spaces: [Option<AddressSpace>; MAX_PROCESSES] =
-                        [const { None }; MAX_PROCESSES];
+                    let mut casc_pids = alloc::vec![0u64; MAX_PROCESSES];
+                    let mut casc_slots = alloc::vec![0usize; MAX_PROCESSES];
+                    let mut casc_spaces: alloc::vec::Vec<Option<AddressSpace>> =
+                        alloc::vec![None; MAX_PROCESSES];
                     let mut n = 0usize;
                     for (i, entry) in table.iter_mut().enumerate() {
                         let Some(rec) = entry.as_mut() else { continue };
@@ -1542,12 +1560,10 @@ pub fn fork(
 
     {
         let mut table = PROCESS_TABLE.lock();
-        let (slot_index, slot) = table
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-            .ok_or(ProcessError::TableFull)?;
+        let slot_index =
+            alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
         child_slot = slot_index;
+        let slot = &mut table[slot_index];
 
         *slot = Some(ProcessRecord {
             pid: child_pid,
@@ -2150,7 +2166,7 @@ mod state_machine_tests {
         let _g = TABLE_GUARD.lock().unwrap();
         {
             let mut table = PROCESS_TABLE.lock();
-            *table = [const { None }; MAX_PROCESSES];
+            *table = alloc::vec![None; MAX_PROCESSES];
             table[3] = Some(make_record(20, 3, None)); // 将死的父
             table[5] = Some(make_record(21, 5, Some(20))); // 活子
             table[7] = Some(make_record(22, 7, Some(21))); // 孙辈
@@ -2170,7 +2186,7 @@ mod state_machine_tests {
         // 清场：把全局表还原为空，避免影响其他测试对表状态的假设。
         drop(table);
         let mut table = PROCESS_TABLE.lock();
-        *table = [const { None }; MAX_PROCESSES];
+        *table = alloc::vec![None; MAX_PROCESSES];
     }
 
     #[test]
@@ -2181,7 +2197,7 @@ mod state_machine_tests {
         let _g = TABLE_GUARD.lock().unwrap();
         {
             let mut table = PROCESS_TABLE.lock();
-            *table = [const { None }; MAX_PROCESSES];
+            *table = alloc::vec![None; MAX_PROCESSES];
             table[5] = Some(make_record(21, 5, Some(INIT_PID))); // 已被收养的子
             table[5].as_mut().unwrap().adopted = true;
             table[7] = Some(make_record(22, 7, Some(21))); // 它的娃
@@ -2195,7 +2211,7 @@ mod state_machine_tests {
         assert!(grand.adopted);
         drop(table);
         let mut table = PROCESS_TABLE.lock();
-        *table = [const { None }; MAX_PROCESSES];
+        *table = alloc::vec![None; MAX_PROCESSES];
     }
 
     // ── 第八刀：capability bitmask 升格 ─────────────────────────────
@@ -2367,7 +2383,7 @@ mod state_machine_tests {
         let _g = TABLE_GUARD.lock().unwrap();
         {
             let mut table = PROCESS_TABLE.lock();
-            *table = [const { None }; MAX_PROCESSES];
+            *table = alloc::vec![None; MAX_PROCESSES];
             table[9] = Some(make_record(30, 9, Some(P)));
         }
         // SIGSEGV 投递：返回 POSIX 死因编码 -11，位图置 bit(11-1)=bit10
@@ -2392,7 +2408,7 @@ mod state_machine_tests {
         // 清场（仍持 _g）：还原空表，避免影响其他测试对表状态的假设
         {
             let mut table = PROCESS_TABLE.lock();
-            *table = [const { None }; MAX_PROCESSES];
+            *table = alloc::vec![None; MAX_PROCESSES];
         }
     }
 }
@@ -2411,12 +2427,12 @@ mod spawn_table_full_tests {
     fn silence_uart_and_reset_table() {
         crate::runtime::logger::set_level(crate::runtime::logger::Level::Error);
         let mut table = PROCESS_TABLE.lock();
-        *table = [const { None }; MAX_PROCESSES];
+        *table = alloc::vec![None; MAX_PROCESSES];
     }
 
     fn restore_table_and_logger() {
         let mut table = PROCESS_TABLE.lock();
-        *table = [const { None }; MAX_PROCESSES];
+        *table = alloc::vec![None; MAX_PROCESSES];
         crate::runtime::logger::set_level(crate::runtime::logger::Level::Info);
     }
 

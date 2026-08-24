@@ -277,21 +277,21 @@ fn idle() -> ! {
 }
 
 /// 单级环形队列（原第七代 RunQueue 环，第十一刀起作为 MLFQ 的每级载体）。
-/// 容量与 PROCESS_TABLE（64）严格一致：任一时刻每个进程最多在某**一级**
-/// 中出现一次（状态机不变量；跨级重复由 push_at 前的状态检查排除）。
+/// 容量与 PROCESS_TABLE 上限（第十五刀起 256）严格一致：任一时刻每个
+/// 进程最多在某**一级**中出现一次。
 struct RunQueue {
-    buf: [Option<ProcessId>; 64],
+    buf: [Option<ProcessId>; RUNQUEUE_CAPACITY],
     head: usize,
     tail: usize,
     len: usize,
 }
 
-const RUNQUEUE_CAPACITY: usize = 64;
+const RUNQUEUE_CAPACITY: usize = crate::process::MAX_PROCESSES;
 
 impl RunQueue {
     const fn new() -> Self {
         Self {
-            buf: [None; 64],
+            buf: [None; RUNQUEUE_CAPACITY],
             head: 0,
             tail: 0,
             len: 0,
@@ -644,13 +644,13 @@ mod tests {
     #[test]
     fn capacity_exact() {
         let mut q = RunQueue::new();
-        for n in 0..64 {
+        for n in 0..RUNQUEUE_CAPACITY as u64 {
             q.push(pid(n));
         }
         assert_eq!(q.len, RUNQUEUE_CAPACITY);
         // 满员后 pop 一个再 push 一个
         assert_eq!(q.pop(), Some(pid(0)));
-        q.push(pid(64));
+        q.push(pid(RUNQUEUE_CAPACITY as u64));
         assert_eq!(q.pop(), Some(pid(1)));
     }
 
@@ -658,10 +658,10 @@ mod tests {
     #[should_panic(expected = "runqueue full")]
     fn push_full_asserts() {
         let mut q = RunQueue::new();
-        for n in 0..64 {
+        for n in 0..RUNQUEUE_CAPACITY as u64 {
             q.push(pid(n));
         }
-        q.push(pid(65)); // 第 65 个 → 必须触发 assert
+        q.push(pid(RUNQUEUE_CAPACITY as u64 + 1)); // 超员 → 必须触发 assert
     }
 
     // ── 第十一刀：MLFQ 与睡眠队列 ──────────────────────────────────
