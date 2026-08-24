@@ -93,8 +93,16 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | 镜像级 KASLR | docs/kaslr_image_plan.md | 推荐 PIE 方案四步走，用户态先行；阶段1栈随机化已交付 |
 | ZeroPkg 生态 | docs/zeropkg_inos_plan.md | 宿主侧已成型；缺口=设备内 pkg ls/install/remove 四步刀次；依赖 fsd 树+session 均已交付 |
 
-## 结构性天花板剩余（未立项）
-线程模型后续（TLS 动态注册/mutex ABI）/ SMP 阶段 3 收口后重审
+## 第十七刀（进行中 · 四档菜单全干）
+
+| 档 | 内容 | 状态 |
+| --- | --- | --- |
+| 🥇 | 堆损坏猎杀：COW-MISS 探针 + 堆毒填/canary + 根因修复 + **翻转 COW_SHARED_FORK** | 🚧 |
+| 🥈 | ZeroPkg 设备内 WS-A~D（abi 解析核/fsd RENAME/shell 三命令/验收注入） | 🚧 |
+| 🥉 | 线程二期：号位27/28 FutexWait/FutexWake + userlib Mutex + 竞态验证 | 🚧 |
+| 小件 | threaddemo 注入 acceptance；crashlog 命令评估（pstore 设备内读取需新号位或服务化，先缓） | 🚧 |
+
+完成后：SMP 阶段 3 随 🥇 自动收口；结构性天花板仅剩镜像级 KASLR 实施。
 
 ### SMP 多核立项（2026-08-24 定稿，四阶段）
 > 裁决：先 SMP 后 ACPI。virt 上副核启动走 PSCI CPU_ON（conduit 已验证），
