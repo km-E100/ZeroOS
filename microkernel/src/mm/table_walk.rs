@@ -119,6 +119,7 @@ pub enum LeafShareClass {
 /// 即恢复第十刀零复制 fork（其在旧调度基线下实机 PASS，证据链完整）。
 pub const COW_SHARED_FORK: bool = false;
 pub const COW_BISECT_SKIP_ASLR: bool = false;
+pub const COW_BISECT_SKIP_PARENT_BBM: bool = false;
 
 pub fn classify_leaf(leaf: u64) -> LeafShareClass {
     if !COW_SHARED_FORK {

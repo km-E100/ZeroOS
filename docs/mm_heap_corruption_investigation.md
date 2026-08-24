@@ -57,3 +57,21 @@ dealloc 入口自动校验下一块 header，异常即打印最近分配序列�
 `qemu -d int -D int.log` 抓 fork 窗口全异常流；重点核对：
 dispatch→switch_to 对「started=true 的 COW 子进程」首次恢复路径 vs
 knife10 分支同路径的差异（含 TTBR0 activate 时序 × KASLR 栈偏移）。
+
+## 二分排除（2026-08-24 深夜 · 第17-18刀期间）
+| 实验 | 结果 | 结论 |
+| --- | --- | --- |
+| 禁用父侧 BBM 断链（父保持 RW 直写共享页） | 仍 6/15 崩，签名一致 | **父侧断链/屏障序排除** |
+| 堆全量轨迹（sleepdemo 窗口） | 序列完全合法 | 分配器算法本身无恙 |
+| CANARY-SMASH 全程零触发 | 载荷尾部无越界 | 写入者绕过 canary 位置（header 直写/wild write） |
+
+## 收窄后的事故模型
+COW fork 完成后的**子进程首次用户态活动窗口**内，某处对内核堆的
+free-list header 发生 8 字节级覆写（内容为 trap 日志串片段）；子进程
+随之静默自旋、记录消失。eager 模式（不共享页、全量复制）确定性无此象。
+
+## 下会话首选
+`qemu -d int -D int.log -singlestep` 包裹 sleepdemo fork 窗口，
+对照 eager/COW 两次运行的异常流差异；同时审查 `cow_share_leaf`/
+`install_leaf_descriptor` 与 `map_physical_page` 在**子表新建 L1/L2**
+时对 `KERNEL_SHARED_L1` 的处理是否与 eager 路径存在别名差异。
