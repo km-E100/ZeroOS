@@ -65,8 +65,29 @@
   翻转开关即回归零复制 fork；待专会二分「断链重放 × MLFQ 抢占/
   FPU 门位」的帧一致性。恢复注入 blktest 后验收矩阵补齐为 13 项。
 
-## 结构性天花板（架构级决策，单独立项）
-SMP 多核 / 线程模型（ABI 级约定）/ KASLR / 动态进程槽
+## 第十六刀（2026-08-24 · 三大件一气呵成）
+
+### ✅ 动态进程槽
+PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_reap
+级联缓冲改堆分配（防 16KiB 栈压穿）；RUNQUEUE 容量同步 256。
+
+### ✅ 线程模型（号位 26 CreateThread）
+- ABI 冻结：x1=entry / x2=stack_top / x3=tls(TPIDR_EL0) / x4=arg；
+  返回 tid（真 pid，WaitPid 原样 join）
+- **组载体空间模型**：组内恰一条记录持有 addr_space，成员 None；
+  address_space() 回退查找；exit/reap 时所有权转移给幸存者，
+  TTBR0 值不变运行中成员零感知；末代成员销毁。TTBR0 转移前后一致，
+  多核下无 TLB 失配窗口
+- exec 仅载体可发起（成员线程拒绝，文档披露 POSIX 差异）
+- 实机：threaddemo 双轮 PASS（sbrk 栈 + 共享区写入验证 + join code=77）
+
+### ✅ KASLR 阶段 1（栈随机化 + 熵源基建）
+- rng 模块：cntpct 抖动 ⊕ MPIDR → splitmix64（非密码学安全，已披露）
+- spawn/exec 两路用户栈顶向下随机偏移 ≤1MiB（页粒度，保底半栈深）
+- 镜像级 KASLR 待 PIE 工具链改造（bootloader 选址+重定位），另行立项
+
+## 结构性天花板剩余
+SMP 阶段 3（TLB 击落深化 + COW 重开）/ 镜像级 KASLR / ZeroPkg 生态
 
 ### SMP 多核立项（2026-08-24 定稿，四阶段）
 > 裁决：先 SMP 后 ACPI。virt 上副核启动走 PSCI CPU_ON（conduit 已验证），

@@ -15,6 +15,7 @@ pub mod elf;
 pub mod ipc;
 pub mod mm;
 pub mod process;
+pub mod rng;
 pub mod rootfs;
 pub mod runtime;
 pub mod scheduler;

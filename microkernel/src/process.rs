@@ -436,7 +436,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
         alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
     let slot = &mut table[slot_index];
 
-    let user_sp = user_stack_top_raw(slot_index);
+    // KASLR 阶段 1（第十五刀）：用户栈顶向下随机偏移 ≤256 页（1MiB）。
+    let user_sp = randomized_user_stack_top(user_stack_top_raw(slot_index));
     let kernel_sp = kernel_stack_top_raw(slot_index);
     unsafe {
         let tf = TRAP_FRAMES[slot_index].get();
@@ -1918,6 +1919,16 @@ pub(crate) fn exec_stage_plan(build_ok: bool) -> &'static [ExecStage] {
 /// - x0/x1 = bootfs 文件表首址 / 条目数（任何用户程序起步都能找到自己的文件）
 /// - x2    = 调用方透传值（userlib::exec 的 arg；0 表示未使用）
 /// - x3    = 0（预留）
+/// KASLR 阶段 1：栈顶向下随机偏移（页粒度，≤256 页/1MiB）。约束：
+/// 不越过 USER_STACK_LEN 一半——保底剩余栈深，避免极端随机值压爆
+/// 深调用链。熵源见 crate::rng（计数器抖动，非密码学安全）。
+pub fn randomized_user_stack_top(base: usize) -> usize {
+    use crate::mm::table_walk::PAGE_SIZE;
+    let max_pages = (USER_STACK_LEN / 2) / PAGE_SIZE;
+    let offset_pages = crate::rng::random_page_offset(max_pages.min(256));
+    base.saturating_sub(offset_pages * PAGE_SIZE)
+}
+
 fn apply_exec_frame(
     frame: &mut TrapFrame,
     entry: usize,
@@ -1933,7 +1944,9 @@ fn apply_exec_frame(
     // main 正常返回 = exit(0)：沿用 spawn 的 trampoline 约定，
     // 新映像的退出码同样可被父进程 WaitPid 收集（forktest/execdemo 依赖）。
     frame.regs[30] = thread_exit as usize as u64;
-    frame.sp_el0 = user_sp as u64;
+    // KASLR 阶段 1：exec 后的栈顶同样随机化（与 spawn 同策略同窗口）。
+    let sp_base = user_sp as usize;
+    frame.sp_el0 = randomized_user_stack_top(sp_base) as u64;
     frame.elr_el1 = entry as u64;
     frame.spsr_el1 = 0; // EL0t，中断随 SPSR 对 EL0 开启
     frame.sp_el1 = kernel_sp as u64;
