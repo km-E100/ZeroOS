@@ -2,11 +2,12 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use core::{cmp, mem, ptr};
 
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use crate::mm::address_space::{AddressSpace, MapError};
 // PAGE_SIZE 已由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
-use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
+use crate::mm::table_walk::PAGE_SIZE;
 
 use zero_abi::boot::{RootFsEntry, RootFsImage};
 use zero_abi::bootfs::{UserBootFile, UserBootFs};
@@ -17,6 +18,19 @@ use zero_abi::bootfs::{UserBootFile, UserBootFs};
 // -----------------------------------------------------------------------------
 static ROOTFS_PTR: AtomicPtr<RootFsImage> = AtomicPtr::new(ptr::null_mut());
 
+/// 全系统唯一的 immutable bootfs 物理缓存。bundle/UEFI 内存不直接暴露给
+/// EL0：启动时复制到物理分配器一次，之后所有进程只 retain + RO map。
+struct BootFsCache {
+    files: Vec<UserBootFile>,
+    entries_phys: usize,
+    entries_pages: usize,
+    entries_base: usize,
+    count: usize,
+    payload_pages: usize,
+}
+
+static BOOTFS_CACHE: Mutex<Option<BootFsCache>> = Mutex::new(None);
+
 pub const USER_BOOTFS_BASE: usize = 0x0000_8000_0000;
 
 //
@@ -24,7 +38,10 @@ pub const USER_BOOTFS_BASE: usize = 0x0000_8000_0000;
 //  Initialization
 // -----------------------------------------------------------------------------
 pub fn init(image_ptr: *const RootFsImage) {
-    crate::info!("rootfs::init: begin image_ptr=0x{:016x}", image_ptr as usize);
+    crate::info!(
+        "rootfs::init: begin image_ptr=0x{:016x}",
+        image_ptr as usize
+    );
 
     if image_ptr.is_null() {
         crate::info!("rootfs::init: image_ptr is NULL, skipping");
@@ -41,6 +58,20 @@ pub fn init(image_ptr: *const RootFsImage) {
     );
 
     ROOTFS_PTR.store(image_ptr as *mut RootFsImage, Ordering::SeqCst);
+
+    // 第25刀：把 bootfs payload 复制进物理分配器**一次**。旧实现每次
+    // spawn/exec 都复制整份 bootfs；服务数增长后 9MiB × N 直接把启动
+    // 拖到分钟级。缓存持有每页的基础引用，进程映射只 retain/free 自己
+    // 的那一份引用，因此任一进程退出都不会破坏其他进程或缓存本体。
+    let cache = build_bootfs_cache(image, USER_BOOTFS_BASE)
+        .expect("rootfs: unable to build immutable bootfs cache");
+    crate::info!(
+        "rootfs: shared bootfs cache entries={} payload_pages={} metadata_pages={}",
+        cache.count,
+        cache.payload_pages,
+        cache.entries_pages
+    );
+    *BOOTFS_CACHE.lock() = Some(cache);
 
     crate::info!("rootfs::init: end");
 }
@@ -63,7 +94,10 @@ fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage 
 
     assert!(image.entry_count > 0, "rootfs::init: entry_count = 0");
 
-    assert!(!image.entries.is_null(), "rootfs::init: entries pointer NULL");
+    assert!(
+        !image.entries.is_null(),
+        "rootfs::init: entries pointer NULL"
+    );
 
     assert_eq!(
         (image.entries as usize) % mem::align_of::<RootFsEntry>(),
@@ -85,8 +119,16 @@ fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage 
     unsafe {
         let slice = core::slice::from_raw_parts(image.entries, image.entry_count);
         for (i, entry) in slice.iter().enumerate() {
-            assert!(!entry.path_ptr.is_null(),  "rootfs::init: entry {} has NULL path", i);
-            assert!(!entry.data_ptr.is_null(),  "rootfs::init: entry {} has NULL data", i);
+            assert!(
+                !entry.path_ptr.is_null(),
+                "rootfs::init: entry {} has NULL path",
+                i
+            );
+            assert!(
+                !entry.data_ptr.is_null(),
+                "rootfs::init: entry {} has NULL data",
+                i
+            );
         }
     }
 
@@ -114,9 +156,7 @@ pub fn image() -> Option<&'static RootFsImage> {
 }
 
 pub fn entries() -> Option<&'static [RootFsEntry]> {
-    image().map(|img| unsafe {
-        core::slice::from_raw_parts(img.entries, img.entry_count)
-    })
+    image().map(|img| unsafe { core::slice::from_raw_parts(img.entries, img.entry_count) })
 }
 
 //
@@ -150,9 +190,10 @@ fn copy_into_pages(src: &[u8]) -> Option<(usize, usize)> {
     Some((first, pages))
 }
 
-pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, usize) {
+fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, usize, usize) {
     let entries = unsafe { image.as_slice() };
     let mut files = Vec::with_capacity(entries.len());
+    let mut payload_pages = 0usize;
 
     for entry in entries {
         let path = unsafe { entry.path() };
@@ -160,11 +201,9 @@ pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, us
         let data = unsafe { entry.data() };
         let data_len = data.len();
 
-        // 支持多页文件（如 /Applications/Shell 这种 2.6MB 的 ELF）。
-        // path_phys / data_phys 记录首页物理地址即可：虚拟地址连续，
-        // 且物理地址在下发用户态前会被抹除，消费者只依赖 data_ptr/data_len。
-        let (path_phys, _) = copy_into_pages(path.as_bytes()).expect("bootfs: OOM");
-        let (data_phys, _) = copy_into_pages(data).expect("bootfs: OOM");
+        let (path_phys, path_pages) = copy_into_pages(path.as_bytes()).expect("bootfs: OOM");
+        let (data_phys, data_pages) = copy_into_pages(data).expect("bootfs: OOM");
+        payload_pages = payload_pages.saturating_add(path_pages + data_pages);
 
         files.push(UserBootFile {
             path_phys: path_phys as u64,
@@ -176,15 +215,11 @@ pub fn build_user_bootfs_metadata(image: &RootFsImage) -> (Vec<UserBootFile>, us
         });
     }
 
-    // ⬇⬇⬇ 关键修复：不能在 move 后再 borrow ⬇⬇⬇
     let count = files.len();
-    (files, count)
+    (files, count, payload_pages)
 }
 
-pub fn assign_user_bootfs_virtual_addresses(
-    files: &mut [UserBootFile],
-    mut base: usize,
-) -> usize {
+pub fn assign_user_bootfs_virtual_addresses(files: &mut [UserBootFile], mut base: usize) -> usize {
     for file in files.iter_mut() {
         file.path_ptr = base as u64;
         base += pages_for_len(file.path_len as usize) * PAGE_SIZE;
@@ -195,90 +230,113 @@ pub fn assign_user_bootfs_virtual_addresses(
     base
 }
 
-//
-// -----------------------------------------------------------------------------
-//  Build full user bootfs
-// -----------------------------------------------------------------------------
-pub fn build_user_bootfs_for_process(
-    aspace: &mut AddressSpace,
-    user_base: usize,
-) -> Result<UserBootFs, MapError> {
-    let image = match image() {
-        Some(i) => i,
-        None => {
-            return Ok(UserBootFs { entries_ptr: 0, entries_len: 0 });
-        }
-    };
-
-    let (mut files, count) = build_user_bootfs_metadata(image);
-
-    if count == 0 {
-        return Ok(UserBootFs { entries_ptr: 0, entries_len: 0 });
-    }
-
+fn build_bootfs_cache(image: &RootFsImage, user_base: usize) -> Result<BootFsCache, MapError> {
+    let (mut files, count, payload_pages) = build_user_bootfs_metadata(image);
     let cursor = assign_user_bootfs_virtual_addresses(&mut files, user_base);
+    let entries_base = (cursor + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let entry_bytes = count * mem::size_of::<UserBootFile>();
+    let entries_pages = pages_for_len(entry_bytes);
 
-    // Map pages（每个文件可能跨多页，路径与数据分别映射完整页数）
-    for file in files.iter() {
-        unsafe {
-            let path_pages = pages_for_len(file.path_len as usize);
-            for i in 0..path_pages {
-                aspace.map_page_phys(
-                    file.path_ptr as usize + i * PAGE_SIZE,
-                    file.path_phys as usize + i * PAGE_SIZE,
-                    false,
-                    false,
-                )?;
-            }
-            let data_pages = pages_for_len(file.data_len as usize);
-            for i in 0..data_pages {
-                aspace.map_page_phys(
-                    file.data_ptr as usize + i * PAGE_SIZE,
-                    file.data_phys as usize + i * PAGE_SIZE,
-                    false,
-                    false,
-                )?;
-            }
-        }
-    }
-
-    // Erase physical pointers (handed to user)
-    for file in files.iter_mut() {
+    // 用户可见元数据不泄露物理地址；布局固定，因此所有进程可共享同一页。
+    let mut user_files = files.clone();
+    for file in user_files.iter_mut() {
         file.path_phys = 0;
         file.data_phys = 0;
     }
-
-    // Serialize metadata
-    let entry_bytes = count * mem::size_of::<UserBootFile>();
-    let entries_base = (cursor + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let meta_bytes = unsafe {
-        core::slice::from_raw_parts(files.as_ptr() as *const u8, entry_bytes)
+    let entries_phys = if entries_pages == 0 {
+        0
+    } else {
+        let first = phys::alloc_pages_contiguous(entries_pages).ok_or(MapError::OutOfMemory)?;
+        let bytes =
+            unsafe { core::slice::from_raw_parts(user_files.as_ptr() as *const u8, entry_bytes) };
+        unsafe {
+            ptr::write_bytes(first as *mut u8, 0, entries_pages * PAGE_SIZE);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), first as *mut u8, entry_bytes);
+        }
+        first
     };
 
-    let mut virt = entries_base;
-    let mut offset = 0;
+    Ok(BootFsCache {
+        files,
+        entries_phys,
+        entries_pages,
+        entries_base,
+        count,
+        payload_pages,
+    })
+}
 
-    while offset < entry_bytes {
-        let chunk = cmp::min(PAGE_SIZE, entry_bytes - offset);
-        let phys = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
+#[inline]
+unsafe fn retain_and_map_ro(
+    aspace: &mut AddressSpace,
+    virt: usize,
+    phys_addr: usize,
+) -> Result<(), MapError> {
+    phys::retain_page(phys_addr);
+    if let Err(err) = aspace.map_page_phys(virt, phys_addr, false, false) {
+        // retain 尚未进入页表，必须单独撤销；已成功映射的旧页由调用方
+        // destroy address space 时逐叶 free，缓存自己的基础引用始终保留。
+        phys::free_page(phys_addr);
+        return Err(err);
+    }
+    Ok(())
+}
 
-        unsafe {
-            // 恒等映射下物理页可直接写入。
-            let dst = phys as *mut u8;
-            ptr::copy_nonoverlapping(meta_bytes.as_ptr().add(offset), dst, chunk);
-            if chunk < PAGE_SIZE {
-                ptr::write_bytes(dst.add(chunk), 0, PAGE_SIZE - chunk);
+// -----------------------------------------------------------------------------
+//  Build per-process view of the globally shared immutable bootfs
+// -----------------------------------------------------------------------------
+pub fn build_user_bootfs_for_process(
+    aspace: &mut AddressSpace,
+    _user_base: usize,
+) -> Result<UserBootFs, MapError> {
+    let guard = BOOTFS_CACHE.lock();
+    let Some(cache) = guard.as_ref() else {
+        return Ok(UserBootFs {
+            entries_ptr: 0,
+            entries_len: 0,
+        });
+    };
+    if cache.count == 0 {
+        return Ok(UserBootFs {
+            entries_ptr: 0,
+            entries_len: 0,
+        });
+    }
+
+    for file in cache.files.iter() {
+        for i in 0..pages_for_len(file.path_len as usize) {
+            unsafe {
+                retain_and_map_ro(
+                    aspace,
+                    file.path_ptr as usize + i * PAGE_SIZE,
+                    file.path_phys as usize + i * PAGE_SIZE,
+                )?;
             }
-            aspace.map_page_phys(virt, phys, true, false)?;
         }
+        for i in 0..pages_for_len(file.data_len as usize) {
+            unsafe {
+                retain_and_map_ro(
+                    aspace,
+                    file.data_ptr as usize + i * PAGE_SIZE,
+                    file.data_phys as usize + i * PAGE_SIZE,
+                )?;
+            }
+        }
+    }
 
-        virt += PAGE_SIZE;
-        offset += chunk;
+    for i in 0..cache.entries_pages {
+        unsafe {
+            retain_and_map_ro(
+                aspace,
+                cache.entries_base + i * PAGE_SIZE,
+                cache.entries_phys + i * PAGE_SIZE,
+            )?;
+        }
     }
 
     Ok(UserBootFs {
-        entries_ptr: entries_base as u64,
-        entries_len: count as u64,
+        entries_ptr: cache.entries_base as u64,
+        entries_len: cache.count as u64,
     })
 }
 

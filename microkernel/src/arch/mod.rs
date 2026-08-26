@@ -18,6 +18,14 @@ pub fn init(boot_info: &BootInfo) {
     }
 }
 
+/// MM + ACPI 之后的平台 IRQ/timer 第二阶段初始化。
+pub fn init_platform() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::init_platform();
+    }
+}
+
 pub unsafe fn switch_to(next: *mut Context) -> ! {
     #[cfg(target_arch = "aarch64")]
     {

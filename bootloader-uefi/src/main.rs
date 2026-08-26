@@ -74,7 +74,7 @@ fn real_entry(handle: Handle, mut st: SystemTable<Boot>) -> Result<(), Status> {
         log_info!("boot configuration loaded");
 
         let kernel_image =
-            KernelImage::load(&mut fs_iface, &boot_paths, &config, st.boot_services())?;
+            KernelImage::load(&mut fs_iface, &boot_paths, &config, &st)?;
 
         let rootfs = fs::load_rootfs_image(&mut fs_iface, &boot_paths, &config)?;
         (kernel_image, rootfs, config)

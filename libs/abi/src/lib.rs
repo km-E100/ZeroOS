@@ -25,8 +25,6 @@
 #[cfg(feature = "zpkg")]
 extern crate alloc;
 
-
-
 pub mod bootfs;
 
 /// POSIX 信号编号最小集 + 进程 pending 位图编码（第九刀「信号位图最小版」）。
@@ -90,9 +88,11 @@ pub mod signals {
             // u8 容不下 bit10：这正是位图取 u16 的原因（模块头披露）
             assert_eq!(signal_bit(SIGSEGV), 1 << 10);
             // 位互不重叠：多信号可共存于同一位图
-            let all =
-                signal_bit(SIGILL) | signal_bit(SIGTRAP) | signal_bit(SIGBUS)
-                    | signal_bit(SIGFPE) | signal_bit(SIGSEGV);
+            let all = signal_bit(SIGILL)
+                | signal_bit(SIGTRAP)
+                | signal_bit(SIGBUS)
+                | signal_bit(SIGFPE)
+                | signal_bit(SIGSEGV);
             assert_eq!(all.count_ones(), 5);
         }
 
@@ -247,6 +247,12 @@ pub mod driver {
         VirtIORng = 5,
         /// NVMe 块设备。
         Nvme = 6,
+        /// VirtIO GPU（2D/3D display）。
+        VirtIOGpu = 7,
+        /// VirtIO input（keyboard/mouse/tablet）。
+        VirtIOInput = 8,
+        /// VirtIO sound。
+        VirtIOSound = 9,
     }
 
     /// 单条驱动描述符（`DriverInfo` 系统调用回填用户缓冲区的**源格式**；
@@ -383,6 +389,96 @@ pub mod channels {
     pub const BLKDRV_RESP: u32 = 0x261;
     /// 块设备服务器事件通道（热插拔通知）。
     pub const BLKDRV_EVENT: u32 = 0x262;
+    /// inputd 发布的统一输入事件流（键盘/鼠标/触控）。
+    pub const INPUT_EVENT_BUS: u32 = 0x280;
+    /// WindowServer 请求/事件总线。
+    pub const WINDOW_REQ: u32 = 0x290;
+    pub const WINDOW_RESP: u32 = 0x291;
+    pub const NET_REQ: u32 = 0x2a0;
+    pub const NET_RESP: u32 = 0x2a1;
+    pub const PKG_REQ: u32 = 0x2b0;
+    pub const PKG_RESP: u32 = 0x2b1;
+    /// audiod command/response buses (Knife 33).
+    pub const AUDIO_REQ: u32 = 0x2c0;
+    pub const AUDIO_RESP: u32 = 0x2c1;
+}
+
+/// 统一输入事件 ABI。布局固定 24 字节，可直接装入 Message.payload。
+pub mod input {
+    pub const KIND_KEY: u16 = 1;
+    pub const KIND_REL: u16 = 2;
+    pub const KIND_ABS: u16 = 3;
+    pub const KIND_BUTTON: u16 = 4;
+    pub const KIND_WHEEL: u16 = 5;
+    pub const KIND_IME_COMPOSITION: u16 = 0x100;
+    pub const KIND_IME_COMMIT: u16 = 0x101;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct InputEvent {
+        pub kind: u16,
+        pub code: u16,
+        pub value: i32,
+        pub modifiers: u32,
+        pub device_id: u32,
+        /// 单调时间戳；Knife26 接入真实 monotonic clock 前允许为 0。
+        pub timestamp: u64,
+    }
+
+    const _: () = assert!(core::mem::size_of::<InputEvent>() == 24);
+}
+
+
+/// Stable userspace audio format exposed by audiod/kernel. Knife33 deliberately
+/// freezes one first-generation PCM contract instead of leaking VirtIO enums.
+pub mod audio {
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct AudioInfo {
+        pub sample_rate: u32,
+        pub channels: u16,
+        pub sample_bits: u16,
+        pub period_bytes: u32,
+        pub buffer_bytes: u32,
+    }
+    const _: () = assert!(core::mem::size_of::<AudioInfo>() == 16);
+}
+
+/// Stable userspace VirtIO-GPU 3D ABI (Knife34). The kernel owns VirtIO
+/// queue/context/resource lifetime; userspace submits an opaque VirGL command stream.
+pub mod gpu {
+    pub const GPU3D_FLAG_VIRGL: u32 = 1 << 0;
+    pub const GPU3D_FLAG_CONTEXT_INIT: u32 = 1 << 1;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Gpu3dInfo {
+        pub flags: u32,
+        pub capset_id: u32,
+        pub capset_version: u32,
+        pub capset_size: u32,
+    }
+
+    /// Resource description mirrors the stable subset of virtio_gpu_resource_create_3d.
+    /// `backing_bytes=0` creates a host-only resource; non-zero asks the kernel to
+    /// allocate/attach guest backing so userspace can read rendered pixels back.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Gpu3dResourceDesc {
+        pub target: u32,
+        pub format: u32,
+        pub bind: u32,
+        pub width: u32,
+        pub height: u32,
+        pub depth: u32,
+        pub array_size: u32,
+        pub last_level: u32,
+        pub nr_samples: u32,
+        pub flags: u32,
+        pub backing_bytes: u64,
+    }
+    const _: () = assert!(core::mem::size_of::<Gpu3dInfo>() == 16);
+    const _: () = assert!(core::mem::size_of::<Gpu3dResourceDesc>() == 48);
 }
 
 /// 各服务器的**命令协议码**（`Message.code` 字段取值）。
@@ -423,6 +519,9 @@ pub mod protocol {
         pub const CMD_CAP_LIST: u32 = 0x22;
         /// 校验令牌在台账中的状态（payload：`token\0`；code==0 有效）。
         pub const CMD_CAP_VERIFY: u32 = 0x23;
+        /// Verify ZeroPkg v2 Ed25519 signature. Payload:
+        /// `[origin_len u8][origin][message_hash 32][signature 64]`.
+        pub const CMD_PKG_VERIFY: u32 = 0x30;
 
         /// CMD_CAP_ISSUE 请求字段。
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -621,7 +720,10 @@ pub mod protocol {
 
             /// 测试辅助：取第一个 `\0` 前的字段文本（断言可读性用）。
             fn first_field(payload: &[u8]) -> &str {
-                let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                let end = payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(payload.len());
                 core::str::from_utf8(&payload[..end]).unwrap_or("?")
             }
 
@@ -721,6 +823,61 @@ pub mod protocol {
     /// `[0..4]` request_id（小端 u32），`[4]` flags（bit0=keepalive，bit1=foreground），
     /// `[5..]` 服务路径（`\0` 结尾）。
     /// 响应 payload 布局：`[0..4]` request_id，`[4..]` 结果文本（`\0` 结尾）。
+    /// WindowServer commands. Payloads are fixed little-endian scalars; large
+    /// pixel surfaces are referenced by secure SHM handles, never copied through IPC.
+    pub mod net {
+        pub const STATUS: u32 = 1;
+        pub const PING: u32 = 2;
+        pub const UDP_OPEN: u32 = 0x10;
+        pub const UDP_SEND: u32 = 0x11;
+        pub const UDP_RECV: u32 = 0x12;
+        pub const TCP_CONNECT: u32 = 0x20;
+        pub const TCP_STATE: u32 = 0x21;
+        pub const TCP_SEND: u32 = 0x22;
+        pub const TCP_RECV: u32 = 0x23;
+        /// Bulk TCP receive through a caller-owned secure SHM region.
+        /// request payload: handle(u32), shm_handle(u32), max(u32).
+        /// response payload: actual(u32). The bytes live in the shared region.
+        pub const TCP_RECV_SHM: u32 = 0x24;
+        pub const DNS_QUERY: u32 = 0x30;
+        pub const HTTP_GET: u32 = 0x31;
+        pub const OK: u32 = 0;
+        pub const AGAIN: u32 = 1;
+        pub const ERR: u32 = 2;
+        pub const UNSUPPORTED: u32 = 3;
+    }
+
+    pub mod pkg {
+        pub const INSTALL_URL: u32 = 1;
+        pub const REMOVE: u32 = 2;
+        pub const VERIFY: u32 = 3;
+        pub const LAUNCH: u32 = 4;
+        pub const LIST: u32 = 5;
+        pub const OK: u32 = 0;
+        pub const ERR: u32 = 1;
+    }
+
+    pub mod audio {
+        pub const INFO: u32 = 1;
+        /// Ask audiod to play the deterministic acceptance tone. Normal apps
+        /// will later use stream/buffer commands; this code is intentionally
+        /// an audiod policy operation, not a raw device syscall.
+        pub const PLAY_TEST: u32 = 2;
+        pub const STOP: u32 = 3;
+        pub const OK: u32 = 0;
+        pub const ERR: u32 = 1;
+    }
+
+    pub mod window {
+        pub const CREATE: u32 = 0x01;
+        pub const DESTROY: u32 = 0x02;
+        pub const SET_GEOMETRY: u32 = 0x03;
+        pub const RAISE: u32 = 0x04;
+        pub const SUBMIT_SHM: u32 = 0x05;
+        pub const OK: u32 = 0;
+        pub const ERR: u32 = 1;
+    }
+
     pub mod service_control {
         /// 启动服务。
         pub const CMD_START: u32 = 0x01;
@@ -810,6 +967,16 @@ pub mod protocol {
             /// 用途：安装流先写临时名 `.tmp`，校验后原子 rename 上线，
             /// 实现「读者要么看到旧版、要么看到新版」的提交语义。
             pub const CMD_RENAME: u32 = 0x28;
+            /// Sized read: request `[fd u32][max u32]`; response
+            /// `[actual u32][data..]`. Added for streaming packages/ELFs without
+            /// relying on zero padding to infer EOF. max <= 124.
+            pub const CMD_READ_SIZED: u32 = 0x29;
+            /// Bulk read through secure SHM: request
+            /// `[fd u32][handle u32][max u32]`; response `[actual u32]`.
+            /// The caller must explicitly grant `handle` to fsd before each
+            /// request; fsd maps, copies at most `max` bytes, releases its
+            /// holder, advances the fd offset, then replies.
+            pub const CMD_READ_SHARED: u32 = 0x2a;
 
             /// OPEN mode：仅打开已存在文件（不存在 → ERR_NOT_FOUND）。
             pub const OPEN_EXISTING: u8 = 0;
@@ -910,11 +1077,30 @@ pub mod cap {
     /// 令牌位；目标进程持含本位的有效令牌调号位 43 SessionBegin
     /// 建立会话，令牌随即消费（防重放）。
     pub const CAP_SESSION: u32 = 1 << 6;
+    /// 从内核输入设备队列读取事件（仅 inputd）。
+    pub const CAP_INPUT_DEV: u32 = 1 << 7;
+    /// 向显示后端提交合成后的 surface（仅 WindowServer/displayd）。
+    pub const CAP_DISPLAY: u32 = 1 << 8;
+    /// 直接收发二层网络帧（仅 netd）。
+    pub const CAP_NET_DEV: u32 = 1 << 9;
+    /// 音频设备数据面（仅 audiod）。
+    pub const CAP_AUDIO_DEV: u32 = 1 << 10;
+    /// 从已验证的用户缓冲区启动应用镜像（号位58 SpawnImage）。
+    /// 不并入 CAP_ALL；仅 launcher/admin 会话按需动态领取。
+    pub const CAP_SPAWN_APP: u32 = 1 << 11;
+    /// Send administrative requests to pkgd's protected command channel.
+    pub const CAP_PKG_CLIENT: u32 = 1 << 12;
+    /// Send commands to audiod. Raw VirtIO sound access remains CAP_AUDIO_DEV
+    /// and is held only by audiod.
+    pub const CAP_AUDIO_CLIENT: u32 = 1 << 13;
     /// 全部已定义能力的组合（引导期 privileged 服务的缺省位图）。
     ///
     /// 【第十三刀边界】动态管理位（CHANNEL_CREATE/SECURE_IPC/ISSUER/
     /// SESSION）**不并入 CAP_ALL**：引导期布尔映射不应静默携带签发权
     /// 或会话准入，这些能力只能显式授予或动态签发，保持最小授权。
+    // Compatibility meaning of legacy `privileged=true`: only the original
+    // kernel resource trio. Device-service capabilities added later are never
+    // inherited implicitly; inputd/displayd/netd/audiod receive them explicitly.
     pub const CAP_ALL: u32 = CAP_MMIO | CAP_BLOCK_DEV | CAP_SPAWN_SVC;
 
     #[cfg(test)]
@@ -942,6 +1128,7 @@ pub mod cap {
                 CAP_SECURE_IPC,
                 CAP_ISSUER,
                 CAP_SESSION,
+                CAP_INPUT_DEV, CAP_DISPLAY, CAP_NET_DEV, CAP_AUDIO_DEV, CAP_SPAWN_APP, CAP_PKG_CLIENT, CAP_AUDIO_CLIENT,
             ];
             for (i, a) in all.iter().enumerate() {
                 for (j, b) in all.iter().enumerate() {
@@ -1285,7 +1472,6 @@ pub mod syscall {
         // 内核侧落点：trap.rs::decode_syscall + syscalls::handle +
         // security 模块（GrantBook 台账）；文档登记见
         // docs/abi_syscall_reference.md。
-
         /// (40) 动态签发能力授予：`x1`=目标 pid，`x2`=能力位图
         /// （[`crate::cap`] 位或），`x3`=有效期 TTL（逻辑 tick，见下；
         /// 0 = 不过期）。**仅 [`crate::cap::CAP_ISSUER`] 持有者可调**
@@ -1351,6 +1537,94 @@ pub mod syscall {
             user_buffer: usize,
             len: usize,
         },
+        /// (46) 共享内存 owner 显式授权：`x1`=handle, `x2`=target pid。
+        /// 只授予 opaque handle 的访问权；目标仍须自行 ShmMap，内核选择 VA。
+        ShmGrant {
+            handle: u32,
+            target_pid: u64,
+        },
+        /// (47) 从内核输入设备队列取一条 [`crate::input::InputEvent`]。
+        InputRead {
+            user_event: usize,
+        },
+        /// (48) WindowServer 提交 XRGB8888 surface：x1=ptr,x2=width,x3=height,x4=stride(px)。
+        DisplayPresent {
+            user_buffer: usize,
+            width: usize,
+            height: usize,
+            stride: usize,
+        },
+        /// (49) 读取时钟：clock_id 0=monotonic ns, 1=realtime unix ns。
+        ClockGet {
+            clock_id: u32,
+        },
+        /// (50) 睡眠至 monotonic deadline(ns)。
+        SleepUntil {
+            deadline_ns: u64,
+        },
+        /// (51/52) netd 专属二层帧数据面。
+        NetSend {
+            user_buffer: usize,
+            len: usize,
+        },
+        NetRecv {
+            user_buffer: usize,
+            len: usize,
+        },
+        /// (53) netd-only: copy the negotiated virtio-net MAC (6 bytes).
+        NetGetMac {
+            user_buffer: usize,
+        },
+        /// (54) targeted IPC send: same channel ACL as IpcSend, but only target_pid may receive.
+        IpcSendTo {
+            channel: u32,
+            target_pid: u64,
+            user_message: usize,
+        },
+        /// (55) 非阻塞 IPC 接收：与号位 1 同 ACL/targeted-envelope 语义，
+        /// 但队列无本进程可收消息时立即返回 WouldBlock，绝不登记 waiter。
+        TryReceiveMessage {
+            channel: u32,
+            user_buffer: usize,
+        },
+        /// (56) cryptographic random bytes from the platform entropy source.
+        GetRandom {
+            user_buffer: usize,
+            len: usize,
+        },
+        /// (57) kernel-owned block device capacity in 512-byte sectors.
+        BlockCapacity,
+        /// (58) Spawn a user ELF supplied in caller memory. Requires
+        /// [`crate::cap::CAP_SPAWN_APP`]. The kernel copies/maps the image but
+        /// never performs filesystem IPC itself.
+        SpawnImage {
+            user_buffer: usize,
+            len: usize,
+        },
+        /// (59) audiod-only: copy stable [`crate::audio::AudioInfo`] to EL0.
+        AudioInfo { user_info: usize },
+        /// (60) audiod-only: submit one S16LE/48kHz/stereo PCM period.
+        AudioPlay { user_buffer: usize, len: usize },
+        /// (61) audiod-only: stop/release the active PCM stream.
+        AudioStop,
+        /// (62) CAP_DISPLAY: query negotiated VirtIO-GPU 3D/capset contract.
+        Gpu3dInfo { user_info: usize },
+        /// (63) CAP_DISPLAY: create one VirGL context for a negotiated capset.
+        Gpu3dContextCreate { capset_id: u32 },
+        /// (64) CAP_DISPLAY: destroy an empty VirGL context.
+        Gpu3dContextDestroy { ctx_id: u32 },
+        /// (65) CAP_DISPLAY: create a 3D resource from [`crate::gpu::Gpu3dResourceDesc`].
+        Gpu3dResourceCreate { user_desc: usize },
+        /// (66) CAP_DISPLAY: detach/unref a 3D resource.
+        Gpu3dResourceDestroy { resource_id: u32 },
+        /// (67) CAP_DISPLAY: attach a resource to a context.
+        Gpu3dContextAttach { ctx_id: u32, resource_id: u32 },
+        /// (68) CAP_DISPLAY: submit an opaque VirGL dword stream (len multiple of 4).
+        Gpu3dSubmit { ctx_id: u32, user_buffer: usize, len: usize },
+        /// (69) CAP_DISPLAY: transfer rendered B8G8R8X8 resource data back to EL0.
+        Gpu3dReadback { resource_id: u32, user_buffer: usize, len: usize },
+        /// (70) CAP_DISPLAY: copy negotiated capset bytes to EL0.
+        Gpu3dGetCapset { capset_id: u32, version: u32, user_buffer: usize, len: usize },
     }
 
     /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。
@@ -1610,7 +1884,9 @@ mod fuzz_tests {
 
     /// LCG 参数取 Numerical Recipes 常量；u64 溢出即自由截断。
     fn next(state: &mut u64) -> u64 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *state
     }
 

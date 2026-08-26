@@ -65,8 +65,14 @@ impl PhysBitmap {
         total: usize,
         reserved: usize,
     ) {
-        assert!(total <= nwords * 64, "PhysBitmap: total exceeds bitmap capacity");
-        assert!(total <= nrefs, "PhysBitmap: total exceeds refcount capacity");
+        assert!(
+            total <= nwords * 64,
+            "PhysBitmap: total exceeds bitmap capacity"
+        );
+        assert!(
+            total <= nrefs,
+            "PhysBitmap: total exceeds refcount capacity"
+        );
         self.words = words;
         self.nwords = nwords;
         self.refs = refs;
@@ -105,7 +111,9 @@ impl PhysBitmap {
                     continue;
                 }
                 if slot & (1u64 << bit) == 0 {
-                    unsafe { *self.words.add(index) |= 1u64 << bit; }
+                    unsafe {
+                        *self.words.add(index) |= 1u64 << bit;
+                    }
                     self.set_refs(page, 1);
                     self.free -= 1;
                     return Some(self.base + page * PAGE_SIZE);
@@ -191,7 +199,9 @@ impl PhysBitmap {
         );
         let old = self.refs_of(page);
         // u16 上限 65535 份共享；超出即记账 bug，响亮失败。
-        let inc = old.checked_add(1).expect("PhysBitmap::retain_page: refcount overflow");
+        let inc = old
+            .checked_add(1)
+            .expect("PhysBitmap::retain_page: refcount overflow");
         self.set_refs(page, inc);
     }
 
@@ -251,7 +261,9 @@ impl PhysBitmap {
     }
 
     fn set_refs(&mut self, page: usize, value: u16) {
-        unsafe { *self.refs.add(page) = value; }
+        unsafe {
+            *self.refs.add(page) = value;
+        }
     }
 
     /// 查询该物理地址的页是否空闲（测试/诊断用）。
@@ -297,11 +309,15 @@ impl PhysBitmap {
     }
 
     fn set_bit(&self, page: usize) {
-        unsafe { *self.words.add(page / 64) |= 1u64 << (page % 64); }
+        unsafe {
+            *self.words.add(page / 64) |= 1u64 << (page % 64);
+        }
     }
 
     fn clear_bit(&self, page: usize) {
-        unsafe { *self.words.add(page / 64) &= !(1u64 << (page % 64)); }
+        unsafe {
+            *self.words.add(page / 64) &= !(1u64 << (page % 64));
+        }
     }
 
     fn assert_ready(&self) {
@@ -509,8 +525,8 @@ mod tests {
     #[test]
     fn cow_fork_teardown_order_independent() {
         let mut h = Harness::new(64, 4);
-        let page = h.mm.alloc_page().unwrap();      // 父映射，rc=1
-        h.mm.retain_page(page);                     // clone 共享给子，rc=2
+        let page = h.mm.alloc_page().unwrap(); // 父映射，rc=1
+        h.mm.retain_page(page); // clone 共享给子，rc=2
 
         // 子写触发断链：老页引用减一（rc 2→1），页保持 busy 归父所有。
         h.mm.free_page(page);
@@ -566,5 +582,4 @@ mod tests {
         }
         assert_eq!(h.mm.alloc_page(), None);
     }
-
 }

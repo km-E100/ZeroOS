@@ -20,8 +20,28 @@ pub fn create_channel_for(owner: ProcessId, desc: ChannelDesc) -> Result<(), Ipc
 }
 
 pub fn send(caller: ProcessId, chan: u32, msg: &Message) -> Result<(), IpcError> {
-    // 锁纪律：持通道表锁完成入队并取出待唤醒者；释放锁后才触碰调度器。
-    let wake = CHANNEL_TABLE.lock().send(caller, chan, *msg)?;
+    send_inner(caller, None, chan, msg)
+}
+
+/// Targeted delivery: the envelope stays on the shared channel but only `target`
+/// can dequeue it. This fixes response theft between concurrent service clients
+/// without multiplying channel IDs. Existing `send` remains broadcast/first-reader.
+pub fn send_to(
+    caller: ProcessId,
+    target: ProcessId,
+    chan: u32,
+    msg: &Message,
+) -> Result<(), IpcError> {
+    send_inner(caller, Some(target), chan, msg)
+}
+
+fn send_inner(
+    caller: ProcessId,
+    target: Option<ProcessId>,
+    chan: u32,
+    msg: &Message,
+) -> Result<(), IpcError> {
+    let wake = CHANNEL_TABLE.lock().send(caller, target, chan, *msg)?;
     if let Some(pid) = wake {
         crate::scheduler::wake(pid);
     }
@@ -86,7 +106,13 @@ impl ChannelTable {
     /// 通道表 → 就绪队列，绝不反向，也不得持锁进调度器）。
     ///
     /// 访问控制两道闸（第十三刀起）：owner 匹配 + tx 组策略。
-    fn send(&mut self, caller: ProcessId, chan: u32, msg: Message) -> Result<Option<ProcessId>, IpcError> {
+    fn send(
+        &mut self,
+        caller: ProcessId,
+        target: Option<ProcessId>,
+        chan: u32,
+        msg: Message,
+    ) -> Result<Option<ProcessId>, IpcError> {
         let channel = self
             .channels
             .iter_mut()
@@ -94,8 +120,15 @@ impl ChannelTable {
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
         channel.ensure_groups(channel.tx_groups, caller)?;
-        channel.queue.push(Envelope { sender: caller, message: msg }, channel.capacity)?;
-        Ok(channel.pop_waiter())
+        channel.queue.push(
+            Envelope {
+                sender: caller,
+                target: target.unwrap_or(ProcessId::new(0)),
+                message: msg,
+            },
+            channel.capacity,
+        )?;
+        Ok(channel.pop_waiter_for(target))
     }
 
     /// 接收。owner 匹配 + rx 组策略。
@@ -107,7 +140,7 @@ impl ChannelTable {
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
         channel.ensure_groups(channel.rx_groups, caller)?;
-        let env = channel.queue.pop()?;
+        let env = channel.queue.pop_for(caller)?;
         Ok((env.sender, env.message))
     }
 
@@ -122,11 +155,7 @@ impl ChannelTable {
             .ok_or(IpcError::Invalid)?;
         channel.ensure_access(caller)?;
         channel.ensure_groups(channel.rx_groups, caller)?;
-        if channel
-            .waiters
-            .iter()
-            .any(|w| *w == Some(caller))
-        {
+        if channel.waiters.iter().any(|w| *w == Some(caller)) {
             return Ok(()); // 重复登记幂等
         }
         if let Some(slot) = channel.waiters.iter_mut().find(|w| w.is_none()) {
@@ -206,10 +235,16 @@ impl Channel {
     }
 
     /// 取走一个等待者（FIFO）。send 成功后由调用方触发调度器唤醒。
-    fn pop_waiter(&mut self) -> Option<ProcessId> {
+    fn pop_waiter_for(&mut self, target: Option<ProcessId>) -> Option<ProcessId> {
+        if let Some(target) = target {
+            if let Some(w) = self.waiters.iter_mut().find(|w| **w == Some(target)) {
+                return w.take();
+            }
+            return None;
+        }
         for w in self.waiters.iter_mut() {
-            if let Some(pid) = w.take() {
-                return Some(pid);
+            if w.is_some() {
+                return w.take();
             }
         }
         None
@@ -245,12 +280,15 @@ fn group_allows(mask: u32, caller_caps: u32) -> bool {
 #[derive(Copy, Clone)]
 struct Envelope {
     sender: ProcessId,
+    /// pid=0 means broadcast/first eligible reader.
+    target: ProcessId,
     message: Message,
 }
 
 impl Envelope {
     const EMPTY: Self = Self {
         sender: ProcessId::new(0),
+        target: ProcessId::new(0),
         message: Message::empty(),
     };
 }
@@ -290,13 +328,38 @@ impl MessageQueue {
     }
 
     fn pop(&mut self) -> Result<Envelope, IpcError> {
+        self.pop_for(ProcessId::new(0))
+    }
+
+    /// Remove the first broadcast envelope or envelope targeted at `caller`,
+    /// preserving relative order of all other entries. Queue is only 16 deep, so
+    /// the bounded O(n) compaction is simpler and safer than per-client queues.
+    fn pop_for(&mut self, caller: ProcessId) -> Result<Envelope, IpcError> {
         if self.len == 0 {
             return Err(IpcError::Empty);
         }
-        let msg = self.buf[self.head];
-        self.head = (self.head + 1) % MAX_QUEUE;
+        let mut found = None;
+        for off in 0..self.len {
+            let idx = (self.head + off) % MAX_QUEUE;
+            let target = self.buf[idx].target.raw();
+            if target == 0 || (caller.raw() != 0 && target == caller.raw()) {
+                found = Some(off);
+                break;
+            }
+        }
+        let Some(off) = found else {
+            return Err(IpcError::Empty);
+        };
+        let idx = (self.head + off) % MAX_QUEUE;
+        let out = self.buf[idx];
+        for j in off..self.len - 1 {
+            let from = (self.head + j + 1) % MAX_QUEUE;
+            let to = (self.head + j) % MAX_QUEUE;
+            self.buf[to] = self.buf[from];
+        }
+        self.tail = (self.tail + MAX_QUEUE - 1) % MAX_QUEUE;
         self.len -= 1;
-        Ok(msg)
+        Ok(out)
     }
 }
 
@@ -311,7 +374,11 @@ mod tests {
     }
 
     fn env(n: u32) -> Envelope {
-        Envelope { sender: ProcessId::new(11), message: msg(n) }
+        Envelope {
+            sender: ProcessId::new(11),
+            target: ProcessId::new(0),
+            message: msg(n),
+        }
     }
 
     #[test]
@@ -330,6 +397,20 @@ mod tests {
             assert_eq!(q.pop().unwrap().message.code, n);
         }
         assert!(matches!(q.pop(), Err(IpcError::Empty)));
+    }
+
+    #[test]
+    fn targeted_envelopes_cannot_be_stolen() {
+        let mut q = MessageQueue::new();
+        let mut a = env(1);
+        a.target = ProcessId::new(7);
+        let mut b = env(2);
+        b.target = ProcessId::new(8);
+        q.push(a, MAX_QUEUE).unwrap();
+        q.push(b, MAX_QUEUE).unwrap();
+        assert_eq!(q.pop_for(ProcessId::new(8)).unwrap().message.code, 2);
+        assert!(matches!(q.pop_for(ProcessId::new(8)), Err(IpcError::Empty)));
+        assert_eq!(q.pop_for(ProcessId::new(7)).unwrap().message.code, 1);
     }
 
     #[test]
@@ -395,10 +476,7 @@ mod tests {
         assert!(group_allows(0, CAP_SECURE_IPC));
         // 非空掩码：任一命中位放行
         assert!(group_allows(CAP_SECURE_IPC, CAP_SECURE_IPC));
-        assert!(group_allows(
-            CAP_SECURE_IPC | CAP_SPAWN_SVC,
-            CAP_SECURE_IPC
-        ));
+        assert!(group_allows(CAP_SECURE_IPC | CAP_SPAWN_SVC, CAP_SECURE_IPC));
         assert!(group_allows(CAP_SECURE_IPC | CAP_SPAWN_SVC, CAP_SPAWN_SVC));
         // 无交集拒绝
         assert!(!group_allows(CAP_SECURE_IPC, 0));
@@ -438,7 +516,10 @@ mod tests {
         // 允许：持组位发送
         assert!(send(ALICE, CH, &msg(1)).is_ok());
         // 拒绝：无组位 → PolicyDenied（与 owner 型 AccessDenied 区分）
-        assert!(matches!(send(BOB, CH, &msg(2)), Err(IpcError::PolicyDenied)));
+        assert!(matches!(
+            send(BOB, CH, &msg(2)),
+            Err(IpcError::PolicyDenied)
+        ));
         // 对照：全通通道对无任何能力的进程也放行（向后兼容）
         assert!(send(BOB, OPEN_CH, &msg(3)).is_ok());
         assert!(receive(BOB, OPEN_CH).is_ok());
@@ -452,10 +533,7 @@ mod tests {
         set_caps(BOB, 0);
         send(ALICE, CH, &msg(7)).unwrap();
         // 无组接收者被拒且消息不被消费
-        assert!(matches!(
-            receive(BOB, CH),
-            Err(IpcError::PolicyDenied)
-        ));
+        assert!(matches!(receive(BOB, CH), Err(IpcError::PolicyDenied)));
         // 持组接收者取到消息
         assert_eq!(receive(ALICE, CH).unwrap().1.code, 7);
         // 阻塞等待登记同样受 rx 组约束
@@ -471,13 +549,19 @@ mod tests {
         let _serial = TEST_SERIAL.lock();
         setup_protected_channels();
         set_caps(BOB, 0);
-        assert!(matches!(send(BOB, CH, &msg(1)), Err(IpcError::PolicyDenied)));
+        assert!(matches!(
+            send(BOB, CH, &msg(1)),
+            Err(IpcError::PolicyDenied)
+        ));
         // securityd 动态签发后（测试直接钉住有效能力，等价于授予生效）
         set_caps(BOB, CAP_SECURE_IPC);
         assert!(send(BOB, CH, &msg(2)).is_ok());
         // revoke 后再拒
         set_caps(BOB, 0);
-        assert!(matches!(send(BOB, CH, &msg(3)), Err(IpcError::PolicyDenied)));
+        assert!(matches!(
+            send(BOB, CH, &msg(3)),
+            Err(IpcError::PolicyDenied)
+        ));
     }
 
     #[test]
@@ -486,11 +570,7 @@ mod tests {
         // owner 型拒绝（create_channel_for 指定属主）保持 AccessDenied；
         // 组策略拒绝是 PolicyDenied——两条路径可精确区分。
         CHANNEL_TABLE.lock().reset();
-        create_channel_for(
-            ALICE,
-            ChannelDesc::open(0x272, 4),
-        )
-        .unwrap();
+        create_channel_for(ALICE, ChannelDesc::open(0x272, 4)).unwrap();
         set_caps(BOB, CAP_SECURE_IPC);
         // BOB 虽有组位，但不是通道属主 → owner 闸先拦
         assert!(matches!(

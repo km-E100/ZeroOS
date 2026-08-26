@@ -34,16 +34,28 @@ fn ensure_paging_ready() {
 
 pub fn init_early(memory_bytes: usize, reserved_bytes: usize) {
     MEMORY_BYTES.store(memory_bytes, Ordering::SeqCst);
-    paging::configure_identity_map(
-        0,
-        core::cmp::max(memory_bytes, MIN_IDENTITY_BYTES) as u64,
-    );
+    paging::configure_identity_map(0, core::cmp::max(memory_bytes, MIN_IDENTITY_BYTES) as u64);
     phys::init(memory_bytes, reserved_bytes);
     // Do NOT activate our own page tables here; keep using firmware's mapping.
     // Only bring up the heap so early drivers can allocate safely.
     unsafe {
         heap::init_heap(memory_bytes);
     }
+}
+
+pub fn init_relocated(memory_bytes: usize, legacy_reserved_bytes: usize, kernel_start: usize, kernel_end: usize) {
+    MEMORY_BYTES.store(memory_bytes, Ordering::SeqCst);
+    crate::info!(
+        "mm::init: phys init memory=0x{:x} kernel=[0x{:x},0x{:x})",
+        memory_bytes, kernel_start, kernel_end
+    );
+    paging::configure_identity_map(0, core::cmp::max(memory_bytes, MIN_IDENTITY_BYTES) as u64);
+    phys::init_with_kernel_range(memory_bytes, legacy_reserved_bytes, kernel_start, kernel_end);
+    crate::info!("mm::init: paging setup");
+    ensure_paging_ready();
+    crate::info!("mm::init: heap init");
+    unsafe { heap::init_heap(memory_bytes); }
+    crate::info!("mm::init: complete (RAM=0x{:x} free_pages={})", memory_bytes, phys::free_pages());
 }
 
 pub fn init(memory_bytes: usize, reserved_bytes: usize) {
@@ -53,10 +65,7 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
         memory_bytes,
         reserved_bytes
     );
-    paging::configure_identity_map(
-        0,
-        core::cmp::max(memory_bytes, MIN_IDENTITY_BYTES) as u64,
-    );
+    paging::configure_identity_map(0, core::cmp::max(memory_bytes, MIN_IDENTITY_BYTES) as u64);
     phys::init(memory_bytes, reserved_bytes);
     crate::info!("mm::init: paging setup");
     ensure_paging_ready();

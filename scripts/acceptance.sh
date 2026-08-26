@@ -41,7 +41,7 @@ if [[ ! -f "$ISO" ]]; then
   exit 1
 fi
 
-# 测试盘存在则复用：fstest 跨重启持久化、blktest 尾段写入都依赖历史数据。
+# 测试盘存在则复用：fstest 验证跨重启持久化；blktest 使用 ZFS 明确保留的最后 4KiB 诊断块。
 if [[ ! -f "$DISK" ]]; then
   echo "acceptance: 创建测试盘 $DISK (32MiB raw)"
   dd if=/dev/zero of="$DISK" bs=1m count=32

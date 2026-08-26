@@ -66,6 +66,10 @@ impl DirectoryIndex {
         }
     }
 
+    pub fn as_map(&self) -> &BTreeMap<String, DirectoryEntry> {
+        &self.entries
+    }
+
     pub fn snapshot(&self) -> BTreeMap<String, DirectoryEntry> {
         self.entries.clone()
     }

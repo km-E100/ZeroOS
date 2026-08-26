@@ -23,20 +23,20 @@
 use core::panic::PanicInfo;
 use useralloc::StaticFreeList;
 use userlib::{
-    cause_segv, console_read, console_write, create_channel, encode_message,
-    exec, exit, extract_payload_text, get_session, session_begin, session_list, wait_pid,
-    wait_pid_flags, WAIT_NOHANG,
+    cause_segv, console_read, console_write, create_channel, encode_message, exec, exit,
+    extract_payload_text, get_session, session_begin, session_list, wait_pid, wait_pid_flags,
+    WAIT_NOHANG,
 };
-use zero_abi::channels::{FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP, SECURITY_USER_REQ, SECURITY_USER_RESP};
+use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_SECURE_IPC, CAP_SESSION};
+use zero_abi::channels::{
+    FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP, SECURITY_USER_REQ, SECURITY_USER_RESP,
+};
 use zero_abi::ipc::{ChannelDesc, Message};
 use zero_abi::protocol::fs as fs_proto;
 use zero_abi::protocol::fs::vtable as fs_vt;
 use zero_abi::protocol::launchd::{CMD_LIST_SERVICES, CMD_RESTART_SERVICE, CMD_STATUS};
-use zero_abi::protocol::security::{
-    self as sec_proto, parse_token, CapIssueRequest,
-};
+use zero_abi::protocol::security::{self as sec_proto, parse_token, CapIssueRequest};
 use zero_abi::syscall::SysError;
-use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_SECURE_IPC, CAP_SESSION};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -560,7 +560,9 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
                             }
                         }
                         if pass {
-                            println("[P] waitspec: PASS (two precise collects, out-of-order exits)");
+                            println(
+                                "[P] waitspec: PASS (two precise collects, out-of-order exits)",
+                            );
                         } else {
                             println("[P] waitspec: FAIL (misdelivered or wrong-code collect)");
                         }
@@ -1238,31 +1240,38 @@ fn print_fs_fail(step: &str, code: u32) {
 /// 逐字节比对 → 打印 PASS / MISMATCH。每一步失败都友好打印后返回，
 /// 绝不 panic（panic_handler 只是最后防线）。
 ///
-/// 选址纪律：默认 LBA 60000。测试盘 32MiB = 65536 扇区，尾段 5500+ 扇区
-/// 是天然安全带；而低地址区域住着内核自检(@2048)、userdb(@4096)、fsd
-/// 超级块(@8192)与数据区(@16384 起)。`blktest <lba>` 允许指定其他扇区，
-/// 但低于 40000 的一律拒绝执行——raw 写入毁掉 fsd 卷可就不好玩了。
+/// 选址纪律（第32刀 ZFS 默认化后更新）：ZFS 使用整块设备，不再存在
+/// “卷外尾段”。zfsd 永久保留最后一个 4KiB 逻辑块给 raw diagnostics；
+/// 本命令经 BlockCapacity 动态算出该块首 LBA，显式参数也只能落在同一
+/// 保留块内。这样 raw 回环测试不可能覆盖 live ZFS metadata/data。
 fn blktest_command(cmd: &[u8]) {
     const SECTOR: usize = 512;
-    /// fsd 卷保留区安全上界（《编译打包命令.txt》LBA 保留地图 + 裕量）。
-    const MIN_SAFE_LBA: u64 = 40_000;
-    /// 默认扇区：32MiB 测试盘尾段安全带。
-    const DEFAULT_LBA: u64 = 60_000;
+    const SECTORS_PER_ZFS_BLOCK: u64 = 4096 / 512;
 
-    // ---- 参数解析：blktest [lba]（十进制）----
+    // Knife32 made ZFS consume the whole device, so the historical hard-coded
+    // LBA 60000 is no longer a safe "outside the fsd volume" location. zfsd
+    // now reserves the final 4KiB logical block exclusively for this raw test.
+    let capacity = match userlib::block_capacity_sectors() {
+        Ok(v) if v >= SECTORS_PER_ZFS_BLOCK * 2 => v,
+        _ => { println("blktest: cannot determine a usable block-device capacity"); return; }
+    };
+    let diagnostic_lba = ((capacity / SECTORS_PER_ZFS_BLOCK) - 1) * SECTORS_PER_ZFS_BLOCK;
+
+    // Developer override is constrained to the same reserved 4KiB block. This
+    // keeps the diagnostic useful without allowing an interactive shell command
+    // to silently corrupt the live ZFS namespace.
     let lba = if cmd == b"blktest" {
-        DEFAULT_LBA
+        diagnostic_lba
     } else {
         match parse_u64(&cmd[8..]) {
-            Some(v) if v >= MIN_SAFE_LBA => v,
+            Some(v) if v >= diagnostic_lba && v < diagnostic_lba + SECTORS_PER_ZFS_BLOCK => v,
             Some(_) => {
-                println("blktest: refused: LBA < 40000 overlaps the fsd volume region");
+                print("blktest: refused: only reserved diagnostic LBA ");
+                print_u64(diagnostic_lba);
+                print(".."); print_u64(diagnostic_lba + SECTORS_PER_ZFS_BLOCK - 1); println(" is writable");
                 return;
             }
-            None => {
-                println("usage: blktest [lba]   (decimal; default 60000; must be >= 40000)");
-                return;
-            }
+            None => { println("usage: blktest [lba-within-final-reserved-4KiB-block]"); return; }
         }
     };
 
@@ -1505,7 +1514,11 @@ fn path_request(code: u32, path: &[u8], extra: Option<u8>) -> Message {
 /// ls —— 列目录。`ls` 列根，`ls <dir>` 列子目录；子目录条目自带尾 '/'。
 fn ls_command(cmd: &[u8]) {
     let arg = cmd_arg(cmd);
-    let dir: &[u8] = if arg.starts_with(b"/") { &arg[1..] } else { arg };
+    let dir: &[u8] = if arg.starts_with(b"/") {
+        &arg[1..]
+    } else {
+        arg
+    };
     // 嵌套路径直接透传 fsd（空段/点段的权威拒绝在服务端）。
     let request = path_request(fs_vt::CMD_LIST, dir, None);
     print("fs> ");
@@ -1542,7 +1555,11 @@ fn cat_command(cmd: &[u8]) {
         println("usage: cat <path>");
         return;
     }
-    let path: &[u8] = if raw.starts_with(b"/") { &raw[1..] } else { raw };
+    let path: &[u8] = if raw.starts_with(b"/") {
+        &raw[1..]
+    } else {
+        raw
+    };
     // open existing
     let request = path_request(fs_vt::CMD_OPEN, path, None);
     let Some(response) = fs_exchange(&request) else {
@@ -1569,7 +1586,11 @@ fn cat_command(cmd: &[u8]) {
             let _ = send_close(fd);
             return;
         }
-        let end = response.payload.iter().position(|&b| b == 0).unwrap_or(response.payload.len());
+        let end = response
+            .payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(response.payload.len());
         if end == 0 {
             break; // EOF（0 字节回包）
         }
@@ -1591,7 +1612,11 @@ fn mkdir_command(cmd: &[u8]) {
         println("usage: mkdir <path>");
         return;
     }
-    let path: &[u8] = if raw.starts_with(b"/") { &raw[1..] } else { raw };
+    let path: &[u8] = if raw.starts_with(b"/") {
+        &raw[1..]
+    } else {
+        raw
+    };
     let request = path_request(fs_vt::CMD_MKDIR, path, None);
     let Some(response) = fs_exchange(&request) else {
         return;
@@ -1689,11 +1714,7 @@ fn fsdemo_command() {
         Some(r) => r,
         None => return,
     };
-    let text_ok = response.code == 0
-        && response
-            .payload
-            .windows(8)
-            .any(|w| w == b"note.txt");
+    let text_ok = response.code == 0 && response.payload.windows(8).any(|w| w == b"note.txt");
     if !text_ok {
         print_fs_fail("[4/9] ls zfdemo", response.code);
         return;
@@ -1709,7 +1730,11 @@ fn fsdemo_command() {
         print_fs_fail("[5/9] mkdir zfdemo/sub", response.code);
         return;
     }
-    let response = match fs_exchange(&path_request(fs_vt::CMD_OPEN, BFILE, Some(fs_vt::OPEN_CREATE))) {
+    let response = match fs_exchange(&path_request(
+        fs_vt::CMD_OPEN,
+        BFILE,
+        Some(fs_vt::OPEN_CREATE),
+    )) {
         Some(r) => r,
         None => return,
     };
@@ -1746,7 +1771,10 @@ fn fsdemo_command() {
     println("[6/9] rmdir non-empty zfdemo/sub: correctly denied");
 
     // [7] unlink 两文件
-    for (path, step) in [(NOTE, "[7/9] unlink note.txt"), (BFILE, "[7/9] unlink sub/b.txt")] {
+    for (path, step) in [
+        (NOTE, "[7/9] unlink note.txt"),
+        (BFILE, "[7/9] unlink sub/b.txt"),
+    ] {
         let response = match fs_exchange(&path_request(fs_vt::CMD_UNLINK, path, None)) {
             Some(r) => r,
             None => return,
@@ -1759,10 +1787,7 @@ fn fsdemo_command() {
     println("[7/9] unlink note.txt + sub/b.txt: ok");
 
     // [8] rmdir 空 sub → 成功；再 rmdir zfdemo → 成功
-    for (path, step) in [
-        (SUB, "[8/9] rmdir zfdemo/sub"),
-        (DIR, "[8/9] rmdir zfdemo"),
-    ] {
+    for (path, step) in [(SUB, "[8/9] rmdir zfdemo/sub"), (DIR, "[8/9] rmdir zfdemo")] {
         let response = match fs_exchange(&path_request(fs_vt::CMD_RMDIR, path, None)) {
             Some(r) => r,
             None => return,
@@ -1865,7 +1890,10 @@ fn login_flow(mode: &str) {
     }
     payload[..user.len()].copy_from_slice(user);
     payload[user.len() + 1..user.len() + 1 + password.len()].copy_from_slice(password);
-    let Some(resp) = sec_exchange(sec_proto::CMD_USER_VERIFY, &payload[..user.len() + password.len() + 2]) else {
+    let Some(resp) = sec_exchange(
+        sec_proto::CMD_USER_VERIFY,
+        &payload[..user.len() + password.len() + 2],
+    ) else {
         return;
     };
     if resp.code != 0 {
@@ -2213,9 +2241,8 @@ extern "C" fn mutextest_entry(seq: usize) -> ! {
     for _ in 0..MUTEX_ITERS {
         MUTEX_COUNT.lock();
         unsafe {
-            core::ptr::addr_of_mut!(MUTEX_COUNTER).write_volatile(
-                core::ptr::addr_of!(MUTEX_COUNTER).read_volatile() + 1,
-            );
+            core::ptr::addr_of_mut!(MUTEX_COUNTER)
+                .write_volatile(core::ptr::addr_of!(MUTEX_COUNTER).read_volatile() + 1);
         }
         MUTEX_COUNT.unlock();
     }
@@ -2251,7 +2278,9 @@ fn mutextest_command() {
     let mut tids = [0u64; 3];
     for seq in 0..3usize {
         let stack_top = (old + (seq + 1) * 32768 + 0xfff) & !0xfff;
-        match unsafe { userlib::create_thread(mutextest_entry as *const () as usize, stack_top, 0, seq) } {
+        match unsafe {
+            userlib::create_thread(mutextest_entry as *const () as usize, stack_top, 0, seq)
+        } {
             Ok(t) => tids[seq] = t,
             Err(e) => {
                 print("[P] create_thread failed: ");
@@ -2305,8 +2334,16 @@ fn mutextest_command() {
 fn pkg_command(cmd: &[u8]) {
     let arg = cmd_arg(cmd);
     if arg == b"ls" || arg.starts_with(b"ls ") {
-        let dir = if arg.len() > 2 { &arg[3..] } else { b"/Applications" };
-        let dir = if dir.starts_with(b"/") { &dir[1..] } else { dir };
+        let dir = if arg.len() > 2 {
+            &arg[3..]
+        } else {
+            b"/Applications"
+        };
+        let dir = if dir.starts_with(b"/") {
+            &dir[1..]
+        } else {
+            dir
+        };
         let request = path_request(fs_vt::CMD_LIST, dir, None);
         print("pkg> ");
         let Some(response) = fs_exchange(&request) else {

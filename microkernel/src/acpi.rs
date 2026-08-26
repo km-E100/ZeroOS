@@ -1,46 +1,87 @@
-//! ACPI 静态表解析（第十八刀立项 · docs/acpi_static_plan.md WS-C）。
+//! ACPI 静态平台描述。
 //!
-//! 范围：RSDP → XSDT → MADT（GICC 核列表 / GICD 基址）。**AML 不做**。
-//! 恒等映射下 VA==PA，表可直接按物理地址读取；checksum 校验失败或
-//! 结构异常一律返回空结果——调用方（smp/gic/timer）回退硬编码路径，
-//! 不存在"坏表打穿启动"的路径。
-//!
-//! 数据源：bootloader 在 ExitBootServices 前补丁的 `__zero_rsdp_phys`
-//! （0 = 无 ACPI）。
+//! 第十八刀已经打通 RSDP → XSDT → MADT CPU 枚举；第20刀把静态表
+//! 真正变成平台驱动的数据源：MADT(GIC)、GTDT(timer)、FADT(PSCI conduit)
+//! 与 MCFG(PCI ECAM)。AML 仍明确不做。任何坏表都 fail-open 到 QEMU virt
+//! 的 legacy 常量，绝不因为固件描述异常击穿启动。
 
-use alloc::vec::Vec;
 #[cfg(test)]
 use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-// bootloader 补丁的 RSDP 物理地址（0 = 不可用）。槽位本体定义于
-// boot/boot.S（.rodata.boot，与 __zero_memory_bytes 同款模式）。
 extern "C" {
+    /// bootloader 在 ExitBootServices 前从 UEFI config table 捕获并补丁。
     static __zero_rsdp_phys: u64;
 }
+
+const MAX_TABLE_LEN: usize = 1024 * 1024;
+const SDT_HEADER_LEN: usize = 36;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MadtCpu {
     pub mpidr: u64,
     pub uid: u32,
     pub enabled: bool,
+    /// GICv2 CPU interface MMIO base（0 = MADT 未提供/系统使用 sysreg interface）。
+    pub gicc_base: u64,
+    /// GIC redistributor base（GICv3；0 = 未提供）。
+    pub gicr_base: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EcamSegment {
+    pub base: u64,
+    pub segment: u16,
+    pub start_bus: u8,
+    pub end_bus: u8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PsciConduit {
+    /// FADT 没有有效 ARM boot flags，保留 Zero OS 历史/QEMU 默认 HVC。
+    LegacyHvc = 0,
+    Hvc = 1,
+    Smc = 2,
+}
+
+#[derive(Default, Debug)]
+struct ParsedTables {
+    cpus: Vec<MadtCpu>,
+    gicd: u64,
+    gicc: u64,
+    gicr: u64,
+    timer_irq: u32,
+    timer_flags: u32,
+    psci_conduit: u8,
+    ecam: Vec<EcamSegment>,
 }
 
 static CPUS: spin::Mutex<Vec<MadtCpu>> = spin::Mutex::new(Vec::new());
-static GICD_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static PARSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static ECAM: spin::Mutex<Vec<EcamSegment>> = spin::Mutex::new(Vec::new());
+static GICD_BASE: AtomicU64 = AtomicU64::new(0);
+static GICC_BASE: AtomicU64 = AtomicU64::new(0);
+static GICR_BASE: AtomicU64 = AtomicU64::new(0);
+static TIMER_IRQ: AtomicU32 = AtomicU32::new(0);
+static TIMER_FLAGS: AtomicU32 = AtomicU32::new(0);
+static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PsciConduit::LegacyHvc as u8);
+static PARSED: AtomicBool = AtomicBool::new(false);
 
+#[inline]
 fn rd8(base: u64, off: usize) -> u8 {
     unsafe { ((base + off as u64) as *const u8).read_volatile() }
 }
+
+#[inline]
 fn rd32(base: u64, off: usize) -> u32 {
-    // ACPI 字段是 packed byte stream，不保证 u32/u64 自然对齐。逐字节
-    // volatile 读取再按 little-endian 组装，避免 read_volatile 的对齐 UB。
     let mut bytes = [0u8; 4];
     for (i, byte) in bytes.iter_mut().enumerate() {
         *byte = rd8(base, off + i);
     }
     u32::from_le_bytes(bytes)
 }
+
+#[inline]
 fn rd64(base: u64, off: usize) -> u64 {
     let mut bytes = [0u8; 8];
     for (i, byte) in bytes.iter_mut().enumerate() {
@@ -49,147 +90,253 @@ fn rd64(base: u64, off: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// RSDP 校验：签名 "RSD PTR "、rev>=2、第一段校验和（前 20 字节）
-/// 与扩展校验和（全长）均为 0。
+#[cfg(test)]
+fn checksum_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) == 0
+}
+
 fn rsdp_valid(rsdp: u64) -> bool {
-    const SIG: [u8; 8] = *b"RSD PTR ";
-    for (i, b) in SIG.iter().enumerate() {
-        if rd8(rsdp, i) != *b {
-            return false;
-        }
-    }
-    let len = rd32(rsdp, 20) as usize; // XSDT 版长度字段位于 +20
-    if len < 36 || len > 1024 * 1024 {
+    if (0..8).any(|i| rd8(rsdp, i) != b"RSD PTR "[i]) {
         return false;
     }
-    let mut sum = 0u8;
-    for i in 0..20 {
-        sum = sum.wrapping_add(rd8(rsdp, i));
-    }
-    if sum != 0 {
+    // ACPI 1.0 checksum is always required; XSDT requires revision >= 2 + extended checksum.
+    let legacy_sum = (0..20).fold(0u8, |sum, i| sum.wrapping_add(rd8(rsdp, i)));
+    if legacy_sum != 0 || rd8(rsdp, 15) < 2 {
         return false;
     }
-    let mut sum2 = 0u8;
-    for i in 0..len {
-        sum2 = sum2.wrapping_add(rd8(rsdp, i));
+    let len = rd32(rsdp, 20) as usize;
+    if !(36..=MAX_TABLE_LEN).contains(&len) {
+        return false;
     }
-    sum2 == 0
+    (0..len).fold(0u8, |sum, i| sum.wrapping_add(rd8(rsdp, i))) == 0
 }
 
-/// SDT 头校验：sig(4)+len(4)+summing 全 0。
-fn sdt_valid(sdt: u64, sig: &[u8; 4]) -> bool {
-    for (i, b) in sig.iter().enumerate() {
-        if rd8(sdt, i) != *b {
-            return false;
-        }
+fn sdt_header(base: u64) -> Option<([u8; 4], usize)> {
+    let sig = [rd8(base, 0), rd8(base, 1), rd8(base, 2), rd8(base, 3)];
+    let len = rd32(base, 4) as usize;
+    if !(SDT_HEADER_LEN..=MAX_TABLE_LEN).contains(&len) {
+        return None;
     }
-    let len = rd32(sdt, 4) as usize;
-    if len < 36 || len > 1024 * 1024 {
-        return false;
-    }
-    let mut sum = 0u8;
-    for i in 0..len {
-        sum = sum2_wrap(sum, rd8(sdt, i));
-    }
-    sum == 0
-}
-fn sum2_wrap(a: u8, b: u8) -> u8 {
-    a.wrapping_add(b)
+    let sum = (0..len).fold(0u8, |sum, i| sum.wrapping_add(rd8(base, i)));
+    (sum == 0).then_some((sig, len))
 }
 
-/// 纯函数：从 MADT 条目流解析 GICC 核列表与 GICD 基址。
-/// `body_off` 为条目区起始（MADT=44）。截断/未知类型跳过不报错。
-fn parse_madt_entries(
-    bytes: &[u8],
-    body_off: usize,
-) -> (Vec<MadtCpu>, Option<u64>) {
+#[inline]
+fn le16(bytes: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(off..off + 2)?.try_into().ok()?,
+    ))
+}
+#[inline]
+fn le32(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
+}
+#[inline]
+fn le64(bytes: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(off..off + 8)?.try_into().ok()?,
+    ))
+}
+
+/// MADT ARM Generic Interrupt entries（types 11/12/14）。
+fn parse_madt_entries(bytes: &[u8], body_off: usize) -> (Vec<MadtCpu>, Option<u64>, Option<u64>) {
     let mut cpus = Vec::new();
-    let mut gicd: Option<u64> = None;
+    let mut gicd = None;
+    let mut redistributor = None;
     let mut off = body_off;
     while off + 2 <= bytes.len() {
         let etype = bytes[off];
         let elen = bytes[off + 1] as usize;
-        if elen < 2 || off + elen > bytes.len() {
+        if elen < 2
+            || off
+                .checked_add(elen)
+                .filter(|e| *e <= bytes.len())
+                .is_none()
+        {
             break;
         }
         match etype {
+            // Generic Interrupt CPU Interface (ACPI 5+), minimum through MPIDR.
             11 if elen >= 76 => {
-                // GICC（ACPI v5+）：MPIDR@+68，Flags@+12，UID@+8
-                let rd32le = |o: usize| {
-                    u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap_or([0; 4]))
-                };
-                let rd64le = |o: usize| {
-                    u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap_or([0; 8]))
-                };
-                let flags = rd32le(off + 12);
+                let flags = le32(bytes, off + 12).unwrap_or(0);
                 cpus.push(MadtCpu {
-                    mpidr: rd64le(off + 68),
-                    uid: rd32le(off + 8),
+                    uid: le32(bytes, off + 8).unwrap_or(0),
                     enabled: flags & 1 != 0,
+                    gicc_base: le64(bytes, off + 32).unwrap_or(0),
+                    gicr_base: le64(bytes, off + 60).unwrap_or(0),
+                    mpidr: le64(bytes, off + 68).unwrap_or(0),
                 });
             }
-            12 if elen >= 16 => {
-                gicd.get_or_insert_with(|| {
-                    u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap_or([0; 8]))
-                });
+            // Generic Interrupt Distributor.
+            12 if elen >= 20 => {
+                gicd.get_or_insert(le64(bytes, off + 8).unwrap_or(0));
+            }
+            // Generic Interrupt Redistributor discovery range.
+            14 if elen >= 16 => {
+                redistributor.get_or_insert(le64(bytes, off + 4).unwrap_or(0));
             }
             _ => {}
         }
         off += elen;
     }
-    (cpus, gicd)
+    (
+        cpus,
+        gicd.filter(|v| *v != 0),
+        redistributor.filter(|v| *v != 0),
+    )
 }
 
-/// 引导期一次性解析（幂等）。失败静默留空——调用方回退 legacy 探测。
+/// GTDT: Non-Secure EL1 physical timer GSIV/flags are +56/+60 from table base.
+fn parse_gtdt(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 64 {
+        return None;
+    }
+    let irq = le32(bytes, 56)?;
+    let flags = le32(bytes, 60)?;
+    // Architectural interrupt IDs are 16-bit; 0/1023 are not useful timer inputs.
+    (irq > 0 && irq < 1020).then_some((irq, flags))
+}
+
+/// FADT ARM Boot Architecture Flags at byte offset 129 (ACPI 5.1+).
+/// bit0 PSCI_COMPLIANT, bit1 PSCI_USE_HVC.
+fn parse_fadt_psci(bytes: &[u8]) -> PsciConduit {
+    let Some(flags) = le16(bytes, 129) else {
+        return PsciConduit::LegacyHvc;
+    };
+    if flags & 1 == 0 {
+        PsciConduit::LegacyHvc
+    } else if flags & 2 != 0 {
+        PsciConduit::Hvc
+    } else {
+        PsciConduit::Smc
+    }
+}
+
+/// MCFG: header(36) + reserved(8), then 16-byte allocation structures.
+fn parse_mcfg(bytes: &[u8]) -> Vec<EcamSegment> {
+    let mut out = Vec::new();
+    if bytes.len() < 44 {
+        return out;
+    }
+    let mut off = 44usize;
+    while off + 16 <= bytes.len() {
+        let Some(base) = le64(bytes, off) else { break };
+        let Some(segment) = le16(bytes, off + 8) else {
+            break;
+        };
+        let start_bus = bytes[off + 10];
+        let end_bus = bytes[off + 11];
+        if base != 0 && start_bus <= end_bus {
+            out.push(EcamSegment {
+                base,
+                segment,
+                start_bus,
+                end_bus,
+            });
+        }
+        off += 16;
+    }
+    out
+}
+
+fn parse_table_bytes(sig: [u8; 4], bytes: &[u8], parsed: &mut ParsedTables) {
+    match &sig {
+        b"APIC" if bytes.len() >= 44 => {
+            let (cpus, gicd, gicr) = parse_madt_entries(bytes, 44);
+            parsed.cpus.extend(cpus);
+            if parsed.gicd == 0 {
+                parsed.gicd = gicd.unwrap_or(0);
+            }
+            if parsed.gicr == 0 {
+                parsed.gicr = gicr.unwrap_or(0);
+            }
+            if parsed.gicc == 0 {
+                parsed.gicc = parsed
+                    .cpus
+                    .iter()
+                    .find_map(|c| (c.gicc_base != 0).then_some(c.gicc_base))
+                    .unwrap_or(0);
+            }
+            if parsed.gicr == 0 {
+                parsed.gicr = parsed
+                    .cpus
+                    .iter()
+                    .find_map(|c| (c.gicr_base != 0).then_some(c.gicr_base))
+                    .unwrap_or(0);
+            }
+        }
+        b"GTDT" => {
+            if let Some((irq, flags)) = parse_gtdt(bytes) {
+                parsed.timer_irq = irq;
+                parsed.timer_flags = flags;
+            }
+        }
+        b"FACP" => parsed.psci_conduit = parse_fadt_psci(bytes) as u8,
+        b"MCFG" => parsed.ecam.extend(parse_mcfg(bytes)),
+        _ => {}
+    }
+}
+
+/// 引导期一次性解析。此函数必须在 MM/恒等映射完成后、GIC/timer 平台初始化前调用。
 pub fn init() {
     if PARSED.swap(true, Ordering::SeqCst) {
         return;
     }
     let rsdp = unsafe { core::ptr::addr_of!(__zero_rsdp_phys).read_volatile() };
     if rsdp == 0 || !rsdp_valid(rsdp) {
-        crate::info!("acpi: RSDP absent/invalid; legacy probe stays");
+        crate::info!("acpi: RSDP absent/invalid; legacy platform defaults stay");
         return;
     }
     let xsdt = rd64(rsdp, 24);
-    if xsdt == 0 || !sdt_valid(xsdt, b"XSDT") {
-        crate::info!("acpi: XSDT invalid; legacy probe stays");
+    let Some((sig, xsdt_len)) = (xsdt != 0).then(|| sdt_header(xsdt)).flatten() else {
+        crate::info!("acpi: XSDT invalid; legacy platform defaults stay");
+        return;
+    };
+    if &sig != b"XSDT" || (xsdt_len - SDT_HEADER_LEN) % 8 != 0 {
+        crate::info!("acpi: XSDT malformed; legacy platform defaults stay");
         return;
     }
-    let xsdt_len = rd32(xsdt, 4) as usize;
-    let entries = (xsdt_len - 36) / 8;
 
-    let mut cpus: Vec<MadtCpu> = Vec::new();
-    let mut gicd: u64 = 0;
-    for e in 0..entries {
-        let table = rd64(xsdt, 36 + e * 8);
-        if table == 0 || !sdt_valid(table, b"APIC") {
+    let mut parsed = ParsedTables {
+        psci_conduit: PsciConduit::LegacyHvc as u8,
+        ..ParsedTables::default()
+    };
+    let entries = (xsdt_len - SDT_HEADER_LEN) / 8;
+    for i in 0..entries {
+        let table = rd64(xsdt, SDT_HEADER_LEN + i * 8);
+        let Some((table_sig, len)) = (table != 0).then(|| sdt_header(table)).flatten() else {
             continue;
-        }
-        let tlen = rd32(table, 4) as usize;
-        if tlen > 1024 * 1024 {
-            break;
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(table as *const u8, tlen) };
-        let (found_cpus, found_gicd) = parse_madt_entries(bytes, 44);
-        cpus.extend(found_cpus);
-        if gicd == 0 {
-            gicd = found_gicd.unwrap_or(0);
-        }
-        crate::info!("acpi: APIC table parsed at {:#x}", table);
-        break; // 只取第一个 APIC 表
+        };
+        let bytes = unsafe { core::slice::from_raw_parts(table as *const u8, len) };
+        parse_table_bytes(table_sig, bytes, &mut parsed);
     }
 
-    let n = cpus.len();
-    *CPUS.lock() = cpus;
-    GICD_BASE.store(gicd, Ordering::SeqCst);
+    parsed.cpus.sort_by_key(|c| (c.mpidr, c.uid));
+    parsed.cpus.dedup_by_key(|c| (c.mpidr, c.uid));
+    let cpu_count = parsed.cpus.iter().filter(|c| c.enabled).count();
+    let ecam_count = parsed.ecam.len();
+    *CPUS.lock() = parsed.cpus;
+    *ECAM.lock() = parsed.ecam;
+    GICD_BASE.store(parsed.gicd, Ordering::SeqCst);
+    GICC_BASE.store(parsed.gicc, Ordering::SeqCst);
+    GICR_BASE.store(parsed.gicr, Ordering::SeqCst);
+    TIMER_IRQ.store(parsed.timer_irq, Ordering::SeqCst);
+    TIMER_FLAGS.store(parsed.timer_flags, Ordering::SeqCst);
+    PSCI_CONDUIT.store(parsed.psci_conduit, Ordering::SeqCst);
     crate::info!(
-        "acpi: MADT cpus={} gicd={:#x}",
-        n,
-        GICD_BASE.load(Ordering::SeqCst)
+        "acpi: cpus={} gicd={:#x} gicc={:#x} gicr={:#x} timer_irq={} psci={:?} ecam_segments={}",
+        cpu_count,
+        parsed.gicd,
+        parsed.gicc,
+        parsed.gicr,
+        parsed.timer_irq,
+        psci_conduit(),
+        ecam_count
     );
 }
 
-/// 已枚举的核列表（含主核；enabled 位过滤）。
 pub fn cpu_mpidrs() -> Vec<u64> {
     init();
     CPUS.lock()
@@ -199,64 +346,157 @@ pub fn cpu_mpidrs() -> Vec<u64> {
         .collect()
 }
 
-/// MADT 枚举的 GICD 基址（0 = 未提供）。
-pub fn gicd_base() -> u64 {
+pub fn gicd_base() -> Option<u64> {
     init();
-    GICD_BASE.load(Ordering::SeqCst)
+    match GICD_BASE.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
 }
 
-use core::sync::atomic::Ordering;
+pub fn gicc_base() -> Option<u64> {
+    init();
+    match GICC_BASE.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
+}
 
+pub fn gicr_base() -> Option<u64> {
+    init();
+    match GICR_BASE.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
+}
 
+pub fn timer_irq() -> Option<u32> {
+    init();
+    match TIMER_IRQ.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+pub fn timer_flags() -> u32 {
+    init();
+    TIMER_FLAGS.load(Ordering::SeqCst)
+}
+
+pub fn psci_conduit() -> PsciConduit {
+    init();
+    match PSCI_CONDUIT.load(Ordering::SeqCst) {
+        x if x == PsciConduit::Hvc as u8 => PsciConduit::Hvc,
+        x if x == PsciConduit::Smc as u8 => PsciConduit::Smc,
+        _ => PsciConduit::LegacyHvc,
+    }
+}
+
+pub fn ecam_segments() -> Vec<EcamSegment> {
+    init();
+    ECAM.lock().clone()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn put(buf: &mut Vec<u8>, off: usize, bytes: &[u8]) {
-        let end = off + bytes.len();
-        if buf.len() < end {
-            buf.resize(end, 0);
+        if buf.len() < off + bytes.len() {
+            buf.resize(off + bytes.len(), 0);
         }
         buf[off..off + bytes.len()].copy_from_slice(bytes);
     }
 
     #[test]
-    fn madt_entry_parse_matrix() {
-        let mut b: Vec<u8> = alloc::vec![0; 0];
-        // 头部 44 字节占位（纯函数只关心条目区）
-        b.resize(44, 0);
-        let e0 = 44usize;
-        put(&mut b, e0, &[12, 16]);                     // GICD len=16
-        put(&mut b, e0 + 8, &0x0800_0000u64.to_le_bytes());
-        let e1 = e0 + 16;
-        put(&mut b, e1, &[11, 80]);                     // GICC cpu1 enabled
-        put(&mut b, e1 + 12, &1u32.to_le_bytes());      // flags.enabled
-        put(&mut b, e1 + 68, &0x8000_0001u64.to_le_bytes());
-        let e2 = e1 + 80;
-        put(&mut b, e2, &[11, 80]);                     // GICC cpu2 disabled
-        put(&mut b, e2 + 12, &0u32.to_le_bytes());
-        put(&mut b, e2 + 68, &0x8000_0002u64.to_le_bytes());
-        let tail = e2 + 84;
-        // 截断条目（len 声明越界）应被安全跳过：
-        put(&mut b, tail, &[11, 200]);
-
-        let (cpus, gicd) = super::parse_madt_entries(&b, 44);
-        assert_eq!(gicd, Some(0x0800_0000));
-        assert_eq!(cpus.len(), 2); // 截断条目不计入
-        assert!(cpus[0].enabled && !cpus[1].enabled);
-        assert_eq!(cpus[0].mpidr, 0x8000_0001);
-        assert_eq!(cpus[1].mpidr, 0x8000_0002);
+    fn madt_parses_cpu_gicd_gicc_and_gicr() {
+        let mut b = vec![0u8; 44];
+        let gicd = b.len();
+        put(&mut b, gicd, &[12, 24]);
+        put(&mut b, gicd + 8, &0x0800_0000u64.to_le_bytes());
+        let cpu = gicd + 24;
+        put(&mut b, cpu, &[11, 80]);
+        put(&mut b, cpu + 8, &7u32.to_le_bytes());
+        put(&mut b, cpu + 12, &1u32.to_le_bytes());
+        put(&mut b, cpu + 32, &0x0801_0000u64.to_le_bytes());
+        put(&mut b, cpu + 60, &0x080a_0000u64.to_le_bytes());
+        put(&mut b, cpu + 68, &0x8000_0001u64.to_le_bytes());
+        let redist = cpu + 80;
+        put(&mut b, redist, &[14, 16]);
+        put(&mut b, redist + 4, &0x080b_0000u64.to_le_bytes());
+        b.resize(redist + 16, 0);
+        let (cpus, dist, red) = parse_madt_entries(&b, 44);
+        assert_eq!(dist, Some(0x0800_0000));
+        assert_eq!(red, Some(0x080b_0000));
+        assert_eq!(
+            cpus,
+            vec![MadtCpu {
+                mpidr: 0x8000_0001,
+                uid: 7,
+                enabled: true,
+                gicc_base: 0x0801_0000,
+                gicr_base: 0x080a_0000
+            }]
+        );
     }
 
     #[test]
-    fn madt_truncated_body_is_safe() {
+    fn madt_truncated_entry_stops_safely() {
         let mut b = vec![0u8; 46];
         b[44] = 11;
-        b[45] = 80; // 声明 80 字节但只有 2 字节可用
-        let (cpus, gicd) = super::parse_madt_entries(&b, 44);
+        b[45] = 80;
+        let (cpus, gicd, gicr) = parse_madt_entries(&b, 44);
         assert!(cpus.is_empty());
         assert_eq!(gicd, None);
+        assert_eq!(gicr, None);
     }
 
+    #[test]
+    fn gtdt_timer_fields_and_truncation() {
+        let mut b = vec![0u8; 64];
+        put(&mut b, 56, &30u32.to_le_bytes());
+        put(&mut b, 60, &3u32.to_le_bytes());
+        assert_eq!(parse_gtdt(&b), Some((30, 3)));
+        assert_eq!(parse_gtdt(&b[..63]), None);
+    }
+
+    #[test]
+    fn fadt_psci_conduit_matrix() {
+        let mut b = vec![0u8; 136];
+        assert_eq!(parse_fadt_psci(&b), PsciConduit::LegacyHvc);
+        put(&mut b, 129, &1u16.to_le_bytes());
+        assert_eq!(parse_fadt_psci(&b), PsciConduit::Smc);
+        put(&mut b, 129, &3u16.to_le_bytes());
+        assert_eq!(parse_fadt_psci(&b), PsciConduit::Hvc);
+        assert_eq!(parse_fadt_psci(&b[..129]), PsciConduit::LegacyHvc);
+    }
+
+    #[test]
+    fn mcfg_filters_invalid_ranges() {
+        let mut b = vec![0u8; 44];
+        put(&mut b, 44, &0x4010_0000u64.to_le_bytes());
+        put(&mut b, 52, &2u16.to_le_bytes());
+        b.resize(60, 0);
+        b[54] = 0x20;
+        b[55] = 0x2f;
+        put(&mut b, 60, &0x5000_0000u64.to_le_bytes());
+        b.resize(76, 0);
+        b[70] = 5;
+        b[71] = 4;
+        assert_eq!(
+            parse_mcfg(&b),
+            vec![EcamSegment {
+                base: 0x4010_0000,
+                segment: 2,
+                start_bus: 0x20,
+                end_bus: 0x2f
+            }]
+        );
+    }
+
+    #[test]
+    fn checksum_helper_rejects_corruption() {
+        assert!(checksum_bytes(&[1, 2, 253]));
+        assert!(!checksum_bytes(&[1, 2, 252]));
+    }
 }

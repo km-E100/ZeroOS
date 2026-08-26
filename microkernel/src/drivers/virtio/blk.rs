@@ -28,11 +28,14 @@ const SECTOR_SIZE: usize = 512;
 const MAX_TRANSFER: usize = SECTOR_SIZE * 8;
 const QUEUE_SIZE: usize = 16;
 const DEVICE_ID_BLK: u32 = 2;
+const REG_CONFIG: usize = 0x100;
 
-/// 完成等待自旋上限。
-const COMPLETION_RETRIES: usize = 100_000;
-/// 等待上一次 I/O 结束的自旋上限。
-const IDLE_RETRIES: usize = 100_000;
+/// Device completion is asynchronous relative to the vCPU. A raw iteration
+/// count made success depend on host/QEMU scheduling speed (QEMU 11.1 could miss
+/// a valid completion after ~100k spins). Use the architected monotonic clock as
+/// the correctness bound; a generous spin ceiling only protects host/mock misuse.
+const IO_TIMEOUT_NS: u64 = 2_000_000_000;
+const MAX_POLL_SPINS: usize = 20_000_000;
 
 #[repr(C)]
 struct VirtioBlkReq {
@@ -54,6 +57,7 @@ struct VirtioBlkState {
     discard_next: bool,
     last_status: u8,
     last_len: usize,
+    capacity_sectors: u64,
 }
 
 impl VirtioBlkState {
@@ -70,6 +74,7 @@ impl VirtioBlkState {
             discard_next: false,
             last_status: 0xff,
             last_len: 0,
+            capacity_sectors: 0,
         }
     }
 }
@@ -92,6 +97,11 @@ pub fn init(descriptor: &DriverDescriptor) {
 
     let mut state = STATE.lock();
     state.base = base;
+    unsafe {
+        let lo = mmio_read32(base, REG_CONFIG) as u64;
+        let hi = mmio_read32(base, REG_CONFIG + 4) as u64;
+        state.capacity_sectors = lo | (hi << 32);
+    }
     match unsafe { configure_queue::<QUEUE_SIZE>(base, 0) } {
         Some(queue) => state.queue = Some(queue),
         None => {
@@ -130,7 +140,10 @@ pub fn init(descriptor: &DriverDescriptor) {
 
     register_irq_handler(descriptor.irq, irq_handler);
     unsafe { set_driver_ok(base) };
-    info!("driver: virtio-blk 初始化完成 (base=0x{:016x} irq={})", base, descriptor.irq);
+    info!(
+        "driver: virtio-blk 初始化完成 (base=0x{:016x} irq={})",
+        base, descriptor.irq
+    );
 
     self_test();
 }
@@ -146,17 +159,25 @@ fn self_test() {
         *byte = (i % 251) as u8 ^ (SELF_TEST_LBA as u8);
     }
     if let Err(e) = write_blocks(SELF_TEST_LBA, &pattern) {
-        warn!("driver: virtio-blk 自检写入失败 (LBA={}): {:?}", SELF_TEST_LBA, e);
+        warn!(
+            "driver: virtio-blk 自检写入失败 (LBA={}): {:?}",
+            SELF_TEST_LBA, e
+        );
         return;
     }
     let mut readback = [0u8; SECTOR_SIZE];
     if let Err(e) = read_blocks(SELF_TEST_LBA, &mut readback) {
-        warn!("driver: virtio-blk 自检读回失败 (LBA={}): {:?}", SELF_TEST_LBA, e);
+        warn!(
+            "driver: virtio-blk 自检读回失败 (LBA={}): {:?}",
+            SELF_TEST_LBA, e
+        );
         return;
     }
     if readback != pattern {
-        if let Some(off) =
-            readback.iter().zip(pattern.iter()).position(|(r, p)| r != p)
+        if let Some(off) = readback
+            .iter()
+            .zip(pattern.iter())
+            .position(|(r, p)| r != p)
         {
             warn!(
                 "driver: virtio-blk 自检比对不一致 @{} (读 {:02x} 期望 {:02x})",
@@ -175,6 +196,11 @@ fn self_test() {
 
 pub fn is_ready() -> bool {
     STATE.lock().ready
+}
+
+pub fn capacity_sectors() -> Option<u64> {
+    let state = STATE.lock();
+    (state.ready && state.capacity_sectors > 0).then_some(state.capacity_sectors)
 }
 
 pub fn read_blocks(lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
@@ -291,8 +317,7 @@ fn prepare_request(
 
         (*desc.add(1)).addr = state.bounce as u64;
         (*desc.add(1)).len = data_len as u32;
-        (*desc.add(1)).flags =
-            if is_read { VIRTQ_DESC_F_WRITE } else { 0 } | VIRTQ_DESC_F_NEXT;
+        (*desc.add(1)).flags = if is_read { VIRTQ_DESC_F_WRITE } else { 0 } | VIRTQ_DESC_F_NEXT;
         (*desc.add(1)).next = 2;
 
         (*desc.add(2)).addr = state.status_ptr as u64;
@@ -312,13 +337,20 @@ fn prepare_request(
 
 /// 有界等待上一次请求完成。超时返回 Busy（不破坏状态，可稍后重试）。
 fn wait_idle() -> Result<(), BlockError> {
-    for _ in 0..IDLE_RETRIES {
-        if !STATE.lock().inflight {
-            return Ok(());
+    let deadline = crate::time::monotonic_ns().saturating_add(IO_TIMEOUT_NS);
+    for _ in 0..MAX_POLL_SPINS {
+        {
+            let mut state = STATE.lock();
+            if !state.inflight { return Ok(()); }
+            // Do not make forward progress depend on an IRQ arriving while the
+            // caller is runnable; harvest a delayed used-ring element here too.
+            poll_completion_locked(&mut state);
+            if !state.inflight { return Ok(()); }
         }
+        if crate::time::monotonic_ns() >= deadline { break; }
         core::hint::spin_loop();
     }
-    warn!("virtio-blk: 上一次 I/O 未完成，放弃本次请求");
+    warn!("virtio-blk: 上一次 I/O 在 2s deadline 内未完成，放弃本次请求");
     Err(BlockError::Busy)
 }
 
@@ -329,22 +361,20 @@ fn wait_idle() -> Result<(), BlockError> {
 /// 超时后复位 inflight 并置 discard_next，使后续 I/O 可继续；
 /// 迟到的完成元素在任一路径被丢弃，避免污染下一次请求的结果。
 fn wait_for_completion() -> Result<usize, BlockError> {
-    for _ in 0..COMPLETION_RETRIES {
+    let deadline = crate::time::monotonic_ns().saturating_add(IO_TIMEOUT_NS);
+    for _ in 0..MAX_POLL_SPINS {
         {
             let mut state = STATE.lock();
             // IRQ 路径已完成：直接取缓存结果。
-            if !state.inflight {
-                return finish_result(&state);
-            }
+            if !state.inflight { return finish_result(&state); }
             // 主动轮询：取 used 环 + 应答中断原因。
             poll_completion_locked(&mut state);
-            if !state.inflight {
-                return finish_result(&state);
-            }
+            if !state.inflight { return finish_result(&state); }
         }
+        if crate::time::monotonic_ns() >= deadline { break; }
         core::hint::spin_loop();
     }
-    warn!("virtio-blk: 完成等待超时，中止当前 I/O");
+    warn!("virtio-blk: 完成等待超过 2s deadline，中止当前 I/O");
     {
         let mut state = STATE.lock();
         state.inflight = false;

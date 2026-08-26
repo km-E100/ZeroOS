@@ -64,7 +64,11 @@ pub fn multi_core_active() -> bool {
 #[inline(always)]
 pub fn online_mask() -> u32 {
     let n = online_count().min(MAX_CPUS);
-    if n >= 32 { u32::MAX } else { (1u32 << n) - 1 }
+    if n >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << n) - 1
+    }
 }
 
 /// 主核侧：翻多核闸 → 探测点亮副核。幂等（仅 kernel_main 调用一次）。
@@ -92,9 +96,17 @@ pub fn boot_secondaries() {
         let boot_affinity = boot_mpidr & AFFINITY_MASK;
         let mut logical = 1usize;
         for mpidr in madt.into_iter() {
-            if mpidr & AFFINITY_MASK == boot_affinity { continue; }
-            if logical >= MAX_CPUS { break; }
-            let result = psci_cpu_on(mpidr, unsafe { &__secondary_entry } as *const u8 as usize, logical);
+            if mpidr & AFFINITY_MASK == boot_affinity {
+                continue;
+            }
+            if logical >= MAX_CPUS {
+                break;
+            }
+            let result = psci_cpu_on(
+                mpidr,
+                unsafe { &__secondary_entry } as *const u8 as usize,
+                logical,
+            );
             if result.ok {
                 crate::info!("smp: cpu{} UP via MADT mpidr={:#x}", logical, mpidr);
                 logical += 1;
@@ -104,15 +116,32 @@ pub fn boot_secondaries() {
         }
     } else {
         'outer: for cpu in 1..MAX_CPUS {
-            for (shift, use_res1) in [(0u32, true), (0, false), (8, true), (8, false), (16, true), (16, false)] {
+            for (shift, use_res1) in [
+                (0u32, true),
+                (0, false),
+                (8, true),
+                (8, false),
+                (16, true),
+                (16, false),
+            ] {
                 let mut mpidr = (cpu as u64) << shift;
-                if use_res1 { mpidr |= 0x8000_0000; }
-                let result = psci_cpu_on(mpidr, unsafe { &__secondary_entry } as *const u8 as usize, cpu);
+                if use_res1 {
+                    mpidr |= 0x8000_0000;
+                }
+                let result = psci_cpu_on(
+                    mpidr,
+                    unsafe { &__secondary_entry } as *const u8 as usize,
+                    cpu,
+                );
                 if result.ok {
                     crate::info!("smp: cpu{} UP via legacy mpidr={:#010x}", cpu, mpidr);
                     continue 'outer;
                 }
-                crate::debug!("smp-probe: CPU_ON mpidr={:#010x} -> {:#010x}", mpidr, result.raw as i32 as u32);
+                crate::debug!(
+                    "smp-probe: CPU_ON mpidr={:#010x} -> {:#010x}",
+                    mpidr,
+                    result.raw as i32 as u32
+                );
             }
             crate::info!("smp: cpu{} exhausted, online={}", cpu, online_count());
             break;
@@ -155,16 +184,31 @@ struct PsciResult {
 /// entry 以 EL1h/屏蔽中断进入（PSCI 规范保证）。
 fn psci_cpu_on(target_mpidr: u64, entry: usize, logical_cpu: usize) -> PsciResult {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            in("x0") PSCI_FN_CPU_ON,
-            in("x1") target_mpidr,
-            in("x2") entry,
-            in("x3") logical_cpu, // context_id：副核入口 x0 收到逻辑 CPU 号
-            lateout("x0") ret,
-            options(nostack)
-        );
+    // FADT ARM boot flags 是固件对 PSCI conduit 的权威描述。缺表时保留
+    // Zero OS/QEMU 历史 HVC 路径；PSCI compliant + !USE_HVC 则使用 SMC。
+    match crate::acpi::psci_conduit() {
+        crate::acpi::PsciConduit::Smc => unsafe {
+            core::arch::asm!(
+                "smc #0",
+                in("x0") PSCI_FN_CPU_ON,
+                in("x1") target_mpidr,
+                in("x2") entry,
+                in("x3") logical_cpu,
+                lateout("x0") ret,
+                options(nostack)
+            );
+        },
+        crate::acpi::PsciConduit::Hvc | crate::acpi::PsciConduit::LegacyHvc => unsafe {
+            core::arch::asm!(
+                "hvc #0",
+                in("x0") PSCI_FN_CPU_ON,
+                in("x1") target_mpidr,
+                in("x2") entry,
+                in("x3") logical_cpu,
+                lateout("x0") ret,
+                options(nostack)
+            );
+        },
     }
     PsciResult {
         ok: ret == PSCI_SUCCESS,

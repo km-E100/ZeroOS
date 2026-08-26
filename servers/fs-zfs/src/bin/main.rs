@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use useralloc::StaticFreeList;
 
 #[cfg(target_os = "none")]
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 1024 * 1024;
 #[cfg(target_os = "none")]
 #[global_allocator]
 static ALLOCATOR: StaticFreeList<HEAP_SIZE> = StaticFreeList::new();
@@ -39,7 +39,8 @@ fn panic(_info: &PanicInfo) -> ! {
 #[cfg(target_os = "none")]
 #[alloc_error_handler]
 fn alloc_error(_: Layout) -> ! {
-    loop {}
+    let _ = userlib::console_write(b"zfsd: OOM\r\n");
+    userlib::exit(120)
 }
 
 #[cfg(not(target_os = "none"))]

@@ -75,6 +75,14 @@ fn main() -> Result<()> {
 /// 项目目录体积上限（MB）。用户设定 2GB±1GB：峰值构建需要 ~2.3GB，
 /// 取 3072MB（3GB）为硬闸。超限后一切构建命令前置拒绝。
 const SIZE_LIMIT_MB: u64 = 3072;
+const KERNEL_PIE_TARGET_SPEC: &str = "userland/targets/aarch64-unknown-none-pic.json";
+const KERNEL_PIE_REL: &str = "target/aarch64-unknown-none-pic/release/zero-kernel";
+
+fn build_kernel_pie(sh: &Shell) -> Result<()> {
+    cmd!(sh, "cargo +nightly -Z json-target-spec -Z build-std=core,compiler_builtins,alloc build --target {KERNEL_PIE_TARGET_SPEC} -p zero-kernel --release").run()?;
+    Ok(())
+}
+
 
 fn enforce_size_limit(sh: &Shell) -> Result<()> {
     let out = cmd!(sh, "du -sm .").read()?;
@@ -97,7 +105,10 @@ fn purge(sh: &Shell) -> Result<()> {
     // 磁盘预算；worktree 本体与分支保留）。
     let _ = cmd!(sh, "rm -rf target/iso target/zero-os.iso target/zero-rootfs.img target/disk.img target/rootfs.bundle target/rootfs-recovery.bundle target/release target/aarch64-unknown-uefi target/aarch64-unknown-none/debug/incremental target/aarch64-unknown-none/release/incremental target/aarch64-unknown-uefi/debug/incremental target/aarch64-unknown-uefi/release/incremental").run();
     for wt in ["cow-fork-wip", "pstore-wip", "user-heap", "oom-graceful"] {
-        let p = root.parent().unwrap().join(format!("Zero OS.worktrees/{wt}/target"));
+        let p = root
+            .parent()
+            .unwrap()
+            .join(format!("Zero OS.worktrees/{wt}/target"));
         if p.exists() {
             println!("purge: removing worktree target ({wt})");
             fs::remove_dir_all(&p)?;
@@ -131,7 +142,17 @@ fn build_baremetal_blobs(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-inputd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-windowserver --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-netd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-webtest --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-pkgd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-pkgtest --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-audiod --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-audiotest --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-gputest --release").run()?;
     // 第七刀：fsd（块后端卷文件服务）与 blkdrv（直通块设备服务）。
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fs-zfs --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fsd --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-blkdrv --release").run()?;
     Ok(())
@@ -139,17 +160,21 @@ fn build_baremetal_blobs(sh: &Shell) -> Result<()> {
 
 fn build_servers(sh: &Shell) -> Result<()> {
     // 这些是正常 host 目标，照常用默认 target 编
-    cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
+    cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-inputd -p zero-windowserver -p zero-netd -p zero-webtest -p zero-pkgd -p zero-pkgtest -p zero-audiod -p zero-audiotest -p zero-gputest -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
 
     // zero-launchd 只编 aarch64-unknown-none 的裸机版本
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
 
     // zero-securityd 同样只编裸机版本（rootfs 运行物；host 版仅作分析副本）
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-inputd --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-windowserver --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-netd --release").run()?;
 
     // 第七刀：zero-blkdrv / zero-fsd 只编裸机版本（rootfs 运行物；
     // host 版由上方第一行照常产出，供 ISO userland/ 分析用）。
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-blkdrv --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fs-zfs --release").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-fsd --release").run()?;
 
     // 一致性核对：
@@ -190,9 +215,59 @@ fn sync_userland_blobs(sh: &Shell, warn_missing: bool) -> Result<()> {
             "securityd 服务器",
         ),
         (
+            "target/aarch64-unknown-none/release/zero-inputd",
+            "kernel/rootfs/System/Core/zero-inputd",
+            "inputd 输入服务器（第23刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-windowserver",
+            "kernel/rootfs/System/Core/zero-windowserver",
+            "WindowServer 合成服务（第24刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-netd",
+            "kernel/rootfs/System/Core/zero-netd",
+            "netd 网络服务器（第27刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-webtest",
+            "kernel/rootfs/System/Core/zero-webtest",
+            "webtest TLS/HTTP 回归服务（第28刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-pkgd",
+            "kernel/rootfs/System/Core/zero-pkgd",
+            "pkgd 包管理服务（第29刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-pkgtest",
+            "kernel/rootfs/System/Core/zero-pkgtest",
+            "pkgtest 包管理回归客户端（第29刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-audiod",
+            "kernel/rootfs/System/Core/zero-audiod",
+            "audiod 音频服务（第33刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-audiotest",
+            "kernel/rootfs/System/Core/zero-audiotest",
+            "audiotest 音频回归客户端（第33刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-gputest",
+            "kernel/rootfs/System/Core/zero-gputest",
+            "gputest VirGL 3D 回归客户端（第34刀）",
+        ),
+        (
             "target/aarch64-unknown-none/release/zero-blkdrv",
             "kernel/rootfs/System/Core/zero-blkdrv",
             "blkdrv 块设备服务器（第七刀）",
+        ),
+        (
+            "target/aarch64-unknown-none/release/zero-fs-zfs",
+            "kernel/rootfs/System/Core/zero-fs-zfs",
+            "ZFS 默认文件服务器（第32刀）",
         ),
         (
             "target/aarch64-unknown-none/release/zero-fsd",
@@ -242,23 +317,18 @@ fn build_recovery(sh: &Shell) -> Result<()> {
 }
 
 fn build_image(sh: &Shell) -> Result<()> {
-    let target = "aarch64-unknown-none";
-    if let Err(err) = cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target {target} -p zero-kernel")
-        .run()
-    {
+    if let Err(err) = build_kernel_pie(sh) {
         eprintln!(
-            "xtask: build-image failed: {err}\n    hint: rustup needs write access to ~/.rustup/tmp; consider adjusting permissions or running the command outside of this sandbox."
+            "xtask: build-image failed: {err}\n    hint: kernel image KASLR uses the custom PIC target and nightly json-target-spec."
         );
-        return Err(err.into());
+        return Err(err);
     }
     let project_root = sh.current_dir();
-    let elf = project_root.join(format!("target/{target}/debug/zero-kernel"));
+    let elf = project_root.join(KERNEL_PIE_REL);
     let dest = project_root.join("target/zero-os.elf");
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent)?; }
     fs::copy(&elf, &dest)?;
-    println!("image generated at {}", dest.display());
+    println!("KASLR-ready ET_DYN image generated at {}", dest.display());
     Ok(())
 }
 
@@ -382,7 +452,10 @@ fn test_boot(sh: &Shell, expect_shell: bool) -> Result<()> {
     if log_path.exists() {
         fs::remove_file(&log_path)?;
     }
-    println!("==> test-boot: launching QEMU (serial -> {})", log_path.display());
+    println!(
+        "==> test-boot: launching QEMU (serial -> {})",
+        log_path.display()
+    );
 
     let mut child = std::process::Command::new("qemu-system-aarch64")
         .args(QEMU_BASE_ARGS)
@@ -478,7 +551,14 @@ fn test_boot(sh: &Shell, expect_shell: bool) -> Result<()> {
 
     if pass {
         println!();
-        println!("RESULT: PASS{}", if known_issues.is_empty() { "" } else { " (含已知问题，见上)" });
+        println!(
+            "RESULT: PASS{}",
+            if known_issues.is_empty() {
+                ""
+            } else {
+                " (含已知问题，见上)"
+            }
+        );
         println!("==================================");
         Ok(())
     } else {

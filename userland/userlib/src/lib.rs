@@ -111,11 +111,7 @@ pub fn exit(code: i32) -> ! {
 pub fn cause_segv() -> ! {
     unsafe {
         // noreturn asm 不能声明输出；x0 被改写无所谓（进程即将消亡）。
-        core::arch::asm!(
-            "mov x0, xzr",
-            "sturb wzr, [x0]",
-            options(noreturn)
-        );
+        core::arch::asm!("mov x0, xzr", "sturb wzr, [x0]", options(noreturn));
     }
 }
 
@@ -232,10 +228,24 @@ pub fn ipc_send(channel: u32, message: &Message) -> Result<(), SysError> {
     decode_result(ret).map(|_| ())
 }
 
+/// Targeted response on a shared service channel (syscall 54).
+pub fn ipc_send_to(channel: u32, target_pid: u64, message: &Message) -> Result<(), SysError> {
+    decode_result(svc_call(
+        54,
+        [
+            channel as u64,
+            target_pid,
+            message as *const Message as u64,
+            0,
+        ],
+    ))
+    .map(|_| ())
+}
+
 /// 从通道接收一条消息（号位 1）。
 ///
-/// 队列空时返回 `Err(WouldBlock)` —— 服务器主循环的标准写法是
-/// 收到 `WouldBlock` 后 [`yield_now`] 再重收。
+/// 队列空时**阻塞当前进程**，直到有本进程可收的消息；多事件源事件循环
+/// 应使用 [`ipc_try_receive_from`]，不要在某一通道上把自己永久挂住。
 pub fn ipc_receive_from(channel: u32, message: &mut Message) -> Result<u64, SysError> {
     let ret = svc_call(1, [channel as u64, message as *mut Message as u64, 0, 0]);
     decode_result(ret)
@@ -244,6 +254,16 @@ pub fn ipc_receive_from(channel: u32, message: &mut Message) -> Result<u64, SysE
 /// 兼容包装：忽略发送者身份。安全敏感服务应使用 [`ipc_receive_from`]。
 pub fn ipc_receive(channel: u32, message: &mut Message) -> Result<(), SysError> {
     ipc_receive_from(channel, message).map(|_| ())
+}
+
+/// 非阻塞 IPC 接收（号位 55）。队列没有本进程可收消息时返回 WouldBlock。
+pub fn ipc_try_receive_from(channel: u32, message: &mut Message) -> Result<u64, SysError> {
+    let ret = svc_call(55, [channel as u64, message as *mut Message as u64, 0, 0]);
+    decode_result(ret)
+}
+
+pub fn ipc_try_receive(channel: u32, message: &mut Message) -> Result<(), SysError> {
+    ipc_try_receive_from(channel, message).map(|_| ())
 }
 
 /// 按 LBA 读块设备（号位 7）。`buffer.len()` 必须是 512 的倍数。
@@ -305,12 +325,119 @@ pub fn shm_release(handle: u32) -> Result<(), SysError> {
     decode_result(ret).map(|_| ())
 }
 
-/// 查询共享内存首个物理页地址（号位 17）；
-/// 供与内核交换物理页的底层场景使用。
+/// 物理地址查询永久禁用：共享内存只暴露 opaque handle + 用户 VA。
 pub fn shm_phys(handle: u32) -> Result<usize, SysError> {
     let ret = svc_call(17, [handle as u64, 0, 0, 0]);
     decode_result(ret).map(|addr| addr as usize)
 }
+
+/// owner 显式把 handle 授权给目标 pid（号位 46）。目标随后自行 shm_map。
+pub fn shm_grant(handle: u32, target_pid: u64) -> Result<(), SysError> {
+    let ret = svc_call(46, [handle as u64, target_pid, 0, 0]);
+    decode_result(ret).map(|_| ())
+}
+
+pub fn input_read(event: &mut zero_abi::input::InputEvent) -> Result<(), SysError> {
+    let ret = svc_call(47, [event as *mut _ as u64, 0, 0, 0]);
+    decode_result(ret).map(|_| ())
+}
+
+pub fn display_present_bgrx(
+    surface: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<(), SysError> {
+    let ret = svc_call(
+        48,
+        [
+            surface.as_ptr() as u64,
+            width as u64,
+            height as u64,
+            stride as u64,
+        ],
+    );
+    decode_result(ret).map(|_| ())
+}
+
+pub fn clock_get(clock_id: u32) -> Result<u64, SysError> {
+    decode_result(svc_call(49, [clock_id as u64, 0, 0, 0]))
+}
+pub fn monotonic_ns() -> Result<u64, SysError> {
+    clock_get(0)
+}
+pub fn realtime_ns() -> Result<u64, SysError> {
+    clock_get(1)
+}
+pub fn sleep_until(deadline_ns: u64) -> Result<u64, SysError> {
+    decode_result(svc_call(50, [deadline_ns, 0, 0, 0]))
+}
+
+pub fn net_send_frame(frame: &[u8]) -> Result<(), SysError> {
+    decode_result(svc_call(
+        51,
+        [frame.as_ptr() as u64, frame.len() as u64, 0, 0],
+    ))
+    .map(|_| ())
+}
+/// Fill a buffer with cryptographically secure random bytes (syscall 56).
+pub fn getrandom(out: &mut [u8]) -> Result<(), SysError> {
+    let ret = svc_call(56, [out.as_mut_ptr() as u64, out.len() as u64, 0, 0]);
+    decode_result(ret).map(|_| ())
+}
+
+/// Kernel-owned block device capacity in 512-byte sectors (syscall 57).
+pub fn block_capacity_sectors() -> Result<u64, SysError> {
+    decode_result(svc_call(57, [0, 0, 0, 0]))
+}
+
+/// Spawn an ELF image from the caller's verified byte buffer (syscall58).
+/// Requires a dynamically granted CAP_SPAWN_APP.
+pub fn spawn_image(image: &[u8]) -> Result<u64, SysError> {
+    if image.len() < 64 { return Err(SysError::InvalidArgument); }
+    decode_result(svc_call(58, [image.as_ptr() as u64, image.len() as u64, 0, 0]))
+}
+
+pub fn net_recv_frame(frame: &mut [u8]) -> Result<usize, SysError> {
+    decode_result(svc_call(
+        52,
+        [frame.as_mut_ptr() as u64, frame.len() as u64, 0, 0],
+    ))
+    .map(|n| n as usize)
+}
+
+pub fn net_get_mac() -> Result<[u8; 6], SysError> {
+    let mut mac = [0u8; 6];
+    decode_result(svc_call(53, [mac.as_mut_ptr() as u64, 0, 0, 0])).map(|_| mac)
+}
+
+
+/// Query the fixed first-generation PCM contract (syscall 59).
+pub fn audio_info() -> Result<zero_abi::audio::AudioInfo, SysError> {
+    let mut info=zero_abi::audio::AudioInfo::default();
+    decode_result(svc_call(59,[&mut info as *mut _ as u64,0,0,0]))?;
+    Ok(info)
+}
+/// Submit one audio period (syscall 60; audiod-only capability).
+pub fn audio_play_period(pcm:&[u8])->Result<(),SysError>{
+    decode_result(svc_call(60,[pcm.as_ptr() as u64,pcm.len() as u64,0,0])).map(|_|())
+}
+pub fn audio_stop()->Result<(),SysError>{decode_result(svc_call(61,[0,0,0,0])).map(|_|())}
+
+/// Query the negotiated VirtIO-GPU 3D contract (syscall 62; CAP_DISPLAY).
+pub fn gpu3d_info()->Result<zero_abi::gpu::Gpu3dInfo,SysError>{
+    let mut info=zero_abi::gpu::Gpu3dInfo::default();
+    decode_result(svc_call(62,[&mut info as *mut _ as u64,0,0,0]))?;
+    Ok(info)
+}
+pub fn gpu3d_context_create(capset_id:u32)->Result<u32,SysError>{decode_result(svc_call(63,[capset_id as u64,0,0,0])).map(|v|v as u32)}
+pub fn gpu3d_context_destroy(ctx:u32)->Result<(),SysError>{decode_result(svc_call(64,[ctx as u64,0,0,0])).map(|_|())}
+pub fn gpu3d_resource_create(desc:&zero_abi::gpu::Gpu3dResourceDesc)->Result<u32,SysError>{decode_result(svc_call(65,[desc as *const _ as u64,0,0,0])).map(|v|v as u32)}
+pub fn gpu3d_resource_destroy(id:u32)->Result<(),SysError>{decode_result(svc_call(66,[id as u64,0,0,0])).map(|_|())}
+pub fn gpu3d_context_attach(ctx:u32,id:u32)->Result<(),SysError>{decode_result(svc_call(67,[ctx as u64,id as u64,0,0])).map(|_|())}
+pub fn gpu3d_submit(ctx:u32,stream:&[u8])->Result<(),SysError>{decode_result(svc_call(68,[ctx as u64,stream.as_ptr() as u64,stream.len() as u64,0])).map(|_|())}
+pub fn gpu3d_readback(id:u32,out:&mut[u8])->Result<usize,SysError>{decode_result(svc_call(69,[id as u64,out.as_mut_ptr() as u64,out.len() as u64,0])).map(|v|v as usize)}
+pub fn gpu3d_get_capset(capset_id:u32,version:u32,out:&mut[u8])->Result<usize,SysError>{decode_result(svc_call(70,[capset_id as u64,version as u64,out.as_mut_ptr() as u64,out.len() as u64])).map(|v|v as usize)}
 
 /// 驱动信息记录（`DriverInfo` 系统调用回填的投影格式，
 /// 与内核 `syscalls.rs::write_driver_info` 输出布局一致）。
@@ -589,7 +716,10 @@ mod tests {
     fn decode_error_interval_maps_to_sys_error() {
         assert_eq!(decode_result(u64::MAX), Err(SysError::InvalidArgument));
         assert_eq!(decode_result(u64::MAX - 1), Err(SysError::PermissionDenied));
-        assert_eq!(decode_result(u64::MAX - 2), Err(SysError::ChannelUnavailable));
+        assert_eq!(
+            decode_result(u64::MAX - 2),
+            Err(SysError::ChannelUnavailable)
+        );
         assert_eq!(decode_result(u64::MAX - 3), Err(SysError::NotFound));
         assert_eq!(decode_result(u64::MAX - 4), Err(SysError::NoMemory));
         assert_eq!(decode_result(u64::MAX - 5), Err(SysError::WouldBlock));
@@ -640,7 +770,12 @@ mod tests {
         // 与内核 process::pack_wait_result 的编码严格对称：
         // packed = (pid << 32) | (code as u32)，负码按补码无损还原。
         let pack = |pid: u64, code: i32| (pid << 32) | (code as u32 as u64);
-        for (pid, code) in [(7u64, 42i32), (1234, 0), (64, -1), (u32::MAX as u64, i32::MIN)] {
+        for (pid, code) in [
+            (7u64, 42i32),
+            (1234, 0),
+            (64, -1),
+            (u32::MAX as u64, i32::MIN),
+        ] {
             assert_eq!(unpack_wait_result(pack(pid, code)).unwrap(), (pid, code));
         }
         // 注：错误区间由 wait_pid 内的 decode_result 先行拦截（见
@@ -711,20 +846,19 @@ impl UserMutex {
 
     /// 加锁：快路径 CAS；竞争时置 CONTENDED 并 futex 睡眠。
     pub fn lock(&self) {
-        match self
-            .word
-            .compare_exchange(MUTEX_UNLOCKED, MUTEX_LOCKED, Ordering::Acquire, Ordering::Relaxed)
-        {
+        match self.word.compare_exchange(
+            MUTEX_UNLOCKED,
+            MUTEX_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => {}
             Err(_) => {
                 // 已有人持锁：标记 CONTENDED（保证 unlock 时会 wake），
                 // 再睡到被唤醒后重试快路径。
                 if self.word.swap(MUTEX_CONTENDED, Ordering::Acquire) != MUTEX_UNLOCKED {
                     while self.word.load(Ordering::Relaxed) == MUTEX_CONTENDED {
-                        let _ = futex_wait_raw(
-                            self.word.as_ptr() as usize,
-                            MUTEX_CONTENDED,
-                        );
+                        let _ = futex_wait_raw(self.word.as_ptr() as usize, MUTEX_CONTENDED);
                     }
                 }
                 // 醒来：重试整体 lock

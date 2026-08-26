@@ -1,4 +1,5 @@
 use uefi::prelude::*;
+use uefi::proto::rng::Rng;
 use uefi::table::boot::BootServices;
 
 use crate::boot_config::BootConfig;
@@ -17,19 +18,40 @@ impl KernelImage {
         fs: &mut FileSystem<'_>,
         paths: &BootPaths,
         config: &BootConfig,
-        bs: &BootServices,
+        st: &SystemTable<Boot>,
     ) -> Result<KernelImage, Status> {
-        let kernel_bytes = fs.read_to_vec(&paths.kernel_path)?;
-        let elf = ElfImage::parse(&kernel_bytes)?;
+        let kernel_bytes = fs.read_to_vec(&paths.kernel_path).map_err(|e| {
+            log_error!("kernel read failed: {:?}", e);
+            e
+        })?;
+        let mut elf = ElfImage::parse(&kernel_bytes).map_err(|e| {
+            log_error!("kernel ELF parse failed: {:?}", e);
+            e
+        })?;
+        let bs = st.boot_services();
 
-        elf::load_segments(bs, &elf, &kernel_bytes)?;
+        if elf.is_pie() {
+            load_pie_with_kaslr(st, &mut elf, &kernel_bytes).map_err(|e| {
+                log_error!("kernel KASLR load failed: {:?}", e);
+                e
+            })?;
+            elf::apply_relocations(&elf).map_err(|e| {
+                log_error!("kernel relocation failed: {:?}", e);
+                e
+            })?;
+        } else {
+            elf::load_segments(bs, &elf, &kernel_bytes).map_err(|e| {
+                log_error!("kernel segment load failed: {:?}", e);
+                e
+            })?;
+        }
 
         // 内核故障符号化：把符号表灌进内核自留的汇槽（对标 Linux
         // kallsyms 的引导期注入）。必须在 load_segments 之后、
         // jump_to_kernel 之前完成。
         fill_symbol_sink(bs, &elf);
 
-        let entry = config.kernel_address.unwrap_or(elf.entry);
+        let entry = config.kernel_address.unwrap_or_else(|| elf.runtime_entry());
 
         log_info!("kernel loaded at entry=0x{:016x}", entry);
         Ok(KernelImage {
@@ -37,6 +59,74 @@ impl KernelImage {
             segments: elf,
         })
     }
+}
+
+const KASLR_START: u64 = 0x4800_0000;
+const KASLR_END: u64 = 0x5800_0000;
+const KASLR_ALIGN: u64 = 2 * 1024 * 1024;
+
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30; x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27; x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn boot_entropy(st: &SystemTable<Boot>) -> (u64, bool) {
+    let bs = st.boot_services();
+    if let Ok(handle) = bs.get_handle_for_protocol::<Rng>() {
+        if let Ok(mut rng) = bs.open_protocol_exclusive::<Rng>(handle) {
+            let mut bytes = [0u8; 8];
+            if rng.get_rng(None, &mut bytes).is_ok() {
+                return (u64::from_le_bytes(bytes), true);
+            }
+        }
+    }
+    let mut seed = (st as *const _ as usize as u64) ^ (bs as *const _ as usize as u64).rotate_left(17);
+    if let Ok(t) = st.runtime_services().get_time() {
+        seed ^= (t.year() as u64) << 48;
+        seed ^= (t.month() as u64) << 40;
+        seed ^= (t.day() as u64) << 32;
+        seed ^= (t.hour() as u64) << 24;
+        seed ^= (t.minute() as u64) << 16;
+        seed ^= (t.second() as u64) << 8;
+        seed ^= t.nanosecond() as u64;
+    }
+    (mix64(seed), false)
+}
+
+fn load_pie_with_kaslr(
+    st: &SystemTable<Boot>,
+    elf: &mut ElfImage,
+    bytes: &[u8],
+) -> Result<(), Status> {
+    let span = elf.image_span().ok_or(Status::INVALID_PARAMETER)?;
+    let span = (span + KASLR_ALIGN - 1) & !(KASLR_ALIGN - 1);
+    if KASLR_START.checked_add(span).map_or(true, |v| v > KASLR_END) {
+        log_error!("PIE kernel span 0x{:x} does not fit KASLR window", span);
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    let slots = ((KASLR_END - KASLR_START - span) / KASLR_ALIGN + 1) as usize;
+    let (entropy, strong) = boot_entropy(st);
+    let first = (entropy as usize) % slots;
+    if strong {
+        log_info!("KASLR entropy source: UEFI RNG");
+    } else {
+        log_warn!("KASLR entropy source: weak UEFI time/address mixer (RNG protocol unavailable)");
+    }
+    for attempt in 0..slots {
+        let idx = (first + attempt) % slots;
+        let bias = KASLR_START + (idx as u64) * KASLR_ALIGN;
+        elf.set_load_bias(bias)?;
+        match elf::load_segments(st.boot_services(), elf, bytes) {
+            Ok(()) => {
+                log_info!("KASLR kernel base=0x{:016x} span=0x{:x} slot={}/{}", bias, span, idx, slots);
+                return Ok(());
+            }
+            Err(_) => continue,
+        }
+    }
+    log_error!("no KASLR candidate address was free");
+    Err(Status::OUT_OF_RESOURCES)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,12 +167,12 @@ fn fill_symbol_sink(_bs: &BootServices, elf: &ElfImage) {
         return;
     };
     // 防呆：汇槽必须落在某个已加载段内，否则视为镜像/协议不符。
-    if !elf.segments.iter().any(|seg| {
-        sink_va >= seg.physical_addr && sink_va < seg.physical_addr + seg.mem_size
-    }) {
-        log_warn!(
-            "symbol sink address 0x{sink_va:016x} outside loaded segments; skipped"
-        );
+    if !elf
+        .segments
+        .iter()
+        .any(|seg| sink_va >= seg.physical_addr && sink_va < seg.physical_addr + seg.mem_size)
+    {
+        log_warn!("symbol sink address 0x{sink_va:016x} outside loaded segments; skipped");
         return;
     }
 
@@ -91,7 +181,7 @@ fn fill_symbol_sink(_bs: &BootServices, elf: &ElfImage) {
         .symbols()
         .iter()
         .filter(|s| s.value != 0 && matches!(s.sym_type(), STT_OBJECT | STT_FUNC))
-        .map(|s| (s.value, s.name.as_str()))
+        .map(|s| (elf.runtime_addr(s.value), s.name.as_str()))
         .collect();
     syms.sort_unstable_by_key(|(addr, _)| *addr);
     syms.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -140,9 +230,7 @@ fn fill_symbol_sink(_bs: &BootServices, elf: &ElfImage) {
         store_u64(sink, 0x00, symbol_sink::MAGIC);
     }
 
-    log_info!(
-        "symbol sink filled @0x{sink_va:016x}: {fit} symbols, {names_len} name bytes"
-    );
+    log_info!("symbol sink filled @0x{sink_va:016x}: {fit} symbols, {names_len} name bytes");
 }
 
 /// 字节级写入（条目 12 字节跨步，u64 字段天然非对齐，逐字节拷贝免疫）。

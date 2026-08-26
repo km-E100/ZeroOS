@@ -22,8 +22,12 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     ListKeychains,
-    CreateKeychain { name: String },
-    DeleteKeychain { name: String },
+    CreateKeychain {
+        name: String,
+    },
+    DeleteKeychain {
+        name: String,
+    },
     /// 签发一枚能力令牌（对齐实机 CMD_CAP_ISSUE 0x20）
     Issue {
         /// 目标进程 pid
@@ -108,13 +112,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("security: 未找到 {}", name);
             }
         }
-        Command::Issue {
-            target,
-            caps,
-            ttl,
-        } => {
-            let caps_value = parse_caps_hex(&caps)
-                .ok_or_else(|| anyhow::anyhow!("security: caps 需为 1..=8 位十六进制（如 0x50）"))?;
+        Command::Issue { target, caps, ttl } => {
+            let caps_value = parse_caps_hex(&caps).ok_or_else(|| {
+                anyhow::anyhow!("security: caps 需为 1..=8 位十六进制（如 0x50）")
+            })?;
             if caps_value == 0 {
                 bail!("security: caps 不能为空位图");
             }

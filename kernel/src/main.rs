@@ -23,8 +23,7 @@ mod rootfs;
 /// 失败的调用方应在分配点用 fallible API 感知 null，而不是落到本出口。
 #[alloc_error_handler]
 fn zero_oom(layout: core::alloc::Layout) -> ! {
-    zero_microkernel::runtime::serial::write_str(
-        "\r\n[HEAP OOM] layout size=");
+    zero_microkernel::runtime::serial::write_str("\r\n[HEAP OOM] layout size=");
     hex_u64(layout.size() as u64);
     zero_microkernel::runtime::serial::write_str(" align=");
     hex_u64(layout.align() as u64);

@@ -37,7 +37,6 @@
 //! 锁与进程表读取的搬运。
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use zero_abi::cap::{CAP_ISSUER, CAP_SESSION};
 use zero_abi::ProcessId;
@@ -47,15 +46,13 @@ pub(crate) const MAX_GRANTS: usize = 16;
 /// 存活会话容量。
 const MAX_SESSIONS: usize = 8;
 
-/// 全局逻辑时钟（每次系统调用 +1，见模块文档第 2 点）。
-static LCLOCK: AtomicU64 = AtomicU64::new(0);
-
-pub fn advance_clock() {
-    LCLOCK.fetch_add(1, Ordering::Relaxed);
-}
+/// Legacy hook kept ABI-internal for callers from the syscall entry. TTL is now
+/// based on real monotonic milliseconds, so syscall frequency cannot extend or
+/// shorten a grant.
+pub fn advance_clock() {}
 
 pub fn now() -> u64 {
-    LCLOCK.load(Ordering::Relaxed)
+    crate::time::monotonic_ms()
 }
 
 /// 签发失败原因（对外映射见 syscalls.rs 号位 40 臂）。
@@ -91,7 +88,7 @@ struct Grant {
     pid: ProcessId,
     /// 授予的能力位（保证不含 CAP_ISSUER，见 GrantBook::issue）。
     caps: u32,
-    /// 失效时刻（逻辑时钟绝对值；u64::MAX = 不过期）。
+    /// 失效时刻（monotonic millisecond deadline；u64::MAX = 不过期）。
     expires_at: u64,
     /// 签发时目标的会话 id；0 = 未绑定（任何会话下都有效）。
     session: u64,
@@ -260,10 +257,7 @@ impl GrantBook {
 
     /// 存活会话快照（SessionList 系统调用的数据源）。
     pub(crate) fn sessions_snapshot(&self) -> Vec<(u64, ProcessId)> {
-        self.sessions
-            .iter()
-            .map(|s| (s.id, s.leader))
-            .collect()
+        self.sessions.iter().map(|s| (s.id, s.leader)).collect()
     }
 
     /// 在账授予数（诊断用）。

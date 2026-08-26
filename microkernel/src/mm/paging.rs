@@ -5,8 +5,8 @@ use super::table_walk::{
     self, classify_leaf, cow_break_leaf, cow_share_leaf, descriptor_to_table, is_cow_leaf,
     is_table, is_valid, make_leaf_descriptor, make_table_descriptor, page_table_indices, walk,
     LeafShareClass, AP_EL1_RW_EL0_NONE, DESC_AF, DESC_ATTRIDX_NORMAL, DESC_SH_INNER,
-    DESC_TYPE_TABLE, DESC_UXN, DESC_VALID, KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1,
-    PHYS_ADDR_MASK, USER_AP_RW, USER_AP_RX,
+    DESC_TYPE_TABLE, DESC_UXN, DESC_VALID, KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1, PHYS_ADDR_MASK,
+    USER_AP_RW, USER_AP_RX,
 };
 
 // 本文件所用常量与 table_walk.rs 保持一致（语义相同，直接复用）。
@@ -53,7 +53,7 @@ pub unsafe fn init_kernel_page_table() {
     const DEVICE_LO: u64 = 0x0800_0000;
     const DEVICE_HI: u64 = 0x1000_0000;
 
-// L0: 根表，所有 entry 先清零。
+    // L0: 根表，所有 entry 先清零。
     let l0 =
         (&raw const crate::mm::kernel_l0::__zero_kernel_l0 as *const PageTable) as *mut PageTable;
     (*l0).0.fill(0);
@@ -69,10 +69,10 @@ pub unsafe fn init_kernel_page_table() {
     (*l0).0[0] = make_table_descriptor(l1_phys);
 
     // L2: 两个表，每个覆盖 1GiB（512 * 2MiB），共 2GiB。
-    let l2_0 = (&raw const crate::mm::kernel_l2::__zero_kernel_l2_0 as *const PageTable)
-        as *mut PageTable;
-    let l2_1 = (&raw const crate::mm::kernel_l2::__zero_kernel_l2_1 as *const PageTable)
-        as *mut PageTable;
+    let l2_0 =
+        (&raw const crate::mm::kernel_l2::__zero_kernel_l2_0 as *const PageTable) as *mut PageTable;
+    let l2_1 =
+        (&raw const crate::mm::kernel_l2::__zero_kernel_l2_1 as *const PageTable) as *mut PageTable;
     (*l2_0).0.fill(0);
     (*l2_1).0.fill(0);
 
@@ -396,7 +396,10 @@ unsafe fn ensure_child_table(
 /// 映射都发生在 spawn 期间、该地址空间**尚未装入任何 TTBR**，因此无需
 /// BBM 序列。将来在活跃空间上做 demand paging 时必须补全
 /// （先清条目 + dsb ishst + tlbi vaae1is + dsb ish + isb，再写新描述符）。
-unsafe fn ensure_user_leaf_table(l2: *mut PageTable, index: usize) -> Result<*mut PageTable, MapError> {
+unsafe fn ensure_user_leaf_table(
+    l2: *mut PageTable,
+    index: usize,
+) -> Result<*mut PageTable, MapError> {
     let entry = (*l2).0[index];
     if entry & DESC_VALID != 0 && entry & DESC_TYPE_TABLE != 0 {
         return Ok(descriptor_to_table(entry) as *mut PageTable);
@@ -429,7 +432,11 @@ unsafe fn map_physical_page(
     ap: u64,
     executable: bool,
 ) -> Result<(), MapError> {
-    install_leaf_descriptor(space, virt, make_page_descriptor(phys as u64, ap, executable))
+    install_leaf_descriptor(
+        space,
+        virt,
+        make_page_descriptor(phys as u64, ap, executable),
+    )
 }
 
 /// 建全表链并把**完整构造好的叶子描述符**写入 VA 槽位。
@@ -872,7 +879,11 @@ unsafe fn clear_user_leaf_range(
 pub unsafe fn unmap_user_range(space: &AddressSpace, start: usize, end: usize) -> usize {
     // 生产绑定：真实 BBM 屏障（dsb ishst / tlbi vaae1is / dsb ish / isb）。
     let mut b = |va: usize| kbbm_barrier(va);
-    unsafe { clear_user_leaf_range(space.root_table, start, end, &mut b, |pa| phys::free_page(pa)) }
+    unsafe {
+        clear_user_leaf_range(space.root_table, start, end, &mut b, |pa| {
+            phys::free_page(pa)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -993,7 +1004,13 @@ mod unmap_tests {
         let space = t.space();
         let mut barrier = |_: usize| {};
         let n = unsafe {
-            clear_user_leaf_range(space.root_table, 0x1000_0000, 0x1000_3000, &mut barrier, |_| {})
+            clear_user_leaf_range(
+                space.root_table,
+                0x1000_0000,
+                0x1000_3000,
+                &mut barrier,
+                |_| {},
+            )
         };
         assert_eq!(n, 0, "全空范围必须零回收");
     }

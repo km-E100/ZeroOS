@@ -11,13 +11,21 @@ set -euo pipefail
 
 MODE="${1:-normal}"
 case "$MODE" in
-  normal)   BOOT_ARGS=() ;;
+  normal)   BOOT_ARGS=(-display none) ;;
+  network)
+    BOOT_ARGS=(-display none -netdev user,id=znet -device virtio-net-device,netdev=znet,bus=virtio-mmio-bus.1 -object rng-random,filename=/dev/urandom,id=zrng -device virtio-rng-device,rng=zrng,bus=virtio-mmio-bus.5)
+    echo "run-qemu: network mode (usernet + virtio-rng)"
+    ;;
+  graphical)
+    BOOT_ARGS=(-display cocoa -netdev user,id=znet -device virtio-net-device,netdev=znet,bus=virtio-mmio-bus.1 -device virtio-gpu-device,bus=virtio-mmio-bus.2 -device virtio-keyboard-device,bus=virtio-mmio-bus.3 -device virtio-tablet-device,bus=virtio-mmio-bus.4 -object rng-random,filename=/dev/urandom,id=zrng -device virtio-rng-device,rng=zrng,bus=virtio-mmio-bus.5)
+    echo "run-qemu: graphical mode (GOP + virtio-gpu + virtio-keyboard)"
+    ;;
   recovery)
     # 恢复模式：-boot d 把 CD 提到固件启动序首位。镜像内含
     # zero-recovery.efi / boot-recovery.cfg / rootfs-recovery.bundle，
     # 引导器按加载路径中的 "recovery" 字样切恢复变体（与 xtask run
     # recovery 完全同参；连续失败 3 次自动进恢复的机制见 STATUS.md）。
-    BOOT_ARGS=(-boot d)
+    BOOT_ARGS=(-display none -boot d)
     echo "run-qemu: recovery mode (-boot d)"
     ;;
   *)
@@ -57,7 +65,6 @@ exec qemu-system-aarch64 \
   -m 1024 \
   -bios "$BIOS" \
   -serial mon:stdio \
-  -display none \
   "${BOOT_ARGS[@]}" \
   -cdrom "$ISO" \
   -drive if=none,file="$DISK",format=raw,id=zdisk,cache=writethrough \

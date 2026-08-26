@@ -26,18 +26,19 @@
 #![no_std]
 
 use core::cmp::min;
+use ed25519_dalek::{Signature, VerifyingKey};
 use core::slice;
 
 use heapless::{String, Vec};
 use spin::Mutex;
 use userlib;
-use zero_zfs_core::crypto::sha256;
 use zero_abi::bootfs::UserBootFile;
 use zero_abi::channels;
 use zero_abi::ipc::Message;
 use zero_abi::protocol::security::{
-    self, parse_cap_issue, parse_token, encode_token, CapIssueRequest,
+    self, encode_token, parse_cap_issue, parse_token, CapIssueRequest,
 };
+use zero_zfs_core::crypto::sha256;
 
 const USERNAME_MAX: usize = 16;
 const PASSWORD_INPUT_MAX: usize = 64;
@@ -46,6 +47,11 @@ const PASSWORD_PREFIX: &str = "$zero$sha256$";
 const PASSWORD_DOMAIN: &[u8] = b"zero-os-userdb-v2";
 const USER_CAPACITY: usize = 8;
 const LIST_BUFFER: usize = 256;
+const PKG_TRUST_ORIGIN: &[u8] = b"zero-os";
+const PKG_ZERO_OS_PUBLIC_KEY: [u8; 32] = [
+    0x5e,0x0a,0x4d,0x36,0xe2,0x2c,0x3a,0xf5,0x5b,0xad,0xa3,0xf8,0x81,0x45,0xe3,0x22,
+    0xfe,0x3c,0xca,0x8a,0x0c,0x3c,0x06,0xfe,0x8b,0x14,0x35,0x1e,0x91,0xef,0x2a,0xd2,
+];
 
 /// 能力令牌台账容量（与内核 MAX_GRANTS 同量级；heapless 定长无堆）。
 const CAP_LEDGER_CAP: usize = 16;
@@ -132,11 +138,9 @@ fn is_admin(pid: u64) -> bool {
 }
 
 fn cap_issue_allowed(sender: u64, role: Option<UserRole>, req: &CapIssueRequest) -> bool {
-    let login_self = req.caps == zero_abi::cap::CAP_SESSION
-        && req.target_pid == sender
-        && role.is_some();
-    let admin_grant = role == Some(UserRole::Admin)
-        && req.caps != zero_abi::cap::CAP_SESSION;
+    let login_self =
+        req.caps == zero_abi::cap::CAP_SESSION && req.target_pid == sender && role.is_some();
+    let admin_grant = role == Some(UserRole::Admin) && req.caps != zero_abi::cap::CAP_SESSION;
     login_self || admin_grant
 }
 
@@ -151,7 +155,9 @@ fn password_digest(username: &str, password: &str) -> Option<[u8; 32]> {
     let mut n = 0usize;
     let mut append = |bytes: &[u8]| -> Option<()> {
         let end = n.checked_add(bytes.len())?;
-        if end > input.len() { return None; }
+        if end > input.len() {
+            return None;
+        }
         input[n..end].copy_from_slice(bytes);
         n = end;
         Some(())
@@ -320,7 +326,10 @@ pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
 enum RestoreOutcome {
     /// 从盘恢复成功：携带 (记录数, 用户名清单) 供横幅展示——清单
     /// 直接证明数据来自盘而非默认表（跨启动持久化的实机验收点）。
-    Restored { count: usize, names: String<LIST_BUFFER> },
+    Restored {
+        count: usize,
+        names: String<LIST_BUFFER>,
+    },
     /// 块设备在但无有效 SUD1 头部（首启/旧布局/损坏）→ 播种默认表。
     NoValidHeader,
     /// 块设备不可用（ISO 直启、未挂盘）→ 降级为内存态并告警。
@@ -479,11 +488,31 @@ fn process_command(sender: u64, msg: &mut Message) {
         security::CMD_CAP_REVOKE if is_admin(sender) => handle_cap_revoke(msg),
         security::CMD_CAP_LIST if is_admin(sender) => handle_cap_list(msg),
         security::CMD_CAP_VERIFY if is_admin(sender) => handle_cap_verify(msg),
+        security::CMD_PKG_VERIFY => handle_pkg_verify(msg),
         _ => {
             msg.payload.fill(0);
             msg.code = 3; // authenticated/authorization policy denied
         }
     }
+}
+
+fn handle_pkg_verify(msg: &mut Message) {
+    let origin_len = msg.payload[0] as usize;
+    let needed = 1usize.saturating_add(origin_len).saturating_add(32).saturating_add(64);
+    let ok = if origin_len == PKG_TRUST_ORIGIN.len() && needed <= msg.payload.len()
+        && &msg.payload[1..1 + origin_len] == PKG_TRUST_ORIGIN
+    {
+        let hash_off = 1 + origin_len;
+        let sig_off = hash_off + 32;
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&msg.payload[sig_off..sig_off + 64]);
+        match VerifyingKey::from_bytes(&PKG_ZERO_OS_PUBLIC_KEY) {
+            Ok(key) => key.verify_strict(&msg.payload[hash_off..hash_off + 32], &Signature::from_bytes(&sig_bytes)).is_ok(),
+            Err(_) => false,
+        }
+    } else { false };
+    msg.payload.fill(0);
+    msg.code = if ok { 0 } else { 1 };
 }
 
 fn handle_list(msg: &mut Message) {
@@ -619,7 +648,11 @@ fn handle_cap_issue(sender: u64, msg: &mut Message) {
         msg.code = 1;
         return;
     };
-    let CapIssueRequest { target_pid, caps, ttl } = req;
+    let CapIssueRequest {
+        target_pid,
+        caps,
+        ttl,
+    } = req;
     if !cap_issue_allowed(sender, authenticated_role(sender), &req) {
         msg.payload.fill(0);
         msg.code = 3;
@@ -687,7 +720,11 @@ fn handle_cap_list(msg: &mut Message) {
             entry.token,
             entry.target_pid,
             entry.caps,
-            if entry.revoked { "[revoked]" } else { "[active]" }
+            if entry.revoked {
+                "[revoked]"
+            } else {
+                "[active]"
+            }
         )
         .is_err()
         {
@@ -792,10 +829,7 @@ fn write_user_blob(records: &Vec<UserRecord, USER_CAPACITY>) -> Result<usize, ()
         offset += bytes.len();
     }
     // 整扇区写：尾部零填充到扇区边界（至少 1 扇区，空库也有合法记录区）。
-    let used_sectors = core::cmp::max(
-        offset.div_ceil(USERDB_SECTOR_SIZE),
-        1,
-    );
+    let used_sectors = core::cmp::max(offset.div_ceil(USERDB_SECTOR_SIZE), 1);
     let write_len = used_sectors * USERDB_SECTOR_SIZE;
     userlib::block_write(USERDB_RECORD_LBA, &data.bytes[..write_len]).map_err(|_| ())?;
 
@@ -835,12 +869,20 @@ mod tests {
             revoked: false,
         });
         // 在账未撤销 → 有效
-        assert!(ledger.iter().find(|e| e.token == 7).map(|e| !e.revoked).unwrap_or(false));
+        assert!(ledger
+            .iter()
+            .find(|e| e.token == 7)
+            .map(|e| !e.revoked)
+            .unwrap_or(false));
         // 撤销标废（保留行，不删——审计痕迹）
         if let Some(entry) = ledger.iter_mut().find(|e| e.token == 7) {
             entry.revoked = true;
         }
-        assert!(ledger.iter().find(|e| e.token == 7).map(|e| e.revoked).unwrap_or(false));
+        assert!(ledger
+            .iter()
+            .find(|e| e.token == 7)
+            .map(|e| e.revoked)
+            .unwrap_or(false));
         // 未知 token 查无此行
         assert!(ledger.iter().find(|e| e.token == 8).is_none());
     }
@@ -893,19 +935,40 @@ mod tests {
         let again = UserRecord::build("root", root.password.as_str(), UserRole::Admin).unwrap();
         assert_eq!(again.password.as_str(), root.password.as_str());
         let stored = parse_encoded_digest(root.password.as_str()).unwrap();
-        assert!(constant_time_eq(&stored, &password_digest("root", "zero").unwrap()));
-        assert!(!constant_time_eq(&stored, &password_digest("root", "wrong").unwrap()));
+        assert!(constant_time_eq(
+            &stored,
+            &password_digest("root", "zero").unwrap()
+        ));
+        assert!(!constant_time_eq(
+            &stored,
+            &password_digest("root", "wrong").unwrap()
+        ));
     }
 
     #[test]
     fn capability_policy_binds_identity_to_kernel_sender() {
         let sender = 42;
-        let login = CapIssueRequest { target_pid: sender, caps: zero_abi::cap::CAP_SESSION, ttl: 0 };
+        let login = CapIssueRequest {
+            target_pid: sender,
+            caps: zero_abi::cap::CAP_SESSION,
+            ttl: 0,
+        };
         assert!(!cap_issue_allowed(sender, None, &login));
         assert!(cap_issue_allowed(sender, Some(UserRole::User), &login));
-        let forged_login = CapIssueRequest { target_pid: 99, ..login };
-        assert!(!cap_issue_allowed(sender, Some(UserRole::User), &forged_login));
-        let powerful = CapIssueRequest { target_pid: 99, caps: zero_abi::cap::CAP_BLOCK_DEV, ttl: 100 };
+        let forged_login = CapIssueRequest {
+            target_pid: 99,
+            ..login
+        };
+        assert!(!cap_issue_allowed(
+            sender,
+            Some(UserRole::User),
+            &forged_login
+        ));
+        let powerful = CapIssueRequest {
+            target_pid: 99,
+            caps: zero_abi::cap::CAP_BLOCK_DEV,
+            ttl: 100,
+        };
         assert!(!cap_issue_allowed(sender, Some(UserRole::User), &powerful));
         assert!(cap_issue_allowed(sender, Some(UserRole::Admin), &powerful));
     }
@@ -928,5 +991,4 @@ mod tests {
         assert_eq!(guest.code, 0);
         assert_eq!(authenticated_role(43), Some(UserRole::User));
     }
-
 }

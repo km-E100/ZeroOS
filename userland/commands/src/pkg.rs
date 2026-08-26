@@ -1,11 +1,11 @@
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -51,7 +51,7 @@ pub fn pack(
     let hash = hash_directory(app_path)?;
 
     let mut manifest = PackageManifest {
-        format_version: 1,
+        format_version: 2,
         bundle_name: bundle_name.clone(),
         name: config.name.clone(),
         identifier: config.identifier.clone(),
@@ -73,12 +73,8 @@ pub fn pack(
         let key = fs::read_to_string(sign_key_path)
             .with_context(|| format!("读取签名密钥 {} 失败", sign_key_path.display()))?;
         let signature = compute_signature(
-            key.trim().as_bytes(),
-            origin,
-            &manifest.identifier,
-            &manifest.version,
-            &manifest.bundle_hash,
-        );
+            key.trim(), origin, &manifest.identifier, &manifest.version, &manifest.bundle_hash,
+        )?;
         manifest.signature = Some(signature);
     }
 
@@ -345,25 +341,40 @@ fn collect_files(app_path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn hash_directory(dir: &Path) -> Result<String> {
-    let mut hasher = DefaultHasher::new();
     let files = collect_files(dir)?;
+    let mut canonical = Vec::new();
     for rel in files.iter() {
         let path_str = rel.to_string_lossy();
-        hasher.write(path_str.as_bytes());
+        let path = path_str.as_bytes();
+        canonical.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(path);
         let file = dir.join(rel);
-        let metadata = fs::metadata(&file)?;
-        hasher.write_u64(metadata.len());
-        let mut reader = File::open(&file)?;
-        let mut buffer = [0u8; 8192];
-        loop {
-            let n = reader.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hasher.write(&buffer[..n]);
-        }
+        let data = fs::read(&file)?;
+        canonical.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&data);
     }
-    Ok(format!("{:016x}", hasher.finish()))
+    Ok(hex_encode(&crypto::sha256(&canonical)))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const H: &[u8;16]=b"0123456789abcdef";
+    let mut out=String::with_capacity(bytes.len()*2);
+    for &b in bytes { out.push(H[(b>>4) as usize] as char); out.push(H[(b&15) as usize] as char); }
+    out
+}
+fn hex_decode<const N:usize>(text:&str)->Result<[u8;N]> {
+    let b=text.trim().as_bytes();
+    if b.len()!=N*2 { anyhow::bail!("hex length mismatch: expected {}",N*2); }
+    let mut out=[0u8;N];
+    fn v(c:u8)->Option<u8>{match c{b'0'..=b'9'=>Some(c-b'0'),b'a'..=b'f'=>Some(c-b'a'+10),b'A'..=b'F'=>Some(c-b'A'+10),_=>None}}
+    for i in 0..N { out[i]=(v(b[i*2]).ok_or_else(||anyhow::anyhow!("bad hex"))?<<4)|v(b[i*2+1]).ok_or_else(||anyhow::anyhow!("bad hex"))?; }
+    Ok(out)
+}
+
+fn signature_message_hash(origin:&str, identifier:&str, version:&str, bundle_hash:&str)->[u8;32]{
+    let mut m=Vec::new(); m.extend_from_slice(b"zero-pkg-v2\0");
+    for v in [origin,identifier,version,bundle_hash] { m.extend_from_slice(v.as_bytes()); m.push(0); }
+    crypto::sha256(&m)
 }
 
 fn determine_output_path(manifest: &PackageManifest, explicit: Option<&Path>) -> Result<PathBuf> {
@@ -405,18 +416,13 @@ fn collect_trust_warnings(manifest: &PackageManifest) -> Result<Vec<String>> {
             match load_trusted_key(origin)? {
                 Some(key) => match manifest.signature.as_ref() {
                     Some(signature) => {
-                        if signature.len() != 64 {
+                        if signature.len() != 128 {
                             warnings
-                                .push(format!("签名长度异常（origin={}，expect 64 hex）", origin));
+                                .push(format!("签名长度异常（origin={}，expect 128 hex）", origin));
                         }
-                        let expected = compute_signature(
-                            key.as_bytes(),
-                            origin,
-                            &manifest.identifier,
-                            &manifest.version,
-                            &manifest.bundle_hash,
-                        );
-                        if !constant_time_eq(signature, &expected) {
+                        if !verify_signature_hex(
+                            key.trim(), signature, origin, &manifest.identifier, &manifest.version, &manifest.bundle_hash,
+                        ) {
                             warnings.push(format!("签名校验失败（origin={}）", origin));
                         }
                     }
@@ -534,25 +540,18 @@ fn save_trusted_origins(entries: &HashSet<String>) -> Result<()> {
 }
 
 fn compute_signature(
-    key: &[u8],
-    origin: &str,
-    identifier: &str,
-    version: &str,
-    bundle_hash: &str,
-) -> String {
-    let message = format!("{}\n{}\n{}\n{}", origin, identifier, version, bundle_hash);
-    crypto::hmac_sha256_hex(key, message.as_bytes())
+    seed_hex: &str, origin: &str, identifier: &str, version: &str, bundle_hash: &str,
+) -> Result<String> {
+    let seed=hex_decode::<32>(seed_hex)?;
+    let signing=SigningKey::from_bytes(&seed);
+    let digest=signature_message_hash(origin,identifier,version,bundle_hash);
+    let sig:Signature=signing.sign(&digest);
+    Ok(hex_encode(&sig.to_bytes()))
 }
 
-fn constant_time_eq(lhs: &str, rhs: &str) -> bool {
-    let a = lhs.as_bytes();
-    let b = rhs.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+fn verify_signature_hex(public_hex:&str, signature_hex:&str, origin:&str, identifier:&str, version:&str, bundle_hash:&str)->bool{
+    let Ok(pk)=hex_decode::<32>(public_hex) else{return false};
+    let Ok(sb)=hex_decode::<64>(signature_hex) else{return false};
+    let Ok(vk)=VerifyingKey::from_bytes(&pk) else{return false};
+    vk.verify(&signature_message_hash(origin,identifier,version,bundle_hash),&Signature::from_bytes(&sb)).is_ok()
 }

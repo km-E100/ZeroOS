@@ -11,10 +11,13 @@
 //! - `init` 幂等：重复调用直接返回。
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-const GICD_BASE: usize = 0x0800_0000;
-const GICC_BASE: usize = 0x0801_0000;
+const LEGACY_GICD_BASE: usize = 0x0800_0000;
+const LEGACY_GICC_BASE: usize = 0x0801_0000;
+static GICD_BASE: AtomicUsize = AtomicUsize::new(LEGACY_GICD_BASE);
+static GICC_BASE: AtomicUsize = AtomicUsize::new(LEGACY_GICC_BASE);
+static TIMER_IRQ: AtomicU32 = AtomicU32::new(30);
 
 const CTLR_OFFSET: usize = 0x000;
 const PMR_OFFSET: usize = 0x004;
@@ -29,8 +32,11 @@ const INTID_MASK: u32 = 0x3ff;
 /// 本项目只使用 SGI/PPI/SPI，SPI 上限 255。
 const MAX_INTID: u32 = 255;
 
-/// 每 CPU 定时器 PPI。
-pub const TIMER_IRQ_ID: u32 = 30;
+/// 当前每 CPU 定时器 PPI。GTDT 有效时由 ACPI 覆盖，缺失时保持 30。
+#[inline]
+pub fn timer_irq_id() -> u32 {
+    TIMER_IRQ.load(Ordering::Acquire)
+}
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 /// 越界告警只报一次，防高频错误调用刷屏。
@@ -38,12 +44,12 @@ static RANGE_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
 unsafe fn gicd_reg(offset: usize) -> *mut u32 {
-    (GICD_BASE + offset) as *mut u32
+    (GICD_BASE.load(Ordering::Relaxed) + offset) as *mut u32
 }
 
 #[inline(always)]
 unsafe fn gicc_reg(offset: usize) -> *mut u32 {
-    (GICC_BASE + offset) as *mut u32
+    (GICC_BASE.load(Ordering::Relaxed) + offset) as *mut u32
 }
 
 /// 初始化 GIC：幂等。先置位标志，使 init 内部调用 enable_irq 不误告警。
@@ -52,6 +58,19 @@ pub unsafe fn init() {
         return;
     }
 
+    let gicd = crate::acpi::gicd_base()
+        .map(|v| v as usize)
+        .unwrap_or(LEGACY_GICD_BASE);
+    let gicc = crate::acpi::gicc_base()
+        .map(|v| v as usize)
+        .unwrap_or(LEGACY_GICC_BASE);
+    let timer_irq = crate::acpi::timer_irq()
+        .filter(|id| *id <= MAX_INTID)
+        .unwrap_or(30);
+    GICD_BASE.store(gicd, Ordering::Release);
+    GICC_BASE.store(gicc, Ordering::Release);
+    TIMER_IRQ.store(timer_irq, Ordering::Release);
+
     // 关闭分发器与 CPU 接口，再逐项配置。
     write_volatile(gicd_reg(CTLR_OFFSET), 0);
     write_volatile(gicc_reg(CTLR_OFFSET), 0);
@@ -59,15 +78,25 @@ pub unsafe fn init() {
     // 允许全部优先级。
     write_volatile(gicc_reg(PMR_OFFSET), 0xFF);
 
-    // 使能定时器中断并压低其优先级。
-    enable_irq(TIMER_IRQ_ID);
-    set_priority(TIMER_IRQ_ID, 0x20);
+    // 使能固件描述的 NS EL1 timer PPI；GTDT 缺失时回退 INTID 30。
+    enable_irq(timer_irq);
+    set_priority(timer_irq, 0x20);
 
     // 使能分发器与 CPU 接口。
     write_volatile(gicd_reg(CTLR_OFFSET), 1);
     write_volatile(gicc_reg(CTLR_OFFSET), 1);
 
-    crate::debug!("gic: GIC-400 初始化完成");
+    crate::info!(
+        "gic: platform gicd={:#x} gicc={:#x} timer_irq={}{}",
+        gicd,
+        gicc,
+        timer_irq,
+        if crate::acpi::timer_irq().is_some() {
+            " (ACPI)"
+        } else {
+            " (legacy)"
+        }
+    );
 }
 
 /// 副核专用：只初始化本核 banked 的 CPU 接口（GICD 由主核一次配好）。
@@ -87,8 +116,7 @@ pub fn send_resched_sgi(target_mask: u8) {
     if target_mask == 0 {
         return;
     }
-    let word: u32 =
-        ((target_mask as u32 & 0xFF) << 16) | (SGI_RESCHED & 0xF);
+    let word: u32 = ((target_mask as u32 & 0xFF) << 16) | (SGI_RESCHED & 0xF);
     unsafe { write_volatile(gicd_reg(0xF00), word) };
 }
 
@@ -104,7 +132,7 @@ pub unsafe fn end_interrupt(id: u32) {
 }
 
 pub fn is_timer_interrupt(id: u32) -> bool {
-    (id & INTID_MASK) == TIMER_IRQ_ID
+    (id & INTID_MASK) == timer_irq_id()
 }
 
 pub fn interrupt_number(raw: u32) -> u32 {

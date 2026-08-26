@@ -57,12 +57,24 @@ HOST_CRATES=(
     "zero-ipc-router"
     "zero-securityd"
     "zero-service-controller"
+    "zero-inputd"
+    "zero-windowserver"
+    "zero-netd"
+    "zero-webtest"
+    "zero-pkgd"
+    "zero-pkgtest"
+    "zero-audiod"
+    "zero-audiotest"
+    "zero-gputest"
     "mkzfs"
     "userlib"
     "useralloc"
     "zero-user-commands"
     "libfsclient"
     "libblkclient"
+    "libnetclient"
+    "libweb"
+    "libpkg"
     "xtask"
 )
 for crate in "${HOST_CRATES[@]}"; do
@@ -75,7 +87,13 @@ done
 run_step "check(aarch64-unknown-none) bare-metal chain" \
     cargo +nightly check -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none \
       -p zero-microkernel -p zero-kernel -p zero-launchd -p user-app \
-      -p zero-securityd -p zero-fsd -p zero-blkdrv
+      -p zero-securityd -p zero-fsd -p zero-fs-zfs -p zero-blkdrv \
+      -p zero-inputd -p zero-windowserver -p zero-netd -p zero-webtest \
+      -p zero-pkgd -p zero-pkgtest -p zero-audiod -p zero-audiotest -p zero-gputest
+run_step "check(PIC/KASLR target) kernel + PIE services" \
+    cargo +nightly -Z json-target-spec -Z build-std=core,compiler_builtins,alloc check \
+      --target userland/targets/aarch64-unknown-none-pic.json \
+      -p zero-kernel -p zero-pietest
 run_step "check(aarch64-unknown-uefi) bootloader-uefi" \
     cargo +nightly check --target aarch64-unknown-uefi -p bootloader-uefi
 
@@ -84,7 +102,10 @@ run_step "check(aarch64-unknown-uefi) bootloader-uefi" \
 # ------------------------------------------------------------------
 run_step "test zero-microkernel" cargo test -p zero-microkernel --lib -- --test-threads=1
 run_step "test mm-host-tests" bash -lc 'cd microkernel/mm-host-tests && cargo test'
-for crate in zero-zfs-core zero-securityd zero-fsd zero-ipc-router userlib useralloc zero-abi; do
+for crate in zero-zfs-core zero-securityd zero-fsd zero-fs-zfs zero-ipc-router \
+             zero-inputd zero-windowserver zero-netd zero-webtest zero-pkgd zero-pkgtest \
+             zero-audiod zero-audiotest zero-gputest \
+             libfsclient libblkclient libnetclient libweb libpkg userlib useralloc zero-abi; do
     run_step "test $crate" cargo test -p "$crate"
 done
 

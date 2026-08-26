@@ -8,14 +8,35 @@ _start:
     msr    SPSel, #1               // 使用 SP_EL1
 
     // 2. 建立初始栈
-    ldr    x0, =_stack_top
+    adrp   x0, _stack_top
+    add    x0, x0, :lo12:_stack_top
     mov    sp, x0
 
     // 3. 清理 BSS 段
     bl     zero_bss
 
-    // 4. 调用内核入口
-    ldr    x0, =boot_info_struct
+    // 4. 以 PC-relative 地址在运行时填 BootInfo。这样 boot_info_struct
+    // 不含任何 ABS64 relocation，整个入口从第一条指令即可任意搬移。
+    adrp   x0, boot_info_struct
+    add    x0, x0, :lo12:boot_info_struct
+    adrp   x1, __zero_ipc_server_entry
+    add    x1, x1, :lo12:__zero_ipc_server_entry
+    str    x1, [x0, #0]
+    adrp   x1, __zero_zfs_server_entry
+    add    x1, x1, :lo12:__zero_zfs_server_entry
+    str    x1, [x0, #8]
+    adrp   x1, __zero_launchd_entry
+    add    x1, x1, :lo12:__zero_launchd_entry
+    str    x1, [x0, #16]
+    adrp   x1, __zero_rootfs_image
+    add    x1, x1, :lo12:__zero_rootfs_image
+    str    x1, [x0, #24]
+    adrp   x1, __zero_driver_table
+    add    x1, x1, :lo12:__zero_driver_table
+    str    x1, [x0, #32]
+    adrp   x1, __zero_memory_bytes
+    add    x1, x1, :lo12:__zero_memory_bytes
+    str    x1, [x0, #40]
     bl     kernel_main
 
 // 如果返回则挂起
@@ -31,8 +52,10 @@ _start:
 .align 2
 .type zero_bss, %function
 zero_bss:
-    ldr    x0, =__bss_start
-    ldr    x1, =__bss_end
+    adrp   x0, __bss_start
+    add    x0, x0, :lo12:__bss_start
+    adrp   x1, __bss_end
+    add    x1, x1, :lo12:__bss_end
     cmp    x0, x1
     b.hs   2f
 1:
@@ -44,21 +67,15 @@ zero_bss:
 .size zero_bss, . - zero_bss
 
 // -----------------------------------------------------------------------------
-// 静态引导信息（可由链接时覆盖）
-// 布局与 libs/abi 的 BootInfo 逐字段对齐（6 个 8 字节字段）：
-//   __zero_ipc_server_entry / __zero_zfs_server_entry / __zero_launchd_entry
-//   / __zero_rootfs_image / __zero_driver_table / __zero_memory_bytes
+// BootInfo storage. `_start` fills all six words with PC-relative addresses.
+// Keeping this in writable data avoids absolute pointers in the ELF image and
+// is also more honest than declaring a runtime-filled structure read-only.
 // -----------------------------------------------------------------------------
-.section .rodata.boot, "a"
+.section .data.boot, "aw"
 .align 3
 .globl boot_info_struct
 boot_info_struct:
-    .quad __zero_ipc_server_entry
-    .quad __zero_zfs_server_entry
-    .quad __zero_launchd_entry
-    .quad __zero_rootfs_image
-    .quad __zero_driver_table
-    .quad __zero_memory_bytes
+    .zero 48
 
 // 默认服务器入口占位符（可被强符号覆盖）
 .section .text.boot
@@ -77,20 +94,13 @@ __zero_zfs_server_entry:
 __zero_launchd_entry:
     b .
 
+// __zero_rootfs_image / __zero_driver_table are mandatory strong Rust symbols
+// from kernel/src/rootfs.rs and kernel/src/drivers.rs. Do not define weak
+// fallbacks in this same global_asm object: release codegen can coalesce the
+// Rust statics and assembly, and LLVM's assembler then rejects a same-object
+// weak definition whose binding is later upgraded to global.
 .section .rodata.boot, "a"
 .align 3
-.weak __zero_rootfs_image
-.type __zero_rootfs_image, %object
-__zero_rootfs_image:
-    .quad 0
-    .quad 0
-
-.align 3
-.weak __zero_driver_table
-.type __zero_driver_table, %object
-__zero_driver_table:
-    .quad 0
-    .quad 0
 
 // 可用物理内存字节数占位（BootInfo.memory_bytes 指向的位置）。
 // 0 = 未知：内核 mm 初始化时回退到默认 512 MiB。
@@ -110,6 +120,22 @@ __zero_memory_bytes:
 .type __zero_rsdp_phys, %object
 __zero_rsdp_phys:
     .quad 0
+
+// UEFI GOP framebuffer handoff（第21刀）。bootloader 在 ExitBootServices 前
+// 补丁这些标量；base=0 表示没有可直接访问的 GOP framebuffer。
+.align 3
+.globl __zero_fb_base
+__zero_fb_base:   .quad 0
+.globl __zero_fb_size
+__zero_fb_size:   .quad 0
+.globl __zero_fb_width
+__zero_fb_width:  .quad 0
+.globl __zero_fb_height
+__zero_fb_height: .quad 0
+.globl __zero_fb_stride
+__zero_fb_stride: .quad 0
+.globl __zero_fb_format
+__zero_fb_format: .quad 0   // 1=RGBX8888, 2=BGRX8888
 
 // -----------------------------------------------------------------------------
 // 内核引导栈

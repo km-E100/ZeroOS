@@ -88,20 +88,26 @@ impl Slot {
 
     /// 精确匹配一个文件记录（不含目录标记）。
     fn matches(&self, path: &[u8]) -> bool {
-        self.used && !self.is_dir_marker() && self.name[..path.len()] == *path
+        self.used
+            && !self.is_dir_marker()
+            && self.name[..path.len()] == *path
             && self.name[path.len()] == 0
     }
 
     /// 精确匹配一个目录标记（第十二刀：name 以 '/' 结尾）。
     fn matches_dir(&self, path: &[u8]) -> bool {
-        self.used && self.is_dir_marker() && self.name[..path.len()] == *path
+        self.used
+            && self.is_dir_marker()
+            && self.name[..path.len()] == *path
             && self.name[path.len()] == b'/'
             && path.len() + 1 <= NAME_MAX
     }
 
     /// 目录标记判据：存储名以 '/' 结尾（文件名按协议不允许以 '/' 结尾）。
     fn is_dir_marker(&self) -> bool {
-        self.name.iter().position(|&b| b == 0)
+        self.name
+            .iter()
+            .position(|&b| b == 0)
             .map_or(false, |end| end > 0 && self.name[end - 1] == b'/')
     }
 
@@ -154,8 +160,8 @@ fn normalize_path(raw: &[u8]) -> Option<Vec<u8>> {
     }
     for seg in body.split(|&b| b == b'/') {
         match seg {
-            b"" => return None,                      // 双斜杠 / 尾部斜杠
-            b"." | b".." => return None,             // 本里程碑不做点段解析
+            b"" => return None,          // 双斜杠 / 尾部斜杠
+            b"." | b".." => return None, // 本里程碑不做点段解析
             _ => {}
         }
     }
@@ -435,7 +441,10 @@ fn cmd_write(payload: &[u8]) {
         return;
     }
     let mut fds = FDS.lock();
-    let Some(descriptor) = fds.iter_mut().find_map(|e| e.as_mut().filter(|d| d.id == fd)) else {
+    let Some(descriptor) = fds
+        .iter_mut()
+        .find_map(|e| e.as_mut().filter(|d| d.id == fd))
+    else {
         respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
         return;
     };
@@ -501,7 +510,10 @@ fn cmd_read(payload: &[u8]) {
         return;
     }
     let mut fds = FDS.lock();
-    let Some(descriptor) = fds.iter_mut().find_map(|e| e.as_mut().filter(|d| d.id == fd)) else {
+    let Some(descriptor) = fds
+        .iter_mut()
+        .find_map(|e| e.as_mut().filter(|d| d.id == fd))
+    else {
         respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
         return;
     };
@@ -794,7 +806,11 @@ fn parse_open(payload: &[u8]) -> Option<(Vec<u8>, u8)> {
     let end = payload.iter().position(|&b| b == 0)?;
     let raw = &payload[..end];
     let rest = &payload[end + 1..];
-    let mode = if rest.is_empty() { vt::OPEN_EXISTING } else { rest[0] };
+    let mode = if rest.is_empty() {
+        vt::OPEN_EXISTING
+    } else {
+        rest[0]
+    };
     let path = normalize_path(raw)?;
     Some((path, mode))
 }
@@ -928,10 +944,7 @@ mod path_tests {
     fn split_parent_root_and_nested() {
         assert_eq!(split_parent(b"a.txt"), (&[][..], &b"a.txt"[..]));
         assert_eq!(split_parent(b"d/a.txt"), (&b"d"[..], &b"a.txt"[..]));
-        assert_eq!(
-            split_parent(b"d/sub/b.txt"),
-            (&b"d/sub"[..], &b"b.txt"[..])
-        );
+        assert_eq!(split_parent(b"d/sub/b.txt"), (&b"d/sub"[..], &b"b.txt"[..]));
     }
 
     #[test]

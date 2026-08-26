@@ -6,11 +6,13 @@ extern crate std;
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod arch;
 pub mod boot;
-pub mod acpi;
 pub mod bootinfo;
 pub mod debug;
+pub mod display;
+mod display_font;
 pub mod drivers; // drivers/ 目录模块（驱动与中断服务，拆分自 drivers.rs）
 pub mod elf;
 pub mod ipc;
@@ -24,6 +26,7 @@ pub mod security;
 pub mod services;
 pub mod shm;
 pub mod syscalls;
+pub mod time;
 pub mod trap;
 pub mod user_elf;
 
@@ -45,9 +48,7 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     bootinfo::init(boot_info);
     info!("kernel_main: entering boot::init_arch");
     boot::init_arch(boot_info);
-    info!("kernel_main: boot::init_arch complete");
-    // ACPI 表地址来自固件，等 MM/恒等映射建立后再解析。
-    acpi::init();
+    info!("kernel_main: boot::init_arch complete (ACPI/platform ready)");
     info!(
         "kernel_main: rootfs init (boot_info.rootfs=0x{:016x})",
         boot_info.rootfs as usize

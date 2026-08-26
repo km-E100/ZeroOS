@@ -13,13 +13,17 @@ use crate::{debug, info, warn};
 
 use super::super::{register_irq_handler, NetError};
 use super::{
-    configure_queue, mmio_read32, mmio_write32, negotiate_features, probe_device, set_driver_ok,
-    VirtQueue, VIRTQ_DESC_F_WRITE,
+    configure_queue, mmio_read32, mmio_write32, negotiate_features_low, probe_device,
+    set_driver_ok, VirtQueue, VIRTQ_DESC_F_WRITE,
 };
 
 const RX_QUEUE_SIZE: usize = 8;
 const TX_QUEUE_SIZE: usize = 8;
 const MAX_FRAME: usize = 1536;
+const NET_HDR_LEN: usize = 10;
+const BUFFER_LEN: usize = NET_HDR_LEN + MAX_FRAME;
+const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+const REG_CONFIG: usize = 0x100;
 const DEVICE_ID_NET: u32 = 1;
 
 struct VirtioNetState {
@@ -31,6 +35,7 @@ struct VirtioNetState {
     rx_lengths: [u16; RX_QUEUE_SIZE],
     tx_buffer: *mut u8,
     tx_inflight: bool,
+    mac: [u8; 6],
 }
 
 impl VirtioNetState {
@@ -44,6 +49,7 @@ impl VirtioNetState {
             rx_lengths: [u16::MAX; RX_QUEUE_SIZE],
             tx_buffer: ptr::null_mut(),
             tx_inflight: false,
+            mac: [0; 6],
         }
     }
 }
@@ -55,12 +61,24 @@ static STATE: Mutex<VirtioNetState> = Mutex::new(VirtioNetState::new());
 pub fn init(descriptor: &DriverDescriptor) {
     let base = descriptor.mmio_base as usize;
     unsafe {
+        let version = super::transport_version(base);
+        crate::info!("virtio-net: transport version={}", version);
+        if mmio_read32(base, 0x008) == 0 {
+            return;
+        }
         if !probe_device(base, DEVICE_ID_NET, "virtio-net") {
             return;
         }
-        if !negotiate_features(base) {
+        let Some(features) = negotiate_features_low(base, VIRTIO_NET_F_MAC) else {
             warn!("driver: virtio-net 特征协商失败 @ {:#x}", base);
             return;
+        };
+        if features & VIRTIO_NET_F_MAC != 0 {
+            let mut mac = [0u8; 6];
+            for (i, b) in mac.iter_mut().enumerate() {
+                *b = core::ptr::read_volatile((base + REG_CONFIG + i) as *const u8);
+            }
+            STATE.lock().mac = mac;
         }
     }
 
@@ -86,20 +104,83 @@ pub fn init(descriptor: &DriverDescriptor) {
     if !init_tx_buffer(&mut state) {
         return;
     }
+    if let Some(q) = state.rx_queue.as_ref() {
+        let (d, a, u, idx, r0) = q.debug_layout();
+        crate::info!(
+            "virtio-net: RX q desc={:#x} avail={:#x} used={:#x} idx={} ring0={}",
+            d,
+            a,
+            u,
+            idx,
+            r0
+        );
+    }
+    if let Some(q) = state.tx_queue.as_ref() {
+        let (d, a, u, idx, r0) = q.debug_layout();
+        crate::info!(
+            "virtio-net: TX q desc={:#x} avail={:#x} used={:#x} idx={} ring0={}",
+            d,
+            a,
+            u,
+            idx,
+            r0
+        );
+    }
     state.ready = true;
     drop(state);
 
     register_irq_handler(descriptor.irq, irq_handler);
     unsafe { set_driver_ok(base) };
-    info!("driver: virtio-net 初始化完成 (base=0x{:016x} irq={})", base, descriptor.irq);
+    info!(
+        "driver: virtio-net 初始化完成 (base=0x{:016x} irq={})",
+        base, descriptor.irq
+    );
 }
 
 pub fn is_ready() -> bool {
     STATE.lock().ready
 }
 
-/// 发送一帧：非阻塞。上一帧未完成（tx_inflight）时返回 Busy，
-/// 调用方稍后重试即可，不在此等待。
+/// Device MAC negotiated through VIRTIO_NET_F_MAC.
+pub fn mac_address() -> Option<[u8; 6]> {
+    let s = STATE.lock();
+    (s.ready && s.mac != [0; 6]).then_some(s.mac)
+}
+
+/// 主动收割 used ring。IRQ handler 与 syscall 轮询路径共用：网络正确性
+/// 不依赖中断一定及时到达（QEMU/真机均允许 interrupt suppression/coalescing）。
+fn reap_completions(state: &mut VirtioNetState) {
+    if let Some(rx_queue) = state.rx_queue.as_mut() {
+        let mut idxs = [0u16; RX_QUEUE_SIZE];
+        let mut lens = [0u16; RX_QUEUE_SIZE];
+        let mut count = 0usize;
+        while let Some(elem) = rx_queue.pop_used() {
+            if count < RX_QUEUE_SIZE {
+                idxs[count] = elem.id as u16;
+                lens[count] = elem.len.min(u16::MAX as u32) as u16;
+                count += 1;
+            }
+        }
+        for i in 0..count {
+            let slot = idxs[i] as usize;
+            if slot < RX_QUEUE_SIZE {
+                state.rx_lengths[slot] = lens[i];
+            }
+        }
+    }
+    if let Some(tx_queue) = state.tx_queue.as_mut() {
+        let mut completed = false;
+        while tx_queue.pop_used().is_some() {
+            completed = true;
+        }
+        if completed {
+            state.tx_inflight = false;
+        }
+    }
+}
+
+/// 发送一帧：非阻塞。上一帧未完成（tx_inflight）时先主动收割 used ring；
+/// 仍未完成才返回 Busy。这样 IRQ 是低延迟优化，不是正确性前提。
 pub fn transmit(frame: &[u8]) -> Result<(), NetError> {
     if frame.is_empty() {
         return Ok(());
@@ -112,6 +193,7 @@ pub fn transmit(frame: &[u8]) -> Result<(), NetError> {
     if !state.ready {
         return Err(NetError::NotReady);
     }
+    reap_completions(&mut state);
     if state.tx_inflight {
         return Err(NetError::Busy);
     }
@@ -120,14 +202,15 @@ pub fn transmit(frame: &[u8]) -> Result<(), NetError> {
         return Err(NetError::DeviceError);
     }
     unsafe {
-        ptr::copy_nonoverlapping(frame.as_ptr(), tx_buffer, frame.len());
+        ptr::write_bytes(tx_buffer, 0, NET_HDR_LEN);
+        ptr::copy_nonoverlapping(frame.as_ptr(), tx_buffer.add(NET_HDR_LEN), frame.len());
     }
     {
         let queue = state.tx_queue.as_mut().ok_or(NetError::DeviceError)?;
         unsafe {
             let desc = queue.desc;
             (*desc).addr = tx_buffer as u64;
-            (*desc).len = frame.len() as u32;
+            (*desc).len = (NET_HDR_LEN + frame.len()) as u32;
             (*desc).flags = 0;
             (*desc).next = 0;
             // push 内部负责 dmb oshst + 通知。
@@ -151,16 +234,25 @@ pub fn poll_receive(buffer: &mut [u8]) -> Result<Option<usize>, NetError> {
     if state.rx_queue.is_none() {
         return Err(NetError::DeviceError);
     }
+    reap_completions(&mut state);
 
     for idx in 0..RX_QUEUE_SIZE {
         let len = state.rx_lengths[idx];
         if len != u16::MAX {
-            let len_usize = len as usize;
+            let total = len as usize;
+            if total < NET_HDR_LEN {
+                state.rx_lengths[idx] = u16::MAX;
+                if let Some(queue) = state.rx_queue.as_mut() {
+                    queue.push(idx as u16);
+                }
+                return Err(NetError::DeviceError);
+            }
+            let len_usize = total - NET_HDR_LEN;
             if buffer.len() < len_usize {
                 return Err(NetError::BufferTooSmall);
             }
             unsafe {
-                let src = state.rx_buffers.add(idx * MAX_FRAME);
+                let src = state.rx_buffers.add(idx * BUFFER_LEN + NET_HDR_LEN);
                 ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), len_usize);
             }
             state.rx_lengths[idx] = u16::MAX;
@@ -177,7 +269,7 @@ pub fn poll_receive(buffer: &mut [u8]) -> Result<Option<usize>, NetError> {
 
 /// 分配 RX 缓冲池，预填描述符并全部推入可用环。
 fn init_rx_buffers(state: &mut VirtioNetState) -> bool {
-    let buffer_layout = match Layout::from_size_align(RX_QUEUE_SIZE * MAX_FRAME, 64) {
+    let buffer_layout = match Layout::from_size_align(RX_QUEUE_SIZE * BUFFER_LEN, 64) {
         Ok(layout) => layout,
         Err(_) => {
             warn!("virtio-net: RX 缓冲布局非法");
@@ -186,7 +278,10 @@ fn init_rx_buffers(state: &mut VirtioNetState) -> bool {
     };
     let buffers = unsafe { alloc_zeroed(buffer_layout) };
     if buffers.is_null() {
-        warn!("virtio-net: RX 缓冲分配失败 (bytes={})", RX_QUEUE_SIZE * MAX_FRAME);
+        warn!(
+            "virtio-net: RX 缓冲分配失败 (bytes={})",
+            RX_QUEUE_SIZE * BUFFER_LEN
+        );
         return false;
     }
     state.rx_buffers = buffers;
@@ -198,10 +293,10 @@ fn init_rx_buffers(state: &mut VirtioNetState) -> bool {
     };
     unsafe {
         for idx in 0..queue.queue_size as usize {
-            let buffer = buffers.add(idx * MAX_FRAME);
+            let buffer = buffers.add(idx * BUFFER_LEN);
             let desc = queue.desc;
             (*desc.add(idx)).addr = buffer as u64;
-            (*desc.add(idx)).len = MAX_FRAME as u32;
+            (*desc.add(idx)).len = BUFFER_LEN as u32;
             (*desc.add(idx)).flags = VIRTQ_DESC_F_WRITE;
             (*desc.add(idx)).next = 0;
         }
@@ -215,7 +310,7 @@ fn init_rx_buffers(state: &mut VirtioNetState) -> bool {
 
 /// 分配单 TX 缓冲。
 fn init_tx_buffer(state: &mut VirtioNetState) -> bool {
-    let buffer_layout = match Layout::from_size_align(MAX_FRAME, 64) {
+    let buffer_layout = match Layout::from_size_align(BUFFER_LEN, 64) {
         Ok(layout) => layout,
         Err(_) => {
             warn!("virtio-net: TX 缓冲布局非法");
@@ -245,32 +340,6 @@ fn irq_handler(_irq: u32) {
         }
     }
 
-    // RX：把新到的帧长度记录到槽位，等待 poll_receive 取走。
-    if let Some(rx_queue) = state.rx_queue.as_mut() {
-        let mut idxs = [0u16; RX_QUEUE_SIZE];
-        let mut lens = [0u16; RX_QUEUE_SIZE];
-        let mut count = 0usize;
-        while let Some(elem) = rx_queue.pop_used() {
-            if count < RX_QUEUE_SIZE {
-                idxs[count] = elem.id as u16;
-                lens[count] = elem.len as u16;
-                count += 1;
-            }
-        }
-        for i in 0..count {
-            let slot = (idxs[i] as usize) % RX_QUEUE_SIZE;
-            state.rx_lengths[slot] = lens[i];
-        }
-    }
-
-    // TX：上一帧已完成，放行下一次 transmit。
-    if let Some(tx_queue) = state.tx_queue.as_mut() {
-        let mut completed = false;
-        while let Some(_) = tx_queue.pop_used() {
-            completed = true;
-        }
-        if completed {
-            state.tx_inflight = false;
-        }
-    }
+    // IRQ 只负责低延迟触发；实际 used-ring 收割与 syscall 轮询共用同一实现。
+    reap_completions(&mut state);
 }

@@ -1,4 +1,6 @@
-use core::arch::{asm, global_asm};
+use core::arch::asm;
+#[cfg(target_os = "none")]
+use core::arch::global_asm;
 
 pub mod smp;
 use core::hint::spin_loop;
@@ -15,7 +17,7 @@ mod timer;
 // 通过 SPSR 恢复 I=0 —— 单核自旋锁场景下这是唯一不会重入死锁的中断策略。
 // 该值由 restore_context 从帧内 #264 恢复；帧初始化时写 0（见 process::init_user）。
 
-
+#[cfg(target_os = "none")]
 global_asm!(
     ".section .vectors,\"ax\"\n\
      .align 11\n\
@@ -103,7 +105,8 @@ __vector_table:\n\
          // 往返的现场保全；否则跳过（非 FP 用户零开销；他人现场由断链\n\
          // 路径 fpu_trap_replay 落账）。FPEN=0b01 下 EL1 的 stp/mrs 不陷阱。\n\
          // ⚠ 二分排查 C：完整门控复现（读+比较+b.ne 跳过保存）。
-         ldr x17, =FPU_DIRTY\n\
+         adrp x17, FPU_DIRTY\n\
+         add x17, x17, :lo12:FPU_DIRTY\n\
          ldr x15, [x16, #816]\n\
          ldr x17, [x17]\n\
          cmp x15, x17\n\
@@ -169,13 +172,15 @@ __vector_irq_el0_64:\n\
 __secondary_entry:\n\
      msr daifset, #0xf\n\
      msr tpidrro_el0, x0\n\
-     ldr x1, =SMP_SECONDARY_STACKS\n\
+     adrp x1, SMP_SECONDARY_STACKS\n\
+     add x1, x1, :lo12:SMP_SECONDARY_STACKS\n\
      mov x2, #65536\n\
      mul x2, x0, x2\n\
      add x1, x1, x2\n\
      mov x3, #65536\n\
      add sp, x1, x3\n\
-     ldr x1, =SMP_IDLE_FRAMES\n\
+     adrp x1, SMP_IDLE_FRAMES\n\
+     add x1, x1, :lo12:SMP_IDLE_FRAMES\n\
      mov x2, #832\n\
      mul x2, x0, x2\n\
      add x1, x1, x2\n\
@@ -183,11 +188,22 @@ __secondary_entry:\n\
      bl __smp_secondary_rust\n"
 );
 
+#[cfg(target_os = "none")]
 extern "C" {
     static __vector_table: u8;
     fn __zero_trap_handler(frame: *mut Context, kind: u64) -> !;
     static __secondary_entry: u8;
 }
+
+// macOS/AArch64 host tests compile this module because target_arch is also
+// aarch64, but they must never assemble/link the EL1 vector table or PSCI
+// secondary trampoline. Dummy symbols keep pure algorithm tests linkable.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+static __vector_table: u8 = 0;
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+static __secondary_entry: u8 = 0;
 
 pub fn init(_boot_info: &BootInfo) {
     unsafe {
@@ -241,14 +257,23 @@ pub fn init(_boot_info: &BootInfo) {
         asm!("msr mair_el1, {}", in(reg) mair);
         asm!("tlbi vmalle1", options(nostack));
 
-        gic::init();
-        crate::info!("arch/aarch64: gic init done");
-        timer::init(10);
-        crate::info!("arch/aarch64: timer init done");
-        // Do not enable interrupts yet; defer until scheduler
-        // has initialised and installed a current slot.
+        // GIC/timer 延后到 MM + ACPI 完成之后；否则 ACPI 永远只能“解析但不消费”。
+        // Do not enable interrupts yet; defer until scheduler has installed a current slot.
     }
-    crate::info!("arch/aarch64: vector table installed");
+    crate::info!("arch/aarch64: vector table installed (platform IRQ init deferred)");
+}
+
+/// 第二阶段平台初始化：必须在 `acpi::init()` 之后调用。
+pub fn init_platform() {
+    unsafe {
+        gic::init();
+        crate::info!("arch/aarch64: gic platform init done");
+        timer::init(10);
+        crate::info!(
+            "arch/aarch64: timer init done (irq={})",
+            gic::timer_irq_id()
+        );
+    }
 }
 
 /// 仅恢复目标现场并 eret（**绝不保存当前寄存器**）。
@@ -301,9 +326,7 @@ use core::sync::atomic::Ordering::Relaxed;
 pub fn fpu_discard_live(frame: *mut Context) {
     if let Some(slot) = crate::scheduler::current_slot_opt() {
         unsafe {
-            if FPU_DIRTY.load(Relaxed) == slot as u64
-                && (*frame).owner_slot == slot as u64
-            {
+            if FPU_DIRTY.load(Relaxed) == slot as u64 && (*frame).owner_slot == slot as u64 {
                 // 先落账再作废：保证「dirty==owner ⇒ 帧=寄存器快照」
                 // 不变式在任何观察点成立。
                 asm_save_fpu_into(frame as *const u8);
@@ -321,8 +344,7 @@ pub fn fpu_discard_live(frame: *mut Context) {
 /// * 仅允许 EL0 发起（trap.rs 已校验 SPSR.M）；
 /// * FPEN=0b01 保证 EL1 侧 stp q*/mrs fpsr 自由执行、EL0 触发陷阱。
 pub unsafe fn fpu_trap_replay(frame: *mut Context) -> ! {
-    let slot = crate::scheduler::current_slot_opt()
-        .expect("fpu trap outside any process context");
+    let slot = crate::scheduler::current_slot_opt().expect("fpu trap outside any process context");
     let owner = (*frame).owner_slot;
     debug_assert_eq!(owner, slot as u64, "fpu trap on un-armed frame");
     if FPU_DIRTY.load(Relaxed) != slot as u64 {
@@ -535,9 +557,7 @@ pub unsafe fn restore_context(frame: *mut Context) -> ! {
     // 「FPU_DIRTY == frame.owner_slot」判定，本函数是唯一 eret 进
     // 用户态的必经之路（enter_user_mode / switch_to 均汇聚于此），
     // 故属主写入点单点闭环。current_slot 此刻已指向目标进程。
-    (*frame).owner_slot = rc_slot
-        .map(|s| s as u64)
-        .unwrap_or(FPU_OWNER_NONE);
+    (*frame).owner_slot = rc_slot.map(|s| s as u64).unwrap_or(FPU_OWNER_NONE);
     // ⚠ 惰性门位不在本函数调整（第十一刀排障结论）：restore_context
     // 同时服务「切换入」与「断链重放」两条路——此处若压回 01 门，
     // 重放的正是那条用户 FP 指令，会立刻再陷阱成死循环。门位由

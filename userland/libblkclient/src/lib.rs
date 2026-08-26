@@ -148,6 +148,54 @@ fn wait_response(message: &mut Message) -> Result<(), Error> {
     }
 }
 
+/// Read arbitrary bytes through the frozen blkdrv passthrough protocol.
+/// The request stream is split so no chunk crosses a 512-byte sector and no
+/// IPC response exceeds 128 bytes.
+pub fn passthrough_read(device: u8, lba: u64, out: &mut [u8]) -> Result<(), Error> {
+    let mut done = 0usize;
+    while done < out.len() {
+        let sector = lba + (done / 512) as u64;
+        let sector_off = done % 512;
+        let n = core::cmp::min(out.len() - done, core::cmp::min(124, 512 - sector_off));
+        let mut q = Message::empty();
+        q.code = zero_abi::protocol::blk::passthrough::CMD_READ_CHUNK;
+        q.payload[0] = device;
+        q.payload[4..12].copy_from_slice(&sector.to_le_bytes());
+        q.payload[12..16].copy_from_slice(&(sector_off as u32).to_le_bytes());
+        q.payload[16..20].copy_from_slice(&(n as u32).to_le_bytes());
+        send_request(&q)?;
+        let mut r = Message::empty(); wait_response(&mut r)?;
+        if r.code != zero_abi::protocol::blk::STATUS_OK { return Err(Error::Status(r.code)); }
+        out[done..done+n].copy_from_slice(&r.payload[..n]);
+        done += n;
+    }
+    Ok(())
+}
+
+/// Write arbitrary bytes through blkdrv's sector-local read/modify/write path.
+pub fn passthrough_write(device: u8, lba: u64, data: &[u8]) -> Result<(), Error> {
+    let mut done = 0usize;
+    while done < data.len() {
+        let sector = lba + (done / 512) as u64;
+        let sector_off = done % 512;
+        let n = core::cmp::min(data.len() - done, core::cmp::min(104, 512 - sector_off));
+        let mut q = Message::empty();
+        q.code = zero_abi::protocol::blk::passthrough::CMD_WRITE_CHUNK;
+        q.payload[0] = device;
+        q.payload[4..12].copy_from_slice(&sector.to_le_bytes());
+        q.payload[12..16].copy_from_slice(&(sector_off as u32).to_le_bytes());
+        q.payload[16..20].copy_from_slice(&(n as u32).to_le_bytes());
+        q.payload[20..20+n].copy_from_slice(&data[done..done+n]);
+        send_request(&q)?;
+        let mut r = Message::empty(); wait_response(&mut r)?;
+        if r.code != zero_abi::protocol::blk::STATUS_OK { return Err(Error::Status(r.code)); }
+        let wrote = u32::from_le_bytes(r.payload[..4].try_into().unwrap()) as usize;
+        if wrote != n { return Err(Error::InvalidResponse); }
+        done += n;
+    }
+    Ok(())
+}
+
 pub struct SharedBuffer {
     handle: u32,
     ptr: *mut u8,

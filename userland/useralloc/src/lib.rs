@@ -20,7 +20,13 @@ struct State {
 
 impl State {
     const fn new() -> Self {
-        Self { initialised: false, head: NONE }
+        // Keep the entire static allocator zero-initialisable so the linker
+        // can place multi-megabyte heaps in NOLOAD .bss instead of bloating
+        // every service ELF's .data. `head` is ignored until ensure_init().
+        Self {
+            initialised: false,
+            head: 0,
+        }
     }
 }
 
@@ -131,7 +137,11 @@ impl<const N: usize> StaticFreeList<N> {
             let used = align_up(HEADER + pad + payload + FOOTER, ALIGN);
             if size >= used {
                 let nxt = self.next(cur);
-                if prev == NONE { st.head = nxt; } else { self.set_next(prev, nxt); }
+                if prev == NONE {
+                    st.head = nxt;
+                } else {
+                    self.set_next(prev, nxt);
+                }
 
                 let remainder = size - used;
                 let committed = if remainder >= MIN_BLOCK {
@@ -178,7 +188,11 @@ impl<const N: usize> StaticFreeList<N> {
             return; // duplicate free: ignore in user process rather than poison heap
         }
         let size = raw;
-        if size < MIN_BLOCK || block.checked_add(size).map_or(true, |e| e > self.usable_len()) {
+        if size < MIN_BLOCK
+            || block
+                .checked_add(size)
+                .map_or(true, |e| e > self.usable_len())
+        {
             return;
         }
 
@@ -213,12 +227,18 @@ impl<const N: usize> StaticFreeList<N> {
         while cur != NONE {
             let nxt = self.next(cur);
             if cur < merged_start || cur >= merged_end {
-                if last == NONE { new_head = cur; } else { self.set_next(last, cur); }
+                if last == NONE {
+                    new_head = cur;
+                } else {
+                    self.set_next(last, cur);
+                }
                 last = cur;
             }
             cur = nxt;
         }
-        if last != NONE { self.set_next(last, NONE); }
+        if last != NONE {
+            self.set_next(last, NONE);
+        }
         self.write_header(merged_start, merged_size, new_head);
         self.write_footer(merged_start, merged_size, true);
         st.head = merged_start;
@@ -296,5 +316,4 @@ mod tests {
             assert!(!big.is_null());
         }
     }
-
 }

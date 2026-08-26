@@ -29,7 +29,7 @@ pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
 
     fs::write(efi_zeroos_dir.join("build-info.txt"), &source_provenance)?;
 
-    let kernel = project_root.join("target/aarch64-unknown-none/debug/zero-kernel");
+    let kernel = project_root.join("target/aarch64-unknown-none-pic/release/zero-kernel");
     if !kernel.exists() {
         return Err(anyhow!(
             "kernel binary not found at {}; run `cargo run -p xtask -- build-image` first",
@@ -48,6 +48,17 @@ pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
     }
     fs::copy(&rootfs_img, efi_zeroos_dir.join("zero-rootfs.img"))?;
 
+    // Bootfs (early userspace ELF/files) is a compact bundle consumed by the
+    // UEFI loader. It is intentionally separate from the persistent volume.
+    let bootfs_bundle = project_root.join("target/rootfs.bundle");
+    if !bootfs_bundle.exists() {
+        return Err(anyhow!(
+            "bootfs bundle missing at {}",
+            bootfs_bundle.display()
+        ));
+    }
+    fs::copy(&bootfs_bundle, efi_zeroos_dir.join("rootfs.bundle"))?;
+
     let artifact_info = format!(
         "{}kernel_sha256={}\nrootfs_sha256={}\n",
         source_provenance,
@@ -59,7 +70,7 @@ pub fn build_full_image(sh: &Shell) -> Result<PathBuf> {
     let boot_cfg = "\
 # Zero OS boot configuration
 log=info
-rootfs_as_ramdisk=0
+rootfs_as_ramdisk=1
 ";
     fs::write(efi_zeroos_dir.join("boot.cfg"), boot_cfg)?;
 
@@ -148,12 +159,12 @@ if exist fs3:\\EFI\\BOOT\\BOOTAA64.EFI then\r\n  fs3:\\EFI\\BOOT\\BOOTAA64.EFI\r
 
 fn build_components(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo build -p zero-microkernel").run()?;
-    cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
+    cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-inputd -p zero-windowserver -p zero-netd -p zero-webtest -p zero-pkgd -p zero-pkgtest -p zero-audiod -p zero-audiotest -p zero-gputest -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
     // ⚠ user-app（zero-shell）也必须在此构建：否则 sync_userland_blobs 会把
     // 上次手动构建的陈旧 blob 打进镜像 —— 源码改动“神秘失效”皆源于此。
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
-    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd -p zero-fsd -p zero-blkdrv --release").run()?;
+    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-securityd -p zero-inputd -p zero-windowserver -p zero-netd -p zero-webtest -p zero-pkgd -p zero-pkgtest -p zero-audiod -p zero-audiotest -p zero-gputest -p zero-fs-zfs -p zero-fsd -p zero-blkdrv --release").run()?;
 
     // 在 build-rootfs 打包之前，把刚构建的用户态裸机 ELF 同步进 kernel/rootfs
     // （zero-shell / zero-launchd；产物缺失时回退仓库已有 blob 并 warn）。
@@ -162,15 +173,21 @@ fn build_components(sh: &Shell) -> Result<()> {
 
     cmd!(sh, "cargo run -p xtask -- build-rootfs").run()?;
     cmd!(sh, "cargo run -p zero-installer").run()?;
-    cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-kernel").run()?;
+    crate::build_kernel_pie(sh)?;
     cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-uefi -p bootloader-uefi").run()?;
     Ok(())
 }
 
 fn source_provenance(project_root: &Path) -> String {
     let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git").args(args).current_dir(project_root).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
     };
     let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let status = git(&["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default();

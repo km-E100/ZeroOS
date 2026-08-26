@@ -12,7 +12,7 @@ use zero_abi::driver::{DriverDescriptor, DriverKind, DriverTable};
 #[no_mangle]
 #[used]
 #[link_section = ".rodata.boot"]
-pub static __zero_driver_entries: [DriverDescriptor; 3] = [
+pub static __zero_driver_entries: [DriverDescriptor; 8] = [
     DriverDescriptor::new("uart0-pl011", DriverKind::Pl011, 0x0900_0000, 0x1000, 33),
     DriverDescriptor::new(
         "virtio-blk0",
@@ -27,6 +27,41 @@ pub static __zero_driver_entries: [DriverDescriptor; 3] = [
         0x0a00_0200,
         0x2000,
         49,
+    ),
+    DriverDescriptor::new(
+        "virtio-gpu0",
+        DriverKind::VirtIOGpu,
+        0x0a00_0400,
+        0x2000,
+        50,
+    ),
+    DriverDescriptor::new(
+        "virtio-input0",
+        DriverKind::VirtIOInput,
+        0x0a00_0600,
+        0x2000,
+        51,
+    ),
+    DriverDescriptor::new(
+        "virtio-pointer0",
+        DriverKind::VirtIOInput,
+        0x0a00_0800,
+        0x2000,
+        52,
+    ),
+    DriverDescriptor::new(
+        "virtio-rng0",
+        DriverKind::VirtIORng,
+        0x0a00_0a00,
+        0x2000,
+        53,
+    ),
+    DriverDescriptor::new(
+        "virtio-sound0",
+        DriverKind::VirtIOSound,
+        0x0a00_0c00,
+        0x2000,
+        54,
     ),
 ];
 

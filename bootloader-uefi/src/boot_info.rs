@@ -1,6 +1,8 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use uefi::prelude::*;
+use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 use uefi::table::Runtime;
+use zero_abi::boot::{RootFsEntry, RootFsImage};
 
 /// 内核镜像 `.rodata.boot` 中的内存占位符号名（见 boot/boot.S）。
 /// bootloader 在退出 Boot Services 前把真实内存量写回该位置，
@@ -11,7 +13,157 @@ const KERNEL_MEMORY_SYMBOL: &str = "__zero_memory_bytes";
 /// 从 UEFI System Table 的 config 数组抓 ACPI 2.0+ RSDP，补丁进内核
 /// 符号 `__zero_rsdp_phys`（0 = 未找到，内核回退硬编码探测路径）。
 const KERNEL_RSDP_SYMBOL: &str = "__zero_rsdp_phys";
+
+const KERNEL_ROOTFS_IMAGE_SYMBOL: &str = "__zero_rootfs_image";
+
+fn take_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    let v = u32::from_le_bytes(bytes.get(*off..end)?.try_into().ok()?);
+    *off = end;
+    Some(v)
+}
+
+/// Parse xtask's ZEROFSB bundle in place. RootFsEntry path/data pointers point
+/// directly into the loader-owned bundle Vec; no second copy of service ELFs is
+/// made. The Vec lives across the noreturn kernel jump, and the boot memory-map
+/// sink excludes its LoaderData pages from the kernel allocator.
+fn build_bootfs_entries(bundle: &[u8]) -> Result<Box<[RootFsEntry]>, Status> {
+    if bundle.len() < 12 || &bundle[..8] != b"ZEROFSB\0" {
+        return Err(Status::LOAD_ERROR);
+    }
+    let mut off = 8usize;
+    let count = take_u32(bundle, &mut off).ok_or(Status::LOAD_ERROR)? as usize;
+    if count == 0 || count > 4096 {
+        return Err(Status::LOAD_ERROR);
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let path_len = take_u32(bundle, &mut off).ok_or(Status::LOAD_ERROR)? as usize;
+        if path_len == 0 || path_len > 4096 {
+            return Err(Status::LOAD_ERROR);
+        }
+        let path_end = off.checked_add(path_len).ok_or(Status::LOAD_ERROR)?;
+        let path = bundle.get(off..path_end).ok_or(Status::LOAD_ERROR)?;
+        if path.first() != Some(&b'/') || core::str::from_utf8(path).is_err() {
+            return Err(Status::LOAD_ERROR);
+        }
+        off = path_end;
+        let data_len = take_u32(bundle, &mut off).ok_or(Status::LOAD_ERROR)? as usize;
+        let data_end = off.checked_add(data_len).ok_or(Status::LOAD_ERROR)?;
+        let data = bundle.get(off..data_end).ok_or(Status::LOAD_ERROR)?;
+        off = data_end;
+        entries.push(RootFsEntry {
+            path_ptr: path.as_ptr(),
+            path_len,
+            data_ptr: data.as_ptr(),
+            data_len,
+        });
+    }
+    if off != bundle.len() {
+        log_warn!("bootfs bundle has {} trailing bytes", bundle.len() - off);
+    }
+    Ok(entries.into_boxed_slice())
+}
+
+fn patch_kernel_rootfs(
+    kernel: &crate::kernel_loader::KernelImage,
+    bundle: Option<&Vec<u8>>,
+) -> Result<(), Status> {
+    let Some(addr) = kernel.segments.symbol_address(KERNEL_ROOTFS_IMAGE_SYMBOL) else {
+        log_error!("kernel rootfs image symbol missing");
+        return Err(Status::LOAD_ERROR);
+    };
+    let Some(bundle) = bundle else {
+        log_error!("bootfs bundle was not loaded");
+        return Err(Status::NOT_FOUND);
+    };
+    let entries = build_bootfs_entries(bundle)?;
+    let count = entries.len();
+    let ptr = entries.as_ptr();
+    // Intentional leak: this is boot handoff memory and the kernel owns the
+    // referenced pages for the remainder of the boot. They are excluded by the
+    // EFI memory-map snapshot rather than returned to the firmware allocator.
+    core::mem::forget(entries);
+    unsafe {
+        core::ptr::write_volatile(addr as *mut RootFsImage, RootFsImage::new(ptr, count));
+    }
+    log_info!("bootfs handoff: {} entries @0x{:x}", count, ptr as usize);
+    Ok(())
+}
+
 use uefi::table::cfg::ACPI2_GUID;
+
+const FB_SYMBOLS: [(&str, usize); 6] = [
+    ("__zero_fb_base", 0),
+    ("__zero_fb_size", 1),
+    ("__zero_fb_width", 2),
+    ("__zero_fb_height", 3),
+    ("__zero_fb_stride", 4),
+    ("__zero_fb_format", 5),
+];
+
+#[derive(Copy, Clone, Debug, Default)]
+struct FramebufferInfo {
+    base: u64,
+    size: u64,
+    width: u64,
+    height: u64,
+    stride: u64,
+    format: u64,
+}
+
+fn capture_framebuffer(st: &SystemTable<Boot>) -> Option<FramebufferInfo> {
+    let bs = st.boot_services();
+    let handle = bs.get_handle_for_protocol::<GraphicsOutput>().ok()?;
+    let mut gop = bs.open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
+    let info = gop.current_mode_info();
+    let (width, height) = info.resolution();
+    let format = match info.pixel_format() {
+        PixelFormat::Rgb => 1,
+        PixelFormat::Bgr => 2,
+        // Bitmask can be described later with channel masks; BltOnly has no
+        // persistent framebuffer pointer. Both deliberately disable handoff.
+        PixelFormat::Bitmask | PixelFormat::BltOnly => return None,
+    };
+    let mut fb = gop.frame_buffer();
+    Some(FramebufferInfo {
+        base: fb.as_mut_ptr() as usize as u64,
+        size: fb.size() as u64,
+        width: width as u64,
+        height: height as u64,
+        stride: info.stride() as u64,
+        format,
+    })
+}
+
+fn patch_kernel_framebuffer(
+    kernel: &crate::kernel_loader::KernelImage,
+    fb: Option<FramebufferInfo>,
+) {
+    let fb = fb.unwrap_or_default();
+    let values = [fb.base, fb.size, fb.width, fb.height, fb.stride, fb.format];
+    for ((symbol, index), value) in FB_SYMBOLS.iter().zip(values) {
+        if let Some(addr) = kernel.segments.symbol_address(symbol) {
+            unsafe { core::ptr::write_volatile(addr as *mut u64, value) };
+        } else {
+            log_warn!("kernel framebuffer symbol `{}` missing", symbol);
+        }
+        let _ = index;
+    }
+    if fb.base != 0 {
+        log_info!(
+            "GOP framebuffer: base=0x{:x} size={} {}x{} stride={} format={}",
+            fb.base,
+            fb.size,
+            fb.width,
+            fb.height,
+            fb.stride,
+            fb.format
+        );
+    } else {
+        log_warn!("no directly accessible GOP framebuffer; graphical console disabled");
+    }
+}
 
 fn find_rsdp_phys(st: &SystemTable<Boot>) -> Option<u64> {
     for entry in st.config_table() {
@@ -24,7 +176,10 @@ fn find_rsdp_phys(st: &SystemTable<Boot>) -> Option<u64> {
 
 fn patch_kernel_rsdp(kernel: &crate::kernel_loader::KernelImage, rsdp: Option<u64>) {
     let Some(addr) = kernel.segments.symbol_address(KERNEL_RSDP_SYMBOL) else {
-        log_warn!("kernel symbol `{}` not found; rsdp stays 0", KERNEL_RSDP_SYMBOL);
+        log_warn!(
+            "kernel symbol `{}` not found; rsdp stays 0",
+            KERNEL_RSDP_SYMBOL
+        );
         return;
     };
     let value = rsdp.unwrap_or(0);
@@ -39,7 +194,10 @@ fn patch_kernel_rsdp(kernel: &crate::kernel_loader::KernelImage, rsdp: Option<u6
             v
         );
     } else {
-        log_warn!("no ACPI RSDP in config table; kernel `{}` = 0", KERNEL_RSDP_SYMBOL);
+        log_warn!(
+            "no ACPI RSDP in config table; kernel `{}` = 0",
+            KERNEL_RSDP_SYMBOL
+        );
     }
 }
 
@@ -63,7 +221,7 @@ impl KernelBootContext {
     pub fn prepare(
         st: &mut SystemTable<Boot>,
         kernel: &crate::kernel_loader::KernelImage,
-        _rootfs: Option<&Vec<u8>>,
+        rootfs: Option<&Vec<u8>>,
         _config: &crate::boot_config::BootConfig,
     ) -> Result<Self, Status> {
         let (total, max_block) = collect_usable_memory(st)?;
@@ -92,9 +250,15 @@ impl KernelBootContext {
         );
 
         patch_kernel_memory(kernel, memory_bytes);
+        patch_kernel_rootfs(kernel, rootfs)?;
 
         // ACPI（WS-A）：ExitBootServices 前 RSDP 仍由固件持有/有效。
         patch_kernel_rsdp(kernel, find_rsdp_phys(st));
+
+        // Display Foundation：GOP mode/framebuffer 仅在 Boot Services 存活时
+        // 可通过 protocol 查询，故在退出前捕获并补丁进内核只读槽位。
+        let framebuffer = capture_framebuffer(st);
+        patch_kernel_framebuffer(kernel, framebuffer);
 
         // 精细内存图：把合并后的 CONVENTIONAL 区间表灌入内核汇槽，
         // 物理分配器据此登记空洞（失败仅告警，内核回退总量路径）。
@@ -178,10 +342,7 @@ mod memory_map_sink {
 /// 把合并后的 CONVENTIONAL 区间表写入内核 `__zero_memory_map` 汇槽。
 /// 超容截断保低址段；magic 最后落笔；任何异常仅告警——内核侧会
 /// 因 magic 不符回退总量路径。
-fn fill_memory_map_sink(
-    kernel: &crate::kernel_loader::KernelImage,
-    st: &mut SystemTable<Boot>,
-) {
+fn fill_memory_map_sink(kernel: &crate::kernel_loader::KernelImage, st: &mut SystemTable<Boot>) {
     let Some(sink_va) = kernel.segments.symbol_address("__zero_memory_map") else {
         log_warn!("memory map sink `__zero_memory_map` absent; kernel uses total fallback");
         return;
@@ -217,8 +378,8 @@ fn fill_memory_map_sink(
         regions.push((start, end - start));
     }
 
-    let max_entries = (memory_map_sink::CAPACITY - memory_map_sink::HEADER)
-        / memory_map_sink::ENTRY;
+    let max_entries =
+        (memory_map_sink::CAPACITY - memory_map_sink::HEADER) / memory_map_sink::ENTRY;
     if regions.len() > max_entries {
         regions.truncate(max_entries);
     }
@@ -227,16 +388,8 @@ fn fill_memory_map_sink(
     unsafe {
         let mut off = memory_map_sink::HEADER;
         for &(base, len) in &regions {
-            core::ptr::copy_nonoverlapping(
-                base.to_le_bytes().as_ptr(),
-                sink.add(off),
-                8,
-            );
-            core::ptr::copy_nonoverlapping(
-                len.to_le_bytes().as_ptr(),
-                sink.add(off + 8),
-                8,
-            );
+            core::ptr::copy_nonoverlapping(base.to_le_bytes().as_ptr(), sink.add(off), 8);
+            core::ptr::copy_nonoverlapping(len.to_le_bytes().as_ptr(), sink.add(off + 8), 8);
             off += memory_map_sink::ENTRY;
         }
         // count 先于 magic 落笔，magic 是有效性最终承诺。
@@ -245,11 +398,7 @@ fn fill_memory_map_sink(
             sink.add(0x08),
             8,
         );
-        core::ptr::copy_nonoverlapping(
-            memory_map_sink::MAGIC.to_le_bytes().as_ptr(),
-            sink,
-            8,
-        );
+        core::ptr::copy_nonoverlapping(memory_map_sink::MAGIC.to_le_bytes().as_ptr(), sink, 8);
     }
     log_info!(
         "memory map sink filled @0x{sink_va:016x}: {} regions",

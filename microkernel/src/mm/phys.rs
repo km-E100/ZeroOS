@@ -63,7 +63,8 @@ struct BitmapStorage(core::cell::UnsafeCell<[u64; MAX_PAGES / 64]>);
 // Safety：裸机侧全部访问都发生在 MM 自旋锁内（单核内核）；宿主测试
 // 以 INIT_LOCK 互斥锁串行，不存在并发读写。
 unsafe impl Sync for BitmapStorage {}
-static BITMAP_WORDS: BitmapStorage = BitmapStorage(core::cell::UnsafeCell::new([0; MAX_PAGES / 64]));
+static BITMAP_WORDS: BitmapStorage =
+    BitmapStorage(core::cell::UnsafeCell::new([0; MAX_PAGES / 64]));
 
 /// 每页引用计数（与 BITMAP_WORDS 平行，每物理页一格 u16，2 MiB .bss）。
 /// 上限 65535 份共享/页——COW fork 链远达不到，超出即记账 bug。
@@ -81,7 +82,7 @@ static INITIALISED: AtomicBool = AtomicBool::new(false);
 /// 供诊断与未来配额使用。
 static PAGE_TABLE_PAGES: AtomicUsize = AtomicUsize::new(0);
 
-pub fn init(memory_bytes: usize, reserved_bytes: usize) {
+pub fn init_with_kernel_range(memory_bytes: usize, legacy_reserved_bytes: usize, kernel_start: usize, kernel_end: usize) {
     if INITIALISED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -92,13 +93,12 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
     let mut regions = MemRegions::default();
     #[allow(unused_assignments)]
     let mut holes_reserved = 0usize; // 分支内必然赋值；初值仅为类型占位
-    // ⚠ pstore 窗口 tripwire：内核镜像保留区一旦长过窗口基址，说明窗口
-    // 落进了内核自身内存（BSS 别名），pstore 不再可用——串口大声报警。
-    if reserved_pages_for(reserved_bytes) > PSTORE_BASE_REL / PAGE_SIZE {
+                                     // ⚠ pstore 窗口 tripwire：内核镜像保留区一旦长过窗口基址，说明窗口
+                                     // 落进了内核自身内存（BSS 别名），pstore 不再可用——串口大声报警。
+    if ranges_overlap(kernel_start, kernel_end, PSTORE_BASE as usize, PSTORE_BASE as usize + PSTORE_SIZE) {
         crate::warn!(
-            "phys: kernel reservation ({:#x} bytes) reaches past pstore window @0x{:x}; crash log area aliased by kernel image!",
-            reserved_bytes,
-            PSTORE_BASE
+            "phys: relocated kernel [{:#x},{:#x}) overlaps pstore window @0x{:x}",
+            kernel_start, kernel_end, PSTORE_BASE
         );
     }
     let mut mm = MM.lock();
@@ -109,11 +109,15 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
         crate::info!(
             "phys: memory-map path: {} usable region(s), {} KiB total",
             regions.len,
-            regions.as_slice().iter().map(|&(_, l)| l / 1024).sum::<usize>()
+            regions
+                .as_slice()
+                .iter()
+                .map(|&(_, l)| l / 1024)
+                .sum::<usize>()
         );
         // 精细路径：按引导器合并后的 CONVENTIONAL 区间登记，
         // 区间之间的空洞（MMIO/固件保留）整段标忙。
-        init_from_regions(&mut mm, regions.as_slice(), reserved_bytes);
+        init_from_regions_exact(&mut mm, regions.as_slice(), kernel_start, kernel_end);
         holes_reserved = mm.total_pages() - mm.free_count();
         crate::info!(
             "phys: holes+kernel reserved = {} pages (excluded from allocator)",
@@ -122,12 +126,45 @@ pub fn init(memory_bytes: usize, reserved_bytes: usize) {
     } else {
         // 回退：旧引导器只给总量（QEMU virt 单块连续 RAM 下等价）。
         crate::info!("phys: legacy path (total-bytes only)");
-        legacy_init(&mut mm, memory_bytes, reserved_bytes);
+        legacy_init(&mut mm, memory_bytes, legacy_reserved_bytes);
+        mark_absolute_range_busy(&mut mm, kernel_start, kernel_end);
     }
     let free_pages = mm.free_count();
     let total_pages = mm.total_pages();
     drop(mm);
-    crate::info!("phys: ready free_pages={} total_pages={}", free_pages, total_pages);
+    crate::info!(
+        "phys: ready free_pages={} total_pages={}",
+        free_pages,
+        total_pages
+    );
+}
+
+/// Compatibility entry used by host tests/older callers: low-prefix kernel.
+pub fn init(memory_bytes: usize, reserved_bytes: usize) {
+    init_with_kernel_range(
+        memory_bytes,
+        reserved_bytes,
+        RAM_BASE,
+        RAM_BASE.saturating_add(reserved_bytes),
+    )
+}
+
+#[inline]
+fn ranges_overlap(a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
+    a0 < b1 && b0 < a1
+}
+
+fn mark_absolute_range_busy(mm: &mut PhysBitmap, start: usize, end: usize) -> usize {
+    if end <= start || end <= RAM_BASE { return 0; }
+    let ram_end = RAM_BASE.saturating_add(mm.total_pages().saturating_mul(PAGE_SIZE));
+    let s = start.max(RAM_BASE);
+    let e = end.min(ram_end);
+    if e <= s { return 0; }
+    let first = (s - RAM_BASE) / PAGE_SIZE;
+    let last = (e - RAM_BASE).div_ceil(PAGE_SIZE);
+    let mut marked=0usize;
+    for page in first..last.min(mm.total_pages()) { marked += usize::from(mm.mark_busy(page)); }
+    marked
 }
 
 fn legacy_init(mm: &mut PhysBitmap, memory_bytes: usize, reserved_bytes: usize) {
@@ -156,11 +193,11 @@ fn legacy_init(mm: &mut PhysBitmap, memory_bytes: usize, reserved_bytes: usize) 
 /// 区间驱动初始化：[RAM_BASE, top) 全域建图，随后把**不被任何可用
 /// 区间覆盖**的页标忙（EFI 空洞/固件保留），最后把内核镜像保留区
 /// （天花板取页）标忙。
-fn init_from_regions(
-    mm: &mut PhysBitmap,
-    regions: &[(usize, usize)],
-    reserved_bytes: usize,
-) {
+fn init_from_regions(mm: &mut PhysBitmap, regions: &[(usize, usize)], reserved_bytes: usize) {
+    init_from_regions_exact(mm, regions, RAM_BASE, RAM_BASE.saturating_add(reserved_bytes));
+}
+
+fn init_from_regions_exact(mm: &mut PhysBitmap, regions: &[(usize, usize)], kernel_start: usize, kernel_end: usize) {
     // ⚠ 坐标纪律：regions 存**绝对物理地址**；页号一律相对 RAM_BASE。
     // 曾把绝对地址直接除以 PAGE_SIZE 当页号（0x40000000/4096=262144），
     // 导致"空洞扫描"把全部页标忙、free_pages=0（实机探针定位）。
@@ -184,11 +221,10 @@ fn init_from_regions(
         );
     }
 
-    // 1) 内核镜像保留区（恒等映射起点即 RAM_BASE，天花板取页）。
-    let kernel_pages = usize::min(reserved_pages_for(reserved_bytes), total);
-    for page in 0..kernel_pages {
-        mm.mark_busy(page);
-    }
+    // 1) KASLR-aware kernel reservation: mark only the pages actually occupied
+    // by the relocated image. A high load bias must never turn the entire low
+    // RAM prefix into a fake "kernel" reservation.
+    mark_absolute_range_busy(mm, kernel_start, kernel_end);
 
     // 1.5) pstore 固定窗口永久占用（幂等）：它落在 CONVENTIONAL 区间
     //      **内部**，下面的扫洞只标「区间之间的空隙」，不会覆盖到它；
@@ -198,7 +234,7 @@ fn init_from_regions(
     // 2) 双指针扫洞（全部使用相对页坐标）：
     //    [cursor, region_start) 的空隙 → 标忙；region 内部保持空闲，
     //    cursor 跳到 region 末页之后。区间外尾页同样标忙。
-    let mut cursor = kernel_pages; // 内核镜像已标忙，从其后继续扫
+    let mut cursor = 0usize; // holes are independent of the relocated kernel range
     for &(base, len) in regions {
         if base + len <= RAM_BASE || base >= RAM_BASE + top_rel {
             continue; // 区间完全在窗口外
@@ -258,6 +294,29 @@ pub fn free_page(addr: usize) {
 /// 位图不动——页保持 busy，仅记账 +1。
 pub fn retain_page(addr: usize) {
     MM.lock().retain_page(addr);
+}
+
+/// 把落在 QEMU/平台 RAM 窗口内的物理区间标成永久占用。
+///
+/// GOP framebuffer 等固件建立的共享缓冲有时来自 Conventional RAM；若不
+/// 从页分配器摘除，后续用户页分配会把屏幕像素当普通内存覆盖。区间落在
+/// RAM 之外（PCI BAR/MMIO）时自然无操作。
+pub fn reserve_physical_range(addr: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let end = addr.saturating_add(len);
+    if end <= RAM_BASE || addr >= RAM_BASE.saturating_add(MAX_PAGES * PAGE_SIZE) {
+        return 0;
+    }
+    let start = addr.max(RAM_BASE).saturating_sub(RAM_BASE) / PAGE_SIZE;
+    let end_page = end.saturating_sub(RAM_BASE).saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut mm = MM.lock();
+    let mut reserved = 0usize;
+    for page in start..end_page.min(mm.total_pages()) {
+        reserved += usize::from(mm.mark_busy(page));
+    }
+    reserved
 }
 
 /// 查询某物理地址当前引用数（COW 缺页判定：>1 需复制，==1 原地恢复可写）。
@@ -352,10 +411,8 @@ mod tests {
         );
         // 跨窗连续分配（空档全部 + 窗口 16 页 + 1）装不进窗口前段，
         // first-fit 必须整段跳过窗口，落在 0x4201_0000——不得拆窗。
-        let demand = PSTORE_BASE_REL / PAGE_SIZE
-            - reserved_pages_for(16 * 1024 * 1024)
-            + PSTORE_PAGES
-            + 1;
+        let demand =
+            PSTORE_BASE_REL / PAGE_SIZE - reserved_pages_for(16 * 1024 * 1024) + PSTORE_PAGES + 1;
         assert_eq!(
             bm.alloc_contiguous(demand),
             Some(PSTORE_BASE as usize + PSTORE_SIZE)
@@ -367,7 +424,11 @@ mod tests {
         let _g = INIT_LOCK.lock().unwrap();
         let mut bm = PhysBitmap::empty();
         // 引导器精细路径：单块 512MiB CONVENTIONAL 区间（QEMU virt 等价）。
-        init_from_regions(&mut bm, &[(crate::mm::phys::RAM_BASE, MEM_BYTES)], 16 * 1024 * 1024);
+        init_from_regions(
+            &mut bm,
+            &[(crate::mm::phys::RAM_BASE, MEM_BYTES)],
+            16 * 1024 * 1024,
+        );
         assert_window_reserved(&bm);
         // 空闲数必须恰好扣掉窗口 16 页（与 legacy 路径同总量对齐），
         // 且必须在下面的试分配之前断言（分配会消耗空闲计数）。
@@ -376,16 +437,12 @@ mod tests {
         assert_eq!(bm.free_count(), legacy.free_count());
         assert_eq!(
             bm.free_count(),
-            MEM_BYTES / PAGE_SIZE
-                - reserved_pages_for(16 * 1024 * 1024)
-                - PSTORE_PAGES
+            MEM_BYTES / PAGE_SIZE - reserved_pages_for(16 * 1024 * 1024) - PSTORE_PAGES
         );
         // 跨窗口的连续分配（空档全部 + 窗口 16 页 + 1）必须被整段顶到
         // 窗口之后（0x4201_0000），不得拆窗。
-        let demand = PSTORE_BASE_REL / PAGE_SIZE
-            - reserved_pages_for(16 * 1024 * 1024)
-            + PSTORE_PAGES
-            + 1;
+        let demand =
+            PSTORE_BASE_REL / PAGE_SIZE - reserved_pages_for(16 * 1024 * 1024) + PSTORE_PAGES + 1;
         assert_eq!(
             bm.alloc_contiguous(demand),
             Some(PSTORE_BASE as usize + PSTORE_SIZE)
@@ -420,7 +477,10 @@ unsafe impl Sync for MemoryMapSink {}
 // ⚠ 与 __zero_symbol_sink 同理：必须落 `.data`。零初始化 static 默认进
 // .bss，而 boot/boot.S 的 zero_bss 会在引导器灌表之后于内核入口再次
 // 清零整个 .bss——放 .bss 的表活不到第一次读取（实机走了 legacy 回退）。
-#[cfg_attr(all(target_arch = "aarch64", target_os = "none"), link_section = ".data")]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_os = "none"),
+    link_section = ".data"
+)]
 pub static __zero_memory_map: MemoryMapSink = MemoryMapSink {
     bytes: core::cell::UnsafeCell::new([0; MEMMAP_SINK_SIZE]),
 };
@@ -454,9 +514,7 @@ impl MemRegions {
 
 fn read_memory_map_sink(out: &mut MemRegions) -> bool {
     let raw = unsafe { &*__zero_memory_map.bytes.get() };
-    let rd_u64 = |off: usize| {
-        u64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
-    };
+    let rd_u64 = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
     if rd_u64(0x00) != MEMMAP_MAGIC {
         return false;
     }
@@ -477,7 +535,6 @@ fn read_memory_map_sink(out: &mut MemRegions) -> bool {
     }
     true
 }
-
 
 #[cfg(test)]
 mod memmap_tests {
@@ -508,14 +565,8 @@ mod memmap_tests {
 
     #[test]
     fn encode_layout_matches_protocol() {
-        let raw = encode(&[
-            (0x4000_0000, 0x1000_0000),
-            (0x5000_0000, 0x0800_0000),
-        ]);
-        assert_eq!(
-            u64::from_le_bytes(raw[0x08..0x10].try_into().unwrap()),
-            2
-        );
+        let raw = encode(&[(0x4000_0000, 0x1000_0000), (0x5000_0000, 0x0800_0000)]);
+        assert_eq!(u64::from_le_bytes(raw[0x08..0x10].try_into().unwrap()), 2);
         assert_eq!(
             u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap()),
             0x4000_0000

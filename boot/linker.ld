@@ -3,6 +3,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x40080000;
+    __kernel_start = .;
 
     .text : ALIGN(4K) {
         KEEP(*(.text.boot))

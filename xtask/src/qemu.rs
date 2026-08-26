@@ -48,13 +48,22 @@ pub fn ensure_disk_image(project_root: &Path) -> Result<PathBuf> {
             .truncate(true)
             .open(&path)?;
         file.set_len(DISK_SIZE_BYTES)?;
-        println!("qemu: created virtio test disk {} ({} MiB)", path.display(), DISK_SIZE_BYTES / 1024 / 1024);
+        println!(
+            "qemu: created virtio test disk {} ({} MiB)",
+            path.display(),
+            DISK_SIZE_BYTES / 1024 / 1024
+        );
     }
     Ok(path)
 }
 
 /// 组装完整 QEMU 参数列表。
-pub fn build_args(iso: &Path, serial_log: &Path, boot_d: bool, virtio_disk: Option<&Path>) -> Vec<String> {
+pub fn build_args(
+    iso: &Path,
+    serial_log: &Path,
+    boot_d: bool,
+    virtio_disk: Option<&Path>,
+) -> Vec<String> {
     let mut args: Vec<String> = QEMU_BASE_ARGS.iter().map(|s| s.to_string()).collect();
     args.push("-cdrom".into());
     args.push(iso.to_string_lossy().to_string());

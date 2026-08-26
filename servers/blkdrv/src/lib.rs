@@ -30,7 +30,7 @@ use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Mutex;
-use userlib::{self, block_read, block_write, driver_count, driver_info, yield_now};
+use userlib::{self, block_capacity_sectors, block_read, block_write, driver_count, driver_info, yield_now};
 use zero_abi::channels;
 use zero_abi::driver::DriverKind;
 use zero_abi::ipc::Message;
@@ -63,7 +63,9 @@ pub extern "C" fn server_main() -> ! {
     if ready {
         print_line("blkdrv: passthrough backend ready (virtio-blk via kernel svc 7/8)");
     } else {
-        print_line("blkdrv: WARNING no block device in kernel table; IO fails with STATUS_NODEVICE");
+        print_line(
+            "blkdrv: WARNING no block device in kernel table; IO fails with STATUS_NODEVICE",
+        );
     }
 
     loop {
@@ -129,8 +131,9 @@ fn cmd_info() {
     let mut payload = [0u8; 20];
     payload[0] = PASSTHROUGH_DEVICE;
     payload[1] = blk_proto::DEVICE_TYPE_VIRTIO;
-    // 直通路径拿不到设备几何：容量报 0（未知），块大小固定 512。
     payload[4..12].copy_from_slice(&(SECTOR_SIZE as u64).to_le_bytes());
+    let capacity = block_capacity_sectors().unwrap_or(0);
+    payload[12..20].copy_from_slice(&capacity.to_le_bytes());
     respond_status(blk_proto::STATUS_OK, &payload);
 }
 
@@ -210,7 +213,11 @@ impl ChunkRequest {
         let lba = u64::from_le_bytes(payload[4..12].try_into().ok()?);
         let offset = u32::from_le_bytes(payload[12..16].try_into().ok()?);
         let len = u32::from_le_bytes(payload[16..20].try_into().ok()?);
-        let limit = if is_write { WRITE_CHUNK_MAX } else { READ_CHUNK_MAX };
+        let limit = if is_write {
+            WRITE_CHUNK_MAX
+        } else {
+            READ_CHUNK_MAX
+        };
         if len == 0 || len > limit {
             return None;
         }
@@ -252,8 +259,10 @@ fn respond_status(code: u32, payload: &[u8]) {
 /// 生命周期行必须走 console（log 宏无 logger 注册，不会上串口）。
 fn print_line(text: &str) {
     let _ = userlib::console_write(text.as_bytes());
-    let _ = userlib::console_write(b"
-");
+    let _ = userlib::console_write(
+        b"
+",
+    );
 }
 
 fn warn_line(text: &str) {

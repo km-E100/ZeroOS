@@ -3,11 +3,11 @@ use crate::mm::address_space::{
     self, AddressSpace, MapError, USER_HEAP_BASE, USER_STACK_LEN, USER_STACK_TOP,
 };
 // PAGE_SIZE 由 mm Agent 迁移至 table_walk 模块（paging 不再公开导出）。
-use crate::mm::table_walk::PAGE_SIZE;
 use crate::mm::phys;
+use crate::mm::table_walk::PAGE_SIZE;
 use crate::rootfs;
 use crate::user_elf;
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -286,10 +286,7 @@ impl WaitSpec {
 /// exit_current_with_status 的实际取走逻辑直接调用本函数，模型与实现
 /// 共用同一段代码杜绝漂移）。返回 false 时登记必须原样保留——这是
 /// bool 时代无法表达的语义。
-pub(crate) fn wait_wake_decision(
-    registration: Option<WaitSpec>,
-    dying: ProcessId,
-) -> bool {
+pub(crate) fn wait_wake_decision(registration: Option<WaitSpec>, dying: ProcessId) -> bool {
     matches!(registration, Some(spec) if spec.matches(dying))
 }
 
@@ -432,8 +429,7 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
     let pid = alloc_pid();
 
     let mut table = PROCESS_TABLE.lock();
-    let slot_index =
-        alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
+    let slot_index = alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
     let slot = &mut table[slot_index];
 
     // KASLR 阶段 1（第十五刀）：用户栈顶向下随机偏移 ≤256 页（1MiB）。
@@ -480,6 +476,14 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
     Ok(pid)
 }
 
+pub fn set_parent(pid: ProcessId, parent: Option<ProcessId>) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(record) = table.iter_mut().flatten().find(|r| r.pid == pid) {
+        record.parent = parent;
+        record.adopted = false;
+    }
+}
+
 pub fn spawn_user(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, ProcessError> {
     // 恢复真实实现：console shell 是编译进内核的"内核内进程"，
     // 以函数指针为入口（与 ServiceEntry::KernelFn 同类）。
@@ -502,9 +506,12 @@ pub fn spawn_user_from_bootfs(
         return Err(ProcessError::NoSuchProcess);
     };
 
+    let bias = choose_user_load_bias(&elf)?;
+    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
     let result = unsafe {
         let mut space = AddressSpace::new();
-        map_user_elf_segments(&mut space, &elf, path).map_err(ProcessError::MapError)?;
+        map_user_elf_segments(&mut space, &elf, path, bias).map_err(ProcessError::MapError)?;
+        let _libs = load_dynamic_runtime(&mut space, &elf, bias)?;
         space
             .map_stack(USER_STACK_TOP, USER_STACK_LEN)
             .map_err(ProcessError::MapError)?;
@@ -512,7 +519,7 @@ pub fn spawn_user_from_bootfs(
             rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE)
                 .map_err(ProcessError::MapError)?;
         let root_phys = space.ttbr0_phys();
-        configure_user_process(slot, space, elf.entry as usize, USER_STACK_TOP);
+        configure_user_process(slot, space, runtime_entry, USER_STACK_TOP);
         set_initial_user_args(
             slot,
             [bootfs_info.entries_ptr, bootfs_info.entries_len, 0, 0],
@@ -523,10 +530,10 @@ pub fn spawn_user_from_bootfs(
             slot,
             path,
             root_phys,
-            elf.entry as usize
+            runtime_entry
         );
         let tf = TRAP_FRAMES[slot].get();
-        (*tf).elr_el1 = elf.entry;
+        (*tf).elr_el1 = runtime_entry as u64;
         // spawn() 已为该 TrapFrame 选择随机栈顶；不要在 bootfs 装载
         // 收尾把它重新覆盖回固定 USER_STACK_TOP。
         Ok(())
@@ -541,6 +548,39 @@ pub fn spawn_user_from_bootfs(
     // services 注册表仍以 bool 描述服务特权级（本文件不越界改动），
     // 细粒度按服务配置待其升格为 u32 位图后接入。
     set_privileged(pid, privileged);
+    Ok(pid)
+}
+
+/// Spawn a validated user ELF supplied by an authorized user-space launcher.
+/// The bytes are only needed while mapping; page contents are copied into the
+/// new address space before this function returns. Persistent storage remains a
+/// user-space concern (fsd/pkg), so the kernel never calls back into the FS.
+pub fn spawn_user_from_image(
+    elf_bytes: &[u8],
+    name: &'static str,
+    parent: Option<ProcessId>,
+) -> Result<ProcessId, ProcessError> {
+    let elf = user_elf::parse_user_elf(elf_bytes).map_err(ProcessError::ElfError)?;
+    let bias = choose_user_load_bias(&elf)?;
+    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
+    let pid = spawn(thread_exit, name)?;
+    let Some(slot) = slot_for_pid(pid) else { return Err(ProcessError::NoSuchProcess); };
+    let result = unsafe {
+        let mut space = AddressSpace::new();
+        map_user_elf_segments_from_bytes(&mut space, &elf, elf_bytes, "spawn-image", bias)
+            .map_err(ProcessError::MapError)?;
+        let _libs = load_dynamic_runtime(&mut space, &elf, bias)?;
+        space.map_stack(USER_STACK_TOP, USER_STACK_LEN).map_err(ProcessError::MapError)?;
+        let bootfs_info = rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE)
+            .map_err(ProcessError::MapError)?;
+        configure_user_process(slot, space, runtime_entry, USER_STACK_TOP);
+        set_initial_user_args(slot, [bootfs_info.entries_ptr, bootfs_info.entries_len, 0, 0]);
+        let tf = TRAP_FRAMES[slot].get();
+        (*tf).elr_el1 = runtime_entry as u64;
+        Ok::<(), ProcessError>(())
+    };
+    if let Err(err) = result { remove_slot(slot); return Err(err); }
+    set_parent(pid, parent);
     Ok(pid)
 }
 
@@ -687,7 +727,10 @@ pub fn set_pending_recv(slot: usize, chan: u32) {
 /// 取走挂起标记（dispatch 在重入用户态前调用一次）。
 pub fn take_pending_recv(slot: usize) -> Option<u32> {
     let mut table = PROCESS_TABLE.lock();
-    table.get_mut(slot).and_then(|record| record.as_mut()).and_then(|record| record.pending_recv.take())
+    table
+        .get_mut(slot)
+        .and_then(|record| record.as_mut())
+        .and_then(|record| record.pending_recv.take())
 }
 
 /// EL0 同步故障 → 默认动作投递辅助（第九刀信号位图最小版）。
@@ -714,7 +757,10 @@ pub(crate) fn deliver_fatal_signal(slot: usize, sig: u8) -> i32 {
 /// 按槽位读状态（scheduler 的 dispatch 状态保护用）。
 pub fn state_slot(slot: usize) -> Option<ProcessState> {
     let table = PROCESS_TABLE.lock();
-    table.get(slot).and_then(|entry| entry.as_ref()).map(|record| record.state)
+    table
+        .get(slot)
+        .and_then(|entry| entry.as_ref())
+        .map(|record| record.state)
 }
 
 pub fn state(pid: ProcessId) -> Option<ProcessState> {
@@ -946,7 +992,11 @@ pub(crate) struct ProcView {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WaitDecision {
     /// 发现可收尸：携带 (槽位, 子 pid, 退出码)。
-    Collect { slot: usize, pid: ProcessId, code: i32 },
+    Collect {
+        slot: usize,
+        pid: ProcessId,
+        code: i32,
+    },
     /// 有匹配的活子未退：挂起等待。
     Block,
     /// 没有任何匹配子进程（含“早已收过”的重复 wait）：ECHILD。
@@ -1096,14 +1146,14 @@ fn full_reap(seed: usize) {
         // 授予；若死者是会话领袖则注销其会话并清场其余成员（锁纪律：
         // 台账锁在外层、本处已不持表锁，无反转）。
         crate::security::on_process_gone(record.pid);
+        crate::shm::on_process_gone(record.pid);
         if let Some(space) = record.addr_space {
             // 线程组转移（第十五刀）：组长/载体被级联回收时先问组内
             // 幸存者；无人接手才锁外销毁（表锁→分配器锁反转风险，
             // scheduler.rs 锁纪律第 3 条，转移在上方短暂持锁完成）。
             let transferred = {
                 let mut table = PROCESS_TABLE.lock();
-                transfer_group_space_locked(&mut table, record.tgid, record.pid, space)
-                    .is_none()
+                transfer_group_space_locked(&mut table, record.tgid, record.pid, space).is_none()
             };
             if !transferred {
                 unsafe {
@@ -1126,8 +1176,7 @@ fn full_reap(seed: usize) {
             }
             audit_warn(format_args!(
                 "cascade reap: zombie pid={} slot={} (parent died)",
-                casc_pids[k],
-                casc_slots[k]
+                casc_pids[k], casc_slots[k]
             ));
             if top < MAX_PROCESSES {
                 stack[top] = casc_slots[k];
@@ -1152,7 +1201,11 @@ fn full_reap(seed: usize) {
 /// TRAP_FRAMES/KERNEL_STACKS 是 64×16KiB 静态数组，槽位回用即可。
 
 pub fn remove_slot(slot: usize) {
-    assert!(slot < MAX_PROCESSES, "remove_slot: slot {} out of range", slot);
+    assert!(
+        slot < MAX_PROCESSES,
+        "remove_slot: slot {} out of range",
+        slot
+    );
     full_reap(slot);
 }
 
@@ -1206,7 +1259,9 @@ pub fn exit_current_with_status(status: i32) -> ! {
 
         crate::debug!(
             "process exit: pid={} slot={} status={}",
-            my_pid.raw(), slot, status
+            my_pid.raw(),
+            slot,
+            status
         );
         // —— 阶段 2（独占写）：定处置 / 写退出码 / 转 Zombie / 取走父等待标记 ——
         match exit_disposition(parent, parent_alive, adopted) {
@@ -1216,8 +1271,8 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 me.exit_code = Some(status);
                 me.state = ProcessState::Zombie;
                 let space = me.addr_space.take(); // 用户页/页表此刻归还
-                // 线程组转移（第十五刀）：组内还有幸存者则移交所有权
-                // （转移成功 ⇒ None，ZombiePlan.space 为 None 即不销毁）。
+                                                  // 线程组转移（第十五刀）：组内还有幸存者则移交所有权
+                                                  // （转移成功 ⇒ None，ZombiePlan.space 为 None 即不销毁）。
                 let space = space.and_then(|space| {
                     transfer_group_space_locked(&mut table, my_tgid, my_pid, space)
                 });
@@ -1248,13 +1303,7 @@ pub fn exit_current_with_status(status: i32) -> ! {
                 if let Some(me) = rec.as_mut() {
                     me.exit_code = Some(status); // 审计留痕（随后随记录销毁）
                     if let Some(space) = me.addr_space.take() {
-                        if transfer_group_space_locked(
-                            &mut table,
-                            my_tgid,
-                            my_pid,
-                            space,
-                        )
-                        .is_none()
+                        if transfer_group_space_locked(&mut table, my_tgid, my_pid, space).is_none()
                         {
                             putback = false; // 空间已移交幸存成员
                         }
@@ -1309,11 +1358,7 @@ pub fn exit_current_with_status(status: i32) -> ! {
             } else {
                 // 无匹配等待者（父没在等 / 登记的是别的 pid）：留尸待父
                 // 将来 wait 补收（快路径 Collect 分支）。
-                crate::info!(
-                    "process slot={} became zombie (status={})",
-                    slot,
-                    status
-                );
+                crate::info!("process slot={} became zombie (status={})", slot, status);
             }
         }
         Plan::ReapNow => full_reap(slot),
@@ -1415,7 +1460,10 @@ fn group_survivor_index(
 ) -> Option<usize> {
     table.iter().position(|entry| {
         entry.as_ref().map_or(false, |rec| {
-            rec.tgid == tgid && rec.pid != dying_pid && rec.state != ProcessState::Dying && rec.addr_space.is_none()
+            rec.tgid == tgid
+                && rec.pid != dying_pid
+                && rec.state != ProcessState::Dying
+                && rec.addr_space.is_none()
         })
     })
 }
@@ -1465,7 +1513,12 @@ pub(crate) enum WaitAction {
     NoChild,
 }
 
-pub(crate) fn wait_plan(caller: ProcessId, target: u64, flags: u64, procs: &[Option<ProcView>]) -> WaitAction {
+pub(crate) fn wait_plan(
+    caller: ProcessId,
+    target: u64,
+    flags: u64,
+    procs: &[Option<ProcView>],
+) -> WaitAction {
     match wait_scan(caller, target, procs) {
         WaitDecision::Collect { slot, pid, code } => WaitAction::Collect {
             slot,
@@ -1485,7 +1538,10 @@ pub(crate) fn wait_plan(caller: ProcessId, target: u64, flags: u64, procs: &[Opt
 pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
     let caller_slot = crate::scheduler::current_slot();
     enum Act {
-        Collect { packed: u64, space: Option<AddressSpace> },
+        Collect {
+            packed: u64,
+            space: Option<AddressSpace>,
+        },
         Block,
     }
     let act = {
@@ -1545,7 +1601,9 @@ pub fn waitpid_step(target_pid: u64, flags: u64) -> Result<WaitStep, SysError> {
             // 与 full_reap 同一钩子，保证"记录摘除 ⇒ 台账清理"不变量
             // 在两条回收路径上同时成立。pid 从 pack_wait_result 编码
             // 高 32 位还原（与 unpack_wait_result 同一布局）。
-            crate::security::on_process_gone(ProcessId::new(packed >> 32));
+            let dead_pid = ProcessId::new(packed >> 32);
+            crate::security::on_process_gone(dead_pid);
+            crate::shm::on_process_gone(dead_pid);
             crate::info!("waitpid: collected & fully reaped -> {:#x}", packed);
             Ok(WaitStep::Completed(packed))
         }
@@ -1573,7 +1631,11 @@ pub fn address_space(slot: usize) -> Option<AddressSpace> {
         }
     };
     if let Some(s) = &out {
-        crate::debug!("process::address_space: slot={} root=0x{:x}", slot, s.ttbr0_phys());
+        crate::debug!(
+            "process::address_space: slot={} root=0x{:x}",
+            slot,
+            s.ttbr0_phys()
+        );
     }
     out
 }
@@ -1637,7 +1699,11 @@ extern "C" fn thread_exit() -> ! {
     // 终止并回收；两个入口殊途同归，不会再有"死循环占槽"。
     let slot = crate::scheduler::current_slot();
     if let Some(pid) = pid_at_slot(slot) {
-        crate::warn!("thread_exit: pid={} slot={} exiting (user main returned)", pid.raw(), slot);
+        crate::warn!(
+            "thread_exit: pid={} slot={} exiting (user main returned)",
+            pid.raw(),
+            slot
+        );
     }
     exit_current_with_status(0)
 }
@@ -1656,13 +1722,202 @@ fn set_initial_user_args(slot: usize, args: [u64; 4]) {
     }
 }
 
+const USER_PIE_ALIGN: usize = 2 * 1024 * 1024;
+const USER_PIE_BASE_MIN: usize = 0x0200_0000;
+const USER_PIE_CEILING: usize = USER_HEAP_BASE - USER_PIE_ALIGN;
+const USER_LIB_BASE: usize = 0x3000_0000;
+const USER_LIB_END: usize = 0x3f00_0000;
+const USER_LIB_SLOT: usize = 8 * 1024 * 1024;
+const MAX_LOADED_LIBRARIES: usize = (USER_LIB_END - USER_LIB_BASE) / USER_LIB_SLOT;
+
+struct LoadedLibrary {
+    name: String,
+    elf: user_elf::UserElf,
+    bias: usize,
+}
+
+struct SharedLibraryPage {
+    name: String,
+    rel_page: usize,
+    phys: usize,
+}
+
+// One permanent reference per cached read-only library page. Every process
+// mapping takes an additional phys ref; address-space destruction drops only
+// that mapping ref, so text/rodata really are shared across process lifetimes.
+static SHARED_LIBRARY_PAGES: Mutex<Vec<SharedLibraryPage>> = Mutex::new(Vec::new());
+
+fn pie_bias_from_entropy(elf: &user_elf::UserElf, entropy: u64) -> Option<usize> {
+    if elf.kind == user_elf::UserElfKind::Exec {
+        return Some(0);
+    }
+    let span = align_up(elf.image_span()?, USER_PIE_ALIGN);
+    if span == 0 || USER_PIE_BASE_MIN.checked_add(span)? > USER_PIE_CEILING {
+        return None;
+    }
+    let max_bias = USER_PIE_CEILING.checked_sub(span)?;
+    let slots = max_bias.checked_sub(USER_PIE_BASE_MIN)? / USER_PIE_ALIGN + 1;
+    let slot = (entropy as usize) % slots;
+    USER_PIE_BASE_MIN.checked_add(slot.checked_mul(USER_PIE_ALIGN)?)
+}
+
+fn choose_user_load_bias(elf: &user_elf::UserElf) -> Result<usize, ProcessError> {
+    if elf.kind == user_elf::UserElfKind::Exec {
+        return Ok(0);
+    }
+    let mut bytes = [0u8; 8];
+    if !crate::drivers::virtio::rng::fill_random(&mut bytes) {
+        crate::error!("PIE load refused: cryptographic entropy unavailable");
+        return Err(ProcessError::InvalidArgument);
+    }
+    let entropy = u64::from_le_bytes(bytes);
+    let bias = pie_bias_from_entropy(elf, entropy).ok_or(ProcessError::InvalidArgument)?;
+    crate::info!("PIE load bias selected: {:#x}", bias);
+    Ok(bias)
+}
+
+fn library_bias_for_index(index: usize, elf: &user_elf::UserElf) -> Option<usize> {
+    if index >= MAX_LOADED_LIBRARIES { return None; }
+    let span = align_up(elf.image_span()?, PAGE_SIZE);
+    if span == 0 || span > USER_LIB_SLOT { return None; }
+    let bias = USER_LIB_BASE.checked_add(index.checked_mul(USER_LIB_SLOT)?)?;
+    (bias.checked_add(span)? <= USER_LIB_END).then_some(bias)
+}
+
+fn checked_bias_add(bias: usize, value: u64) -> Result<usize, ProcessError> {
+    bias.checked_add(usize::try_from(value).map_err(|_| ProcessError::InvalidArgument)?)
+        .ok_or(ProcessError::InvalidArgument)
+}
+
+fn checked_signed_add(base: usize, addend: i64) -> Result<u64, ProcessError> {
+    let v = (base as i128) + (addend as i128);
+    if !(0..=u64::MAX as i128).contains(&v) { return Err(ProcessError::InvalidArgument); }
+    Ok(v as u64)
+}
+
+fn global_symbol(libs: &[LoadedLibrary], name: &str) -> Option<usize> {
+    if name.is_empty() { return None; }
+    for lib in libs {
+        if let Some(sym) = lib.elf.symbols.iter().find(|s| {
+            s.defined && (s.binding == 1 || s.binding == 2) && s.name == name
+        }) {
+            return lib.bias.checked_add(sym.value as usize);
+        }
+    }
+    None
+}
+
+fn relocation_value(
+    elf: &user_elf::UserElf,
+    bias: usize,
+    libs: &[LoadedLibrary],
+    rela: &user_elf::UserRela,
+) -> Result<u64, ProcessError> {
+    use user_elf::{R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE};
+    if rela.typ == R_AARCH64_RELATIVE {
+        return checked_signed_add(bias, rela.addend);
+    }
+    let sym = elf.symbol(rela.sym).ok_or(ProcessError::InvalidArgument)?;
+    let addr = if sym.defined {
+        checked_bias_add(bias, sym.value)?
+    } else {
+        global_symbol(libs, sym.name.as_str()).ok_or(ProcessError::InvalidArgument)?
+    };
+    match rela.typ {
+        R_AARCH64_ABS64 => checked_signed_add(addr, rela.addend),
+        R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
+            if rela.addend == 0 { Ok(addr as u64) } else { checked_signed_add(addr, rela.addend) }
+        }
+        _ => Err(ProcessError::InvalidArgument),
+    }
+}
+
+fn write_relocation_target(space: &AddressSpace, target: usize, value: u64) -> Result<(), ProcessError> {
+    let page_off = target & (PAGE_SIZE - 1);
+    if page_off > PAGE_SIZE - core::mem::size_of::<u64>() {
+        return Err(ProcessError::InvalidArgument);
+    }
+    let phys = match space.walk(target) {
+        crate::mm::table_walk::WalkOutcome::Page { phys, .. } => phys,
+        _ => return Err(ProcessError::InvalidArgument),
+    };
+    unsafe { core::ptr::write_unaligned((phys + page_off) as *mut u64, value); }
+    Ok(())
+}
+
+fn apply_image_relocations(
+    space: &AddressSpace,
+    elf: &user_elf::UserElf,
+    bias: usize,
+    libs: &[LoadedLibrary],
+) -> Result<(), ProcessError> {
+    for rela in &elf.relas {
+        let target = checked_bias_add(bias, rela.offset)?;
+        let value = relocation_value(elf, bias, libs, rela)?;
+        write_relocation_target(space, target, value)?;
+    }
+    Ok(())
+}
+
+fn load_library_recursive(
+    space: &mut AddressSpace,
+    name: &str,
+    libs: &mut Vec<LoadedLibrary>,
+) -> Result<(), ProcessError> {
+    if libs.iter().any(|l| l.name == name) { return Ok(()); }
+    if libs.len() >= MAX_LOADED_LIBRARIES || name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err(ProcessError::InvalidArgument);
+    }
+    let mut path = String::from("/System/Lib/");
+    path.push_str(name);
+    let bytes = rootfs::read_file(path.as_str()).ok_or(ProcessError::InvalidArgument)?;
+    let elf = user_elf::parse_user_elf(bytes).map_err(ProcessError::ElfError)?;
+    if elf.kind != user_elf::UserElfKind::Dyn { return Err(ProcessError::InvalidArgument); }
+    let deps = elf.needed.clone();
+    for dep in deps { load_library_recursive(space, dep.as_str(), libs)?; }
+    if libs.iter().any(|l| l.name == name) { return Ok(()); }
+    let bias = library_bias_for_index(libs.len(), &elf).ok_or(ProcessError::InvalidArgument)?;
+    map_shared_library_segments(space, &elf, bytes, name, bias).map_err(ProcessError::MapError)?;
+    crate::info!("shared library mapped: {} bias={:#x}", name, bias);
+    libs.push(LoadedLibrary { name: String::from(name), elf, bias });
+    Ok(())
+}
+
+fn load_dynamic_runtime(
+    space: &mut AddressSpace,
+    main: &user_elf::UserElf,
+    main_bias: usize,
+) -> Result<Vec<LoadedLibrary>, ProcessError> {
+    let mut libs = Vec::new();
+    for name in &main.needed { load_library_recursive(space, name.as_str(), &mut libs)?; }
+    // All providers must be present before applying any symbolic relocation.
+    for lib in &libs { apply_image_relocations(space, &lib.elf, lib.bias, &libs)?; }
+    apply_image_relocations(space, main, main_bias, &libs)?;
+    Ok(libs)
+}
+
 fn map_user_elf_segments(
     space: &mut AddressSpace,
     elf: &user_elf::UserElf,
     path: &str,
+    bias: usize,
 ) -> Result<(), MapError> {
     let elf_bytes = rootfs::read_file(path).ok_or(MapError::OutOfMemory)?;
-    crate::debug!("map_user_elf_segments: root_phys=0x{:x} path={}", space.ttbr0_phys(), path);
+    map_user_elf_segments_from_bytes(space, elf, elf_bytes, path, bias)
+}
+
+fn map_user_elf_segments_from_bytes(
+    space: &mut AddressSpace,
+    elf: &user_elf::UserElf,
+    elf_bytes: &[u8],
+    label: &str,
+    bias: usize,
+) -> Result<(), MapError> {
+    crate::debug!(
+        "map_user_elf_segments: root_phys=0x{:x} image={}",
+        space.ttbr0_phys(),
+        label
+    );
     for seg in elf.segments.iter() {
         if seg.memsz == 0 {
             continue;
@@ -1673,8 +1928,12 @@ fn map_user_elf_segments(
             seg.memsz,
             seg.filesz
         );
-        let seg_start = seg.vaddr as usize;
-        let seg_end = seg_start + seg.memsz as usize;
+        let seg_start = bias
+            .checked_add(seg.vaddr as usize)
+            .ok_or(MapError::KernelRegion)?;
+        let seg_end = seg_start
+            .checked_add(seg.memsz as usize)
+            .ok_or(MapError::KernelRegion)?;
         let page_start = seg_start & !(PAGE_SIZE - 1);
         let page_end = align_up(seg_end, PAGE_SIZE);
         let mut writable = (seg.flags & PF_W) != 0;
@@ -1723,6 +1982,86 @@ fn map_user_elf_segments(
             unsafe {
                 space.map_page_phys(page_va, phys, writable, executable)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn map_shared_library_segments(
+    space: &mut AddressSpace,
+    elf: &user_elf::UserElf,
+    elf_bytes: &[u8],
+    name: &str,
+    bias: usize,
+) -> Result<(), MapError> {
+    for seg in &elf.segments {
+        if seg.memsz == 0 { continue; }
+        let seg_start = bias.checked_add(seg.vaddr as usize).ok_or(MapError::KernelRegion)?;
+        let seg_end = seg_start.checked_add(seg.memsz as usize).ok_or(MapError::KernelRegion)?;
+        let page_start = seg_start & !(PAGE_SIZE - 1);
+        let page_end = align_up(seg_end, PAGE_SIZE);
+        let mut writable = (seg.flags & PF_W) != 0;
+        let executable = (seg.flags & PF_X) != 0;
+        if seg.memsz > seg.filesz { writable = true; }
+        let data_len = seg.filesz as usize;
+
+        for page_va in (page_start..page_end).step_by(PAGE_SIZE) {
+            let rel_page = page_va.checked_sub(bias).ok_or(MapError::KernelRegion)?;
+            let mut cached_mapping = false;
+            let phys = if !writable {
+                let mut cache = SHARED_LIBRARY_PAGES.lock();
+                if let Some(hit) = cache.iter().find(|p| p.name == name && p.rel_page == rel_page) {
+                    crate::info!("shared library cache hit: {} rel_page={:#x} phys={:#x}", name, rel_page, hit.phys);
+                    phys::retain_page(hit.phys);
+                    cached_mapping = true;
+                    hit.phys
+                } else {
+                    let page = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
+                    unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+                    let copy_start = cmp::max(seg_start, page_va);
+                    let copy_end = cmp::min(seg_start + data_len, page_va + PAGE_SIZE);
+                    if copy_start < copy_end {
+                        let src_off = copy_start - seg_start;
+                        let dst_off = copy_start - page_va;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                elf_bytes.as_ptr().add(seg.offset as usize + src_off),
+                                (page as *mut u8).add(dst_off),
+                                copy_end - copy_start,
+                            );
+                        }
+                    }
+                    // allocation ref belongs to cache; process mapping gets its own.
+                    cache.push(SharedLibraryPage { name: String::from(name), rel_page, phys: page });
+                    phys::retain_page(page);
+                    cached_mapping = true;
+                    page
+                }
+            } else {
+                let page = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
+                unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+                let copy_start = cmp::max(seg_start, page_va);
+                let copy_end = cmp::min(seg_start + data_len, page_va + PAGE_SIZE);
+                if copy_start < copy_end {
+                    let src_off = copy_start - seg_start;
+                    let dst_off = copy_start - page_va;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            elf_bytes.as_ptr().add(seg.offset as usize + src_off),
+                            (page as *mut u8).add(dst_off),
+                            copy_end - copy_start,
+                        );
+                    }
+                }
+                page
+            };
+            if let Err(err) = unsafe { space.map_page_phys(page_va, phys, writable, executable) } {
+                // cached mappings own an extra process ref; private writable pages own
+                // their allocation ref. One free is correct in both cases.
+                phys::free_page(phys);
+                return Err(err);
+            }
+            let _ = cached_mapping;
         }
     }
     Ok(())
@@ -1784,8 +2123,7 @@ pub fn fork(
 
     {
         let mut table = PROCESS_TABLE.lock();
-        let slot_index =
-            alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
+        let slot_index = alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
         child_slot = slot_index;
         let slot = &mut table[slot_index];
 
@@ -1885,8 +2223,7 @@ pub fn create_thread(
     let child_slot;
     {
         let mut table = PROCESS_TABLE.lock();
-        let slot_index =
-            alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
+        let slot_index = alloc_table_slot_locked(&mut table).ok_or(ProcessError::TableFull)?;
         child_slot = slot_index;
         let slot = &mut table[slot_index];
 
@@ -2107,10 +2444,16 @@ pub unsafe fn exec_load(
     // —— BuildNewImage：旧空间完整期间构建全新空间（唯一可失败阶段）。
     //    半成品当场销毁，绝不留泄漏；错误逐级映射保持 spawn 路径同款语义。
     let elf = user_elf::build_user_elf(path).map_err(ProcessError::ElfError)?;
+    let bias = choose_user_load_bias(&elf)?;
+    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
     let mut space = AddressSpace::new();
-    if let Err(err) = map_user_elf_segments(&mut space, &elf, path) {
+    if let Err(err) = map_user_elf_segments(&mut space, &elf, path, bias) {
         space.destroy();
         return Err(ProcessError::MapError(err));
+    }
+    if let Err(err) = load_dynamic_runtime(&mut space, &elf, bias) {
+        space.destroy();
+        return Err(err);
     }
     if let Err(err) = space.map_stack(USER_STACK_TOP, USER_STACK_LEN) {
         space.destroy();
@@ -2127,7 +2470,7 @@ pub unsafe fn exec_load(
 
     // —— CommitRebind：表锁内原子换入（此后不再有可失败步骤）。
     let (old_space, committed) =
-        rebind_address_space(slot, space, elf.entry as usize, USER_STACK_TOP);
+        rebind_address_space(slot, space, runtime_entry, USER_STACK_TOP);
     if !committed {
         // AddressSpace 是 Copy，这里仍可触达新空间：防御性销毁防泄漏。
         space.destroy();
@@ -2149,7 +2492,7 @@ pub unsafe fn exec_load(
     //    返回后走 exit(0) 状态机（可收集），而不是跌进未知地址。——
     apply_exec_frame(
         &mut *frame,
-        elf.entry as usize,
+        runtime_entry,
         USER_STACK_TOP,
         kernel_stack_top_raw(slot),
         [
@@ -2163,7 +2506,7 @@ pub unsafe fn exec_load(
         "exec_load: pid={} image replaced with {} (entry={:#x} root_phys={:#x} old_as_destroyed=true)",
         pid.map(|p| p.raw()).unwrap_or(0),
         path,
-        elf.entry as usize,
+        runtime_entry,
         space.ttbr0_phys()
     );
     Ok(bootfs_info.entries_ptr)
@@ -2203,12 +2546,10 @@ mod exec_tests {
         assert_eq!(frame.owner_slot, u64::MAX);
         assert_eq!(frame.elr_el1, 0x20_0000);
         assert_eq!(frame.spsr_el1, 0); // EL0t
-        // KASLR 阶段1（第十五刀）：栈顶随机下移 ≤256 页，页对齐。
+                                       // KASLR 阶段1（第十五刀）：栈顶随机下移 ≤256 页，页对齐。
         let sp = frame.sp_el0 as usize;
         assert!(
-            sp <= 0xFFFF_F000
-                && sp > 0xFFFF_F000 - 256 * PAGE_SIZE
-                && sp % PAGE_SIZE == 0,
+            sp <= 0xFFFF_F000 && sp > 0xFFFF_F000 - 256 * PAGE_SIZE && sp % PAGE_SIZE == 0,
             "sp_el0 KASLR out of window: {:#x}",
             sp
         );
@@ -2238,8 +2579,14 @@ mod exec_tests {
     #[test]
     fn exec_stage_plan_orders_activate_before_destroy_and_fails_atomically() {
         let ok = exec_stage_plan(true);
-        let cmt = ok.iter().position(|s| *s == ExecStage::CommitRebind).unwrap();
-        let act = ok.iter().position(|s| *s == ExecStage::ActivateNew).unwrap();
+        let cmt = ok
+            .iter()
+            .position(|s| *s == ExecStage::CommitRebind)
+            .unwrap();
+        let act = ok
+            .iter()
+            .position(|s| *s == ExecStage::ActivateNew)
+            .unwrap();
         let dst = ok.iter().position(|s| *s == ExecStage::DestroyOld).unwrap();
         assert!(cmt < act && act < dst, "Commit→Activate→Destroy 次序被破坏");
         assert_eq!(ok.last(), Some(&ExecStage::ResetFrame));
@@ -2289,7 +2636,10 @@ mod state_machine_tests {
             ExitDisposition::BecomeZombie
         );
         // 无父 / 父已死 / 父已僵 → 立即完全回收
-        assert_eq!(exit_disposition(None, false, false), ExitDisposition::ReapImmediately);
+        assert_eq!(
+            exit_disposition(None, false, false),
+            ExitDisposition::ReapImmediately
+        );
         assert_eq!(
             exit_disposition(Some(ProcessId::new(9)), false, false),
             ExitDisposition::ReapImmediately
@@ -2315,11 +2665,19 @@ mod state_machine_tests {
         ]);
         assert_eq!(
             wait_scan(caller(), 0, &t),
-            WaitDecision::Collect { slot: 1, pid: ProcessId::new(11), code: 42 }
+            WaitDecision::Collect {
+                slot: 1,
+                pid: ProcessId::new(11),
+                code: 42
+            }
         );
         assert_eq!(
             wait_scan(caller(), 11, &t),
-            WaitDecision::Collect { slot: 1, pid: ProcessId::new(11), code: 42 }
+            WaitDecision::Collect {
+                slot: 1,
+                pid: ProcessId::new(11),
+                code: 42
+            }
         );
     }
 
@@ -2352,7 +2710,11 @@ mod state_machine_tests {
         let t1 = table_of(&rows);
         assert_eq!(
             wait_scan(caller(), 0, &t1),
-            WaitDecision::Collect { slot: 1, pid: ProcessId::new(11), code: -3 }
+            WaitDecision::Collect {
+                slot: 1,
+                pid: ProcessId::new(11),
+                code: -3
+            }
         );
         // 模拟完全回收：尸体行消失（waitpid_step 的 take 之后即如此）
         rows[1] = None;
@@ -2389,7 +2751,12 @@ mod state_machine_tests {
 
     #[test]
     fn wait_result_packing_roundtrip_including_negative() {
-        for (raw, code) in [(7u64, 42i32), (1234, 0), (64, -1), (u32::MAX as u64, i32::MIN)] {
+        for (raw, code) in [
+            (7u64, 42i32),
+            (1234, 0),
+            (64, -1),
+            (u32::MAX as u64, i32::MIN),
+        ] {
             let packed = pack_wait_result(ProcessId::new(raw), code);
             assert_eq!((packed >> 32, (packed as u32) as i32), (raw, code));
         }
@@ -2407,10 +2774,7 @@ mod state_machine_tests {
         assert_eq!(wait_plan(caller(), 0, 0, &t), WaitAction::Sleep);
         // WNOHANG 置位：同一张表 → PollMiss（不挂起，立即返回 0）
         let nohang = zero_abi::syscall::WAIT_NOHANG;
-        assert_eq!(
-            wait_plan(caller(), 0, nohang, &t),
-            WaitAction::PollMiss
-        );
+        assert_eq!(wait_plan(caller(), 0, nohang, &t), WaitAction::PollMiss);
         // 未定义位被忽略：只有 bit0 参与判定
         assert_eq!(
             wait_plan(caller(), 0, nohang | 0b1111_1110, &t),
@@ -2430,7 +2794,10 @@ mod state_machine_tests {
         for flags in [0u64, nohang] {
             assert_eq!(
                 wait_plan(caller(), 0, flags, &zombie_t),
-                WaitAction::Collect { slot: 1, packed: pack_wait_result(ProcessId::new(11), 42) }
+                WaitAction::Collect {
+                    slot: 1,
+                    packed: pack_wait_result(ProcessId::new(11), 42)
+                }
             );
         }
         // 无任何子：ECHILD 不受 WNOHANG 影响（Linux 同款语义）
@@ -2473,7 +2840,7 @@ mod state_machine_tests {
             entry: thread_exit,
             state: ProcessState::Runnable,
             slot,
-            addr_space: None, // 测试绝不触发 AddressSpace::destroy
+            addr_space: None,              // 测试绝不触发 AddressSpace::destroy
             tgid: ProcessId::new(pid_raw), // 测试默认单线程组（第十五刀）
             capabilities: 0,
             entry_point: None,
@@ -2599,7 +2966,7 @@ mod state_machine_tests {
         // ② A 后退：命中 ⇒ 唤醒；实现侧 take 后登记清空。
         assert!(wait_wake_decision(registration, a));
         registration = None; // 模拟 exit_current_with_status 取走登记
-        // ③ 二次事件（假想虚假唤醒/stale 投递）：登记已空，绝不再醒。
+                             // ③ 二次事件（假想虚假唤醒/stale 投递）：登记已空，绝不再醒。
         assert!(!wait_wake_decision(registration, a));
         assert!(!wait_wake_decision(registration, b));
     }
@@ -2611,7 +2978,10 @@ mod state_machine_tests {
         let a = ProcessId::new(50);
         let b = ProcessId::new(51);
         let mut registration = Some(WaitSpec::Any);
-        assert!(wait_wake_decision(registration, b), "wait(0) wakes on any child");
+        assert!(
+            wait_wake_decision(registration, b),
+            "wait(0) wakes on any child"
+        );
         assert!(wait_wake_decision(registration, a));
         registration = None;
         assert!(!wait_wake_decision(registration, a));
@@ -2630,7 +3000,11 @@ mod state_machine_tests {
         assert_eq!(wait_scan(caller(), 61, &t), WaitDecision::Block);
         assert_eq!(
             wait_scan(caller(), 60, &t),
-            WaitDecision::Collect { slot: 1, pid: ProcessId::new(60), code: 66 }
+            WaitDecision::Collect {
+                slot: 1,
+                pid: ProcessId::new(60),
+                code: 66
+            }
         );
         // A 也退出后：wait(A) 收 A 自身的码；两具尸体互不串线。
         let t2 = table_of(&[
@@ -2640,11 +3014,19 @@ mod state_machine_tests {
         ]);
         assert_eq!(
             wait_scan(caller(), 61, &t2),
-            WaitDecision::Collect { slot: 2, pid: ProcessId::new(61), code: 33 }
+            WaitDecision::Collect {
+                slot: 2,
+                pid: ProcessId::new(61),
+                code: 33
+            }
         );
         assert_eq!(
             wait_scan(caller(), 60, &t2),
-            WaitDecision::Collect { slot: 1, pid: ProcessId::new(60), code: 66 }
+            WaitDecision::Collect {
+                slot: 1,
+                pid: ProcessId::new(60),
+                code: 66
+            }
         );
     }
 
@@ -2684,7 +3066,10 @@ mod state_machine_tests {
             assert!(seen.insert(cur), "pid {} allocated twice", cur);
             cur = next_pid_raw(cur);
         }
-        assert!(cur < (1u64 << 32), "pid budget must stay within packing capacity");
+        assert!(
+            cur < (1u64 << 32),
+            "pid budget must stay within packing capacity"
+        );
     }
 
     #[test]
@@ -2736,7 +3121,10 @@ mod state_machine_tests {
                 rec.pending_signals,
                 signal_bit(SIGSEGV) | signal_bit(SIGBUS)
             );
-            assert_eq!(rec.exit_code, None, "投递只登记位图；exit_code 由 exit 路径写入");
+            assert_eq!(
+                rec.exit_code, None,
+                "投递只登记位图；exit_code 由 exit 路径写入"
+            );
         }
         // 清场（仍持 _g）：还原空表，避免影响其他测试对表状态的假设
         {
@@ -2808,8 +3196,8 @@ mod spawn_table_full_tests {
 
 #[cfg(test)]
 mod thread_model_tests {
-    use super::*;
     use super::state_machine_tests::TABLE_GUARD;
+    use super::*;
 
     fn bare_record(pid_raw: u64, slot: usize) -> ProcessRecord {
         ProcessRecord {
@@ -2878,6 +3266,34 @@ mod thread_model_tests {
         // 成员死亡：排除成员后只剩组长自身槽位——真实调用方保证此时
         // 组长持有 Some(space) 故不会被选为"空手接盘者"；宿主侧以
         // pid 排除语义验证。
-        assert_eq!(group_survivor_index(&table, leader, ProcessId::new(201)), Some(0));
+        assert_eq!(
+            group_survivor_index(&table, leader, ProcessId::new(201)),
+            Some(0)
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod pie_loader_tests {
+    use super::*;
+    fn fake(span: u64) -> user_elf::UserElf {
+        let mut segments = alloc::vec::Vec::new();
+        segments.push(user_elf::UserElfSegment { vaddr:0, offset:0, filesz:span, memsz:span, flags: crate::elf::PF_X });
+        user_elf::UserElf { kind:user_elf::UserElfKind::Dyn, entry:0, segments, relas:alloc::vec::Vec::new(), needed:alloc::vec::Vec::new(), symbols:alloc::vec::Vec::new() }
+    }
+    #[test]
+    fn pie_bias_is_aligned_below_heap_and_entropy_varies_slot() {
+        let e=fake(0x4000);
+        let a=pie_bias_from_entropy(&e,1).unwrap(); let b=pie_bias_from_entropy(&e,2).unwrap();
+        assert_eq!(a & (USER_PIE_ALIGN-1),0); assert_eq!(b & (USER_PIE_ALIGN-1),0);
+        assert!(a>=USER_PIE_BASE_MIN && a<USER_HEAP_BASE); assert_ne!(a,b);
+    }
+    #[test]
+    fn library_slots_are_separate_from_heap_and_shm() {
+        let e=fake(0x4000);
+        assert_eq!(library_bias_for_index(0,&e),Some(USER_LIB_BASE));
+        assert_eq!(library_bias_for_index(1,&e),Some(USER_LIB_BASE+USER_LIB_SLOT));
+        assert!(USER_LIB_BASE >= crate::shm::SHM_PUBLIC_END_FOR_TEST);
     }
 }

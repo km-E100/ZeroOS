@@ -3,7 +3,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr;
 use spin::Mutex;
-use zero_abi::cap::{CAP_BLOCK_DEV, CAP_CHANNEL_CREATE, CAP_ISSUER, CAP_MMIO, CAP_SPAWN_SVC};
+use zero_abi::cap::{
+    CAP_AUDIO_DEV, CAP_BLOCK_DEV, CAP_CHANNEL_CREATE, CAP_DISPLAY, CAP_INPUT_DEV, CAP_ISSUER, CAP_MMIO,
+    CAP_NET_DEV, CAP_SPAWN_APP, CAP_SPAWN_SVC,
+};
 use zero_abi::ipc::{ChannelDesc, Message};
 use zero_abi::syscall::{SysError, Syscall, SyscallResult};
 use zero_abi::ProcessId;
@@ -137,8 +140,7 @@ pub fn complete_receive(slot: usize, chan: u32) {
                 unsafe {
                     let user_buffer = (*frame).regs[2] as usize;
                     let result = copy_message_to_user(user_buffer, &message);
-                    (*frame).regs[0] =
-                        crate::trap::encode_result(result.map(|_| sender.raw()));
+                    (*frame).regs[0] = crate::trap::encode_result(result.map(|_| sender.raw()));
                 }
                 return;
             }
@@ -186,11 +188,28 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                     // 并挂起进程。单核 + EL1 关中断 ⇒ 登记→置 Blocked→切换
                     // 原子，无丢失唤醒窗口。被 send 唤醒后由 dispatch 调
                     // complete_receive 完成收尾（continuation）。
-                    crate::ipc::register_waiter(caller_pid, channel)
-                        .map_err(map_ipc_error)?;
+                    crate::ipc::register_waiter(caller_pid, channel).map_err(map_ipc_error)?;
                     crate::process::set_pending_recv(caller_slot, channel);
                     crate::scheduler::block_current()
                 }
+                Err(e) => Err(map_ipc_error(e)),
+            }
+        }
+        Syscall::TryReceiveMessage {
+            channel,
+            user_buffer,
+        } => {
+            let caller_slot = crate::scheduler::current_slot();
+            let caller_pid =
+                crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
+            match crate::ipc::receive(caller_pid, channel) {
+                Ok((sender, message)) => {
+                    unsafe {
+                        copy_message_to_user(user_buffer, &message)?;
+                    }
+                    Ok(sender.raw())
+                }
+                Err(crate::ipc::IpcError::Empty) => Err(SysError::WouldBlock),
                 Err(e) => Err(map_ipc_error(e)),
             }
         }
@@ -266,19 +285,46 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             crate::drivers::virtio::blk::write_blocks(lba, &buffer).map_err(map_block_error)?;
             Ok(len as u64)
         }
-        // ═══ SHM 系统调用族（号位 10-14/17）：第八刀止血下线 ═══
-        // 现实现把内核恒等映射区的指针直接交给 EL0：用户态首次解引用即
-        // 致命异常（恒等映射 AP=EL1-only，EL0 无权访问），号位 17 更是把
-        // 物理地址原样泄漏给不可信调用方——两条路都封死，故整族恒返回
-        // Err(NotSupported)。重设计（Region 表 + map 进请求者地址空间，
-        // 句柄只作引用计数）见 STATUS「第八刀候选」第 3 条；号位冻结，
-        // 届时按同号位恢复语义。受影响的旧 shm 句柄协议路径（blkdrv/
-        // fsd 的历史命令码）本就返回 STATUS_UNSUPPORTED，不受波及。
-        Syscall::ShmCreate { size: _, user_result: _ } => Err(SysError::NotSupported),
-        Syscall::ShmMap { handle: _ } => Err(SysError::NotSupported),
-        Syscall::ShmLen { handle: _ } => Err(SysError::NotSupported),
-        Syscall::ShmRetain { handle: _ } => Err(SysError::NotSupported),
-        Syscall::ShmRelease { handle: _ } => Err(SysError::NotSupported),
+        // ═══ 安全 SHM（第25刀）：opaque handle + 真用户页映射 ═══
+        // 物理地址始终留在 EL1；对象页有独立 owner ref，每个用户映射再
+        // retain 一份，release/unmap/进程退出均按引用计数回收。
+        Syscall::ShmCreate { size, user_result } => {
+            let slot = crate::scheduler::current_slot();
+            let (handle, ptr, len) = crate::shm::create(slot, size).map_err(map_shm_error)?;
+            let words = [handle as u64, ptr as u64, len as u64];
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    words.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(&words),
+                )
+            };
+            unsafe { copy_slice_to_user(user_result, bytes)? };
+            Ok(handle as u64)
+        }
+        Syscall::ShmMap { handle } => {
+            let slot = crate::scheduler::current_slot();
+            crate::shm::map(slot, handle)
+                .map(|v| v as u64)
+                .map_err(map_shm_error)
+        }
+        Syscall::ShmLen { handle } => {
+            let slot = crate::scheduler::current_slot();
+            crate::shm::len(slot, handle)
+                .map(|v| v as u64)
+                .map_err(map_shm_error)
+        }
+        Syscall::ShmRetain { handle } => {
+            let slot = crate::scheduler::current_slot();
+            crate::shm::retain(slot, handle)
+                .map(|_| 0)
+                .map_err(map_shm_error)
+        }
+        Syscall::ShmRelease { handle } => {
+            let slot = crate::scheduler::current_slot();
+            crate::shm::release(slot, handle)
+                .map(|_| 0)
+                .map_err(map_shm_error)
+        }
         Syscall::DriverCount => {
             let count = crate::drivers::descriptors()
                 .map(|table| table.len())
@@ -446,9 +492,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 None => crate::process::futex_block_current(), // noreturn
             }
         }
-        Syscall::FutexWake { uaddr, max } => {
-            Ok(crate::process::futex_wake(uaddr, max) as u64)
-        }
+        Syscall::FutexWake { uaddr, max } => Ok(crate::process::futex_wake(uaddr, max) as u64),
         // ═══ 号位 26：CreateThread（第十五刀线程模型）═════════════
         Syscall::CreateThread {
             entry,
@@ -457,9 +501,8 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             arg,
         } => {
             let caller_slot = crate::scheduler::current_slot();
-            let tid =
-                crate::process::create_thread(caller_slot, entry, stack_top, tls, arg)
-                    .map_err(map_process_error)?;
+            let tid = crate::process::create_thread(caller_slot, entry, stack_top, tls, arg)
+                .map_err(map_process_error)?;
             // ⚠ 入队（实机踩坑）：漏掉则新线程永不上调度，父 join 死等
             // 触发软看门狗告警。
             crate::scheduler::enqueue(tid);
@@ -543,6 +586,137 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             }
             Ok(out_len as u64)
         }
+        Syscall::ShmGrant { handle, target_pid } => {
+            let slot = crate::scheduler::current_slot();
+            crate::shm::grant(slot, handle, zero_abi::ProcessId::new(target_pid))
+                .map(|_| 0)
+                .map_err(map_shm_error)
+        }
+        Syscall::InputRead { user_event } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_INPUT_DEV)?;
+            let event = crate::drivers::virtio::input::pop().ok_or(SysError::WouldBlock)?;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&event as *const zero_abi::input::InputEvent).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::input::InputEvent>(),
+                )
+            };
+            unsafe {
+                copy_slice_to_user(user_event, bytes)?;
+            }
+            Ok(0)
+        }
+        Syscall::DisplayPresent {
+            user_buffer,
+            width,
+            height,
+            stride,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            if width == 0 || height == 0 || stride < width || width > 4096 || height > 4096 {
+                return Err(SysError::InvalidArgument);
+            }
+            let len = stride
+                .checked_mul(height)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(SysError::InvalidArgument)?;
+            if len > 64 * 1024 * 1024 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut surface = vec![0u8; len];
+            unsafe {
+                copy_slice_from_user(user_buffer, &mut surface)?;
+            }
+            if crate::display::present_xrgb(&surface, width, height, stride) {
+                Ok(len as u64)
+            } else {
+                Err(SysError::DeviceError)
+            }
+        }
+        Syscall::ClockGet { clock_id } => {
+            crate::time::get(clock_id).ok_or(SysError::InvalidArgument)
+        }
+        Syscall::SleepUntil { deadline_ns } => {
+            let ticks = crate::time::deadline_to_scheduler_ticks(deadline_ns);
+            if ticks == 0 {
+                Ok(0)
+            } else {
+                crate::scheduler::sleep_current(ticks)
+            }
+        }
+        Syscall::NetSend { user_buffer, len } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_NET_DEV)?;
+            if len == 0 || len > 1536 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut frame = vec![0u8; len];
+            unsafe {
+                copy_slice_from_user(user_buffer, &mut frame)?;
+            }
+            crate::drivers::virtio::net::transmit(&frame)
+                .map(|_| len as u64)
+                .map_err(map_net_error)
+        }
+        Syscall::NetRecv { user_buffer, len } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_NET_DEV)?;
+            if len == 0 || len > 1536 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut frame = vec![0u8; len];
+            match crate::drivers::virtio::net::poll_receive(&mut frame).map_err(map_net_error)? {
+                Some(n) => {
+                    unsafe {
+                        copy_slice_to_user(user_buffer, &frame[..n])?;
+                    }
+                    Ok(n as u64)
+                }
+                None => Err(SysError::WouldBlock),
+            }
+        }
+        Syscall::NetGetMac { user_buffer } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_NET_DEV)?;
+            let mac = crate::drivers::virtio::net::mac_address().ok_or(SysError::DeviceError)?;
+            unsafe {
+                copy_slice_to_user(user_buffer, &mac)?;
+            }
+            Ok(0)
+        }
+        Syscall::IpcSendTo {
+            channel,
+            target_pid,
+            user_message,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            let caller = crate::process::pid_at_slot(slot).ok_or(SysError::PermissionDenied)?;
+            let target = ProcessId::new(target_pid);
+            if crate::process::slot_for_pid(target).is_none() {
+                return Err(SysError::NotFound);
+            }
+            let msg = unsafe { copy_message_from_user(user_message)? };
+            crate::ipc::send_to(caller, target, channel, &msg).map_err(map_ipc_error)?;
+            Ok(0)
+        }
+        Syscall::GetRandom { user_buffer, len } => {
+            if len > 64 * 1024 {
+                return Err(SysError::InvalidArgument);
+            }
+            if len == 0 {
+                return Ok(0);
+            }
+            let mut bytes = vec![0u8; len];
+            if !crate::drivers::virtio::rng::fill_random(&mut bytes) {
+                return Err(SysError::DeviceError);
+            }
+            unsafe {
+                copy_slice_to_user(user_buffer, &bytes)?;
+            }
+            Ok(len as u64)
+        }
         // 号位 22（POSIX wait4 最小集）：收尸返回 (pid<<32)|exit_code；
         // 有活子未退则挂起（登记精确等待目标 wait_target + block_current，
         // 仅匹配目标的子退出才由其 Exit 路径写父 TrapFrame 并 wake——
@@ -555,13 +729,121 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         // zero-abi Syscall::WaitPid 文档。置位 WNOHANG 且“有活子无尸”
         // 时不挂起、立即 Ok(0)；等待目标保持未登记（见 process.rs
         // WaitAction::PollMiss 注释）。
+        Syscall::BlockCapacity => {
+            crate::drivers::virtio::blk::capacity_sectors().ok_or(SysError::NotFound)
+        }
+        Syscall::SpawnImage { user_buffer, len } => {
+            let caller_slot = crate::scheduler::current_slot();
+            ensure_effective_capability(caller_slot, CAP_SPAWN_APP)?;
+            if len < 64 || len > 16 * 1024 * 1024 { return Err(SysError::InvalidArgument); }
+            let caller_pid = crate::process::pid_at_slot(caller_slot)
+                .ok_or(SysError::PermissionDenied)?;
+            let mut image = vec![0u8; len];
+            unsafe { copy_slice_from_user(user_buffer, &mut image)?; }
+            let pid = crate::process::spawn_user_from_image(&image, "app", Some(caller_pid))
+                .map_err(map_process_error)?;
+            let sid = crate::process::session_of_slot(caller_slot);
+            if sid != 0 { crate::process::set_session(pid, sid); }
+            crate::scheduler::enqueue(pid);
+            Ok(pid.raw())
+        }
+        Syscall::AudioInfo { user_info } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
+            if !crate::drivers::virtio::sound::active(){return Err(SysError::NotFound);}
+            let info=zero_abi::audio::AudioInfo{
+                sample_rate:crate::drivers::virtio::sound::SAMPLE_RATE as u32,
+                channels:crate::drivers::virtio::sound::CHANNELS as u16,
+                sample_bits:(crate::drivers::virtio::sound::SAMPLE_BYTES*8) as u16,
+                period_bytes:crate::drivers::virtio::sound::PERIOD_BYTES as u32,
+                buffer_bytes:crate::drivers::virtio::sound::BUFFER_BYTES as u32,
+            };
+            let bytes=unsafe{core::slice::from_raw_parts((&info as *const zero_abi::audio::AudioInfo).cast::<u8>(),core::mem::size_of::<zero_abi::audio::AudioInfo>())};
+            unsafe{copy_slice_to_user(user_info,bytes)?;}
+            Ok(0)
+        }
+        Syscall::AudioPlay { user_buffer, len } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
+            if len==0||len>crate::drivers::virtio::sound::PERIOD_BYTES||len%crate::drivers::virtio::sound::FRAME_BYTES!=0{return Err(SysError::InvalidArgument);}
+            let mut pcm=vec![0u8;len];
+            unsafe{copy_slice_from_user(user_buffer,&mut pcm)?;}
+            if crate::drivers::virtio::sound::play_period(&pcm){Ok(len as u64)}else{Err(SysError::DeviceError)}
+        }
+        Syscall::AudioStop => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
+            if crate::drivers::virtio::sound::stop(){Ok(0)}else{Err(SysError::DeviceError)}
+        }
+        Syscall::Gpu3dInfo { user_info } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            let info=crate::drivers::virtio::gpu::three_d_info().map_err(map_gpu3d_error)?;
+            let bytes=unsafe{core::slice::from_raw_parts((&info as *const zero_abi::gpu::Gpu3dInfo).cast::<u8>(),core::mem::size_of::<zero_abi::gpu::Gpu3dInfo>())};
+            unsafe{copy_slice_to_user(user_info,bytes)?;}
+            Ok(0)
+        }
+        Syscall::Gpu3dContextCreate { capset_id } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::create_context(capset_id).map(|v|v as u64).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dContextDestroy { ctx_id } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::destroy_context(ctx_id).map(|_|0).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dResourceCreate { user_desc } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            let mut desc=zero_abi::gpu::Gpu3dResourceDesc::default();
+            let bytes=unsafe{core::slice::from_raw_parts_mut((&mut desc as *mut zero_abi::gpu::Gpu3dResourceDesc).cast::<u8>(),core::mem::size_of::<zero_abi::gpu::Gpu3dResourceDesc>())};
+            unsafe{copy_slice_from_user(user_desc,bytes)?;}
+            crate::drivers::virtio::gpu::create_resource(desc).map(|v|v as u64).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dResourceDestroy { resource_id } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::destroy_resource(resource_id).map(|_|0).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dContextAttach { ctx_id, resource_id } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::attach_resource(ctx_id,resource_id).map(|_|0).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dSubmit { ctx_id, user_buffer, len } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            if len==0||len>1024*1024||len&3!=0{return Err(SysError::InvalidArgument);}
+            let mut stream=vec![0u8;len];
+            unsafe{copy_slice_from_user(user_buffer,&mut stream)?;}
+            crate::drivers::virtio::gpu::submit_3d(ctx_id,&stream).map(|_|len as u64).map_err(map_gpu3d_error)
+        }
+        Syscall::Gpu3dReadback { resource_id, user_buffer, len } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            if len==0||len>64*1024*1024{return Err(SysError::InvalidArgument);}
+            let mut out=vec![0u8;len];
+            let n=crate::drivers::virtio::gpu::readback_3d(resource_id,&mut out).map_err(map_gpu3d_error)?;
+            unsafe{copy_slice_to_user(user_buffer,&out[..n])?;}
+            Ok(n as u64)
+        }
+        Syscall::Gpu3dGetCapset { capset_id, version, user_buffer, len } => {
+            let slot=crate::scheduler::current_slot();
+            ensure_effective_capability(slot,CAP_DISPLAY)?;
+            if len==0||len>1024*1024{return Err(SysError::InvalidArgument);}
+            let mut out=vec![0u8;len];
+            let n=crate::drivers::virtio::gpu::get_capset(capset_id,version,&mut out).map_err(map_gpu3d_error)?;
+            unsafe{copy_slice_to_user(user_buffer,&out[..n])?;}
+            Ok(n as u64)
+        }
         Syscall::WaitPid { pid } => {
             let flags = unsafe { (*frame).regs[3] };
             match crate::process::waitpid_step(pid, flags) {
                 Ok(crate::process::WaitStep::Completed(value)) => Ok(value),
                 Ok(crate::process::WaitStep::Blocked) => crate::scheduler::block_current(),
                 Ok(crate::process::WaitStep::WouldBlock) => Ok(0),
-                Err(e) => Err(e)
+                Err(e) => Err(e),
             }
         }
     }
@@ -619,9 +901,15 @@ fn plan_brk(cur: usize, requested: u64) -> Result<BrkAction, SysError> {
         return Ok(BrkAction::Same);
     }
     if target > cur {
-        Ok(BrkAction::Grow { from: cur, to: target })
+        Ok(BrkAction::Grow {
+            from: cur,
+            to: target,
+        })
     } else {
-        Ok(BrkAction::Shrink { from: cur, to: target })
+        Ok(BrkAction::Shrink {
+            from: cur,
+            to: target,
+        })
     }
 }
 
@@ -685,6 +973,16 @@ fn map_session_error(err: crate::security::SessionError) -> SysError {
     }
 }
 
+fn map_gpu3d_error(err: crate::drivers::virtio::gpu::Gpu3dError) -> SysError {
+    match err {
+        crate::drivers::virtio::gpu::Gpu3dError::Unsupported => SysError::NotSupported,
+        crate::drivers::virtio::gpu::Gpu3dError::Invalid => SysError::InvalidArgument,
+        crate::drivers::virtio::gpu::Gpu3dError::NotFound => SysError::NotFound,
+        crate::drivers::virtio::gpu::Gpu3dError::Device => SysError::DeviceError,
+        crate::drivers::virtio::gpu::Gpu3dError::NoMemory => SysError::NoMemory,
+    }
+}
+
 fn map_process_error(err: crate::process::ProcessError) -> SysError {
     match err {
         crate::process::ProcessError::NoSuchProcess => SysError::NotFound,
@@ -694,6 +992,26 @@ fn map_process_error(err: crate::process::ProcessError) -> SysError {
         crate::process::ProcessError::PermissionDenied => SysError::PermissionDenied,
         crate::process::ProcessError::ElfError(_) => SysError::InvalidArgument,
         crate::process::ProcessError::MapError(_) => SysError::InvalidArgument,
+    }
+}
+
+fn map_shm_error(err: crate::shm::ShmError) -> SysError {
+    match err {
+        crate::shm::ShmError::Invalid => SysError::InvalidArgument,
+        crate::shm::ShmError::NotFound => SysError::NotFound,
+        crate::shm::ShmError::Capacity | crate::shm::ShmError::NoMemory => SysError::NoMemory,
+        crate::shm::ShmError::Permission => SysError::PermissionDenied,
+        crate::shm::ShmError::Map => SysError::InvalidArgument,
+    }
+}
+
+fn map_net_error(err: crate::drivers::NetError) -> SysError {
+    match err {
+        crate::drivers::NetError::NotReady | crate::drivers::NetError::DeviceError => {
+            SysError::DeviceError
+        }
+        crate::drivers::NetError::Busy => SysError::Busy,
+        crate::drivers::NetError::BufferTooSmall => SysError::InvalidArgument,
     }
 }
 
@@ -815,7 +1133,8 @@ unsafe fn copy_slice_to_user(addr: usize, data: &[u8]) -> Result<(), SysError> {
     let mut src_off = 0usize;
     let mut cur = addr;
     while remaining > 0 {
-        let page_avail = crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
+        let page_avail =
+            crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
         let chunk = remaining.min(page_avail);
         validate_user_ptr(cur, chunk)?;
         ptr::copy_nonoverlapping(data.as_ptr().add(src_off), cur as *mut u8, chunk);
@@ -832,7 +1151,8 @@ unsafe fn copy_slice_from_user(addr: usize, dst: &mut [u8]) -> Result<(), SysErr
     let mut dst_off = 0usize;
     let mut cur = addr;
     while remaining > 0 {
-        let page_avail = crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
+        let page_avail =
+            crate::mm::table_walk::PAGE_SIZE - (cur & (crate::mm::table_walk::PAGE_SIZE - 1));
         let chunk = remaining.min(page_avail);
         validate_user_ptr(cur, chunk)?;
         ptr::copy_nonoverlapping(cur as *const u8, dst.as_mut_ptr().add(dst_off), chunk);
@@ -1000,15 +1320,9 @@ mod tests {
         // 页内单字节 → 一页。
         assert_eq!(page_bases(P + 5, 1).collect::<Vec<_>>(), vec![P]);
         // 起始非对齐跨两页。
-        assert_eq!(
-            page_bases(P - 1, 2).collect::<Vec<_>>(),
-            vec![0, P]
-        );
+        assert_eq!(page_bases(P - 1, 2).collect::<Vec<_>>(), vec![0, P]);
         // 尾字节恰好落进下一页首字节：新页必须计入。
-        assert_eq!(
-            page_bases(P, P + 1).collect::<Vec<_>>(),
-            vec![P, 2 * P]
-        );
+        assert_eq!(page_bases(P, P + 1).collect::<Vec<_>>(), vec![P, 2 * P]);
         // 整数页跨度。
         assert_eq!(
             page_bases(P, 3 * P).collect::<Vec<_>>(),
@@ -1023,17 +1337,11 @@ mod tests {
         use zero_abi::cap::{CAP_ALL, CAP_BLOCK_DEV, CAP_MMIO, CAP_SPAWN_SVC};
         // 单位授予/缺位拒绝。
         assert_eq!(ensure_caps(CAP_MMIO, CAP_MMIO), Ok(()));
-        assert_eq!(
-            ensure_caps(0, CAP_MMIO),
-            Err(SysError::PermissionDenied)
-        );
+        assert_eq!(ensure_caps(0, CAP_MMIO), Err(SysError::PermissionDenied));
         // 多位要求：必须全部置位（子集不算持有）。
         let both = CAP_MMIO | CAP_BLOCK_DEV;
         assert_eq!(ensure_caps(both, both), Ok(()));
-        assert_eq!(
-            ensure_caps(CAP_MMIO, both),
-            Err(SysError::PermissionDenied)
-        );
+        assert_eq!(ensure_caps(CAP_MMIO, both), Err(SysError::PermissionDenied));
         // 多余能力不碍事（最小授权的反面是超集无害）。
         assert_eq!(ensure_caps(CAP_ALL, CAP_SPAWN_SVC), Ok(()));
         // required=0 防御性拒绝：空掩码不能静默放行一切。
@@ -1089,7 +1397,10 @@ mod tests {
 
     #[test]
     fn brk_below_heap_base_rejected() {
-        assert_eq!(plan_brk(HB, (HB - 1) as u64), Err(SysError::InvalidArgument));
+        assert_eq!(
+            plan_brk(HB, (HB - 1) as u64),
+            Err(SysError::InvalidArgument)
+        );
         assert_eq!(plan_brk(HB, 5), Err(SysError::InvalidArgument));
         assert_eq!(plan_brk(HB, 1), Err(SysError::InvalidArgument));
         // 边界：恰好等于基址合法（Same）。
@@ -1101,11 +1412,17 @@ mod tests {
         // 非对齐请求向上取整到下一页界。
         assert_eq!(
             plan_brk(HB, (HB + 1) as u64),
-            Ok(BrkAction::Grow { from: HB, to: HB + PAGE_SIZE })
+            Ok(BrkAction::Grow {
+                from: HB,
+                to: HB + PAGE_SIZE
+            })
         );
         assert_eq!(
             plan_brk(HB, (HB + 8192) as u64),
-            Ok(BrkAction::Grow { from: HB, to: HB + 2 * PAGE_SIZE })
+            Ok(BrkAction::Grow {
+                from: HB,
+                to: HB + 2 * PAGE_SIZE
+            })
         );
         // 对齐后恰等于当前值 → Same（幂等）。
         assert_eq!(plan_brk(HB + 8192, (HB + 8000) as u64), Ok(BrkAction::Same));
@@ -1116,12 +1433,18 @@ mod tests {
     fn brk_shrink_targets_aligned_downside() {
         assert_eq!(
             plan_brk(HB + 8192, HB as u64),
-            Ok(BrkAction::Shrink { from: HB + 8192, to: HB })
+            Ok(BrkAction::Shrink {
+                from: HB + 8192,
+                to: HB
+            })
         );
         // 非对齐收缩请求：目标对齐到页界后仍小于当前 → 收缩一页。
         assert_eq!(
             plan_brk(HB + 8192, (HB + 1000) as u64),
-            Ok(BrkAction::Shrink { from: HB + 8192, to: HB + PAGE_SIZE })
+            Ok(BrkAction::Shrink {
+                from: HB + 8192,
+                to: HB + PAGE_SIZE
+            })
         );
         // 对齐后等于当前 → Same（重复收缩幂等）。
         assert_eq!(
@@ -1135,12 +1458,18 @@ mod tests {
         // 恰好顶满上限：合法。
         assert_eq!(
             plan_brk(HB, HL),
-            Ok(BrkAction::Grow { from: HB, to: HL as usize })
+            Ok(BrkAction::Grow {
+                from: HB,
+                to: HL as usize
+            })
         );
         // 上限内非对齐尾请求：对齐后恰好落在上限上——放行。
         assert_eq!(
             plan_brk(HB, HL - 100),
-            Ok(BrkAction::Grow { from: HB, to: HL as usize })
+            Ok(BrkAction::Grow {
+                from: HB,
+                to: HL as usize
+            })
         );
         // 越过上限一字节即 ENOMEM（NoMemory）。
         assert_eq!(plan_brk(HB, HL + 1), Err(SysError::NoMemory));

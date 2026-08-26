@@ -47,10 +47,89 @@ pub fn launch_core(_info: &BootInfo) {
         },
         ServiceDescriptor {
             name: "fsd",
-            entry: ServiceEntry::Bootfs("/System/Core/zero-fsd"),
-            // 文件服务（第七刀）：块后端卷文件表（名字→LBA），客户端
-            // 面纯 IPC（FS_REQ/FS_RESP），对 blkdrv 走 BLKDRV_REQ 分块
-            // 直通。无 MMIO 依赖，privileged=false。
+            entry: ServiceEntry::Bootfs("/System/Core/zero-fs-zfs"),
+            // 文件服务（第32刀）：默认后端 zero-fs-zfs；客户端
+            // 面保持 FS_REQ/FS_RESP + vtable ABI。内核仍是唯一块设备
+            // owner；受信 zfsd 以 CAP_BLOCK_DEV 直接走序列化 BlockRead/Write，
+            // 避免 4KiB ZFS block 被 128-byte IPC 放大成数十次往返。
+            // zero-fsd/blkdrv 继续作为 legacy 与通用块服务保留。
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_BLOCK_DEV,
+        },
+        ServiceDescriptor {
+            name: "inputd",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-inputd"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_INPUT_DEV,
+        },
+        ServiceDescriptor {
+            name: "windowserver",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-windowserver"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_DISPLAY,
+        },
+        ServiceDescriptor {
+            name: "netd",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-netd"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_NET_DEV,
+        },
+        ServiceDescriptor {
+            name: "webtest",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-webtest"),
+            essential: false,
+            privileged: false,
+            capabilities: 0,
+        },
+        ServiceDescriptor {
+            name: "pkgd",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-pkgd"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_SPAWN_APP,
+        },
+        ServiceDescriptor {
+            name: "pkgtest",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-pkgtest"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_PKG_CLIENT,
+        },
+        ServiceDescriptor {
+            name: "audiod",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-audiod"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_AUDIO_DEV,
+        },
+        ServiceDescriptor {
+            name: "audiotest",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-audiotest"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_AUDIO_CLIENT,
+        },
+        ServiceDescriptor {
+            name: "gputest",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-gputest"),
+            essential: false,
+            privileged: false,
+            capabilities: zero_abi::cap::CAP_DISPLAY,
+        },
+        ServiceDescriptor {
+            name: "pietest",
+            entry: ServiceEntry::Bootfs("/System/Core/zero-pietest"),
+            essential: false,
+            privileged: false,
+            capabilities: 0,
+        },
+        ServiceDescriptor {
+            name: "dynapp",
+            entry: ServiceEntry::Bootfs("/System/Test/zero-dynapp"),
             essential: false,
             privileged: false,
             capabilities: 0,
@@ -91,6 +170,15 @@ fn init_channels() {
         ChannelDesc::open(channels::BLKDRV_REQ, 8),
         ChannelDesc::open(channels::BLKDRV_RESP, 8),
         ChannelDesc::open(channels::BLKDRV_EVENT, 4),
+        ChannelDesc::open(channels::INPUT_EVENT_BUS, 32),
+        ChannelDesc::open(channels::WINDOW_REQ, 16),
+        ChannelDesc::open(channels::WINDOW_RESP, 16),
+        ChannelDesc::open(channels::NET_REQ, 32),
+        ChannelDesc::open(channels::NET_RESP, 32),
+        ChannelDesc { id: channels::PKG_REQ, capacity: 8, tx_groups: zero_abi::cap::CAP_PKG_CLIENT, rx_groups: 0 },
+        ChannelDesc::open(channels::PKG_RESP, 8),
+        ChannelDesc { id: channels::AUDIO_REQ, capacity: 8, tx_groups: zero_abi::cap::CAP_AUDIO_CLIENT, rx_groups: 0 },
+        ChannelDesc::open(channels::AUDIO_RESP, 8),
     ];
 
     for desc in channels_to_create {
@@ -148,8 +236,7 @@ fn spawn_server(descriptor: &ServiceDescriptor) -> Result<ProcessId, ServiceErro
             // 表满降级：spawn 的 TableFull 与 Bootfs 分支的失败同构，
             // 统一映射为 SpawnFailed —— launch_service 对非核心服务
             // 仅告警跳过，essential（launchd）仍走既有 panic 兜底。
-            let pid = process::spawn(entry, descriptor.name)
-                .map_err(ServiceError::SpawnFailed)?;
+            let pid = process::spawn(entry, descriptor.name).map_err(ServiceError::SpawnFailed)?;
             if descriptor.privileged {
                 process::set_privileged(pid, true);
             }

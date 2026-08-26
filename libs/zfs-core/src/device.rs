@@ -10,6 +10,11 @@ pub enum DeviceError {
 
 pub trait BlockDevice: Clone {
     const BLOCK_SIZE: usize;
+    /// Fixed device capacity when known. `None` is permitted for streaming or
+    /// legacy backends; Volume then falls back to its historical minimum.
+    fn block_count(&self) -> Option<u64> {
+        None
+    }
     fn read_block(&self, lba: u64, buffer: &mut [u8]) -> Result<(), DeviceError>;
     fn write_block(&self, lba: u64, buffer: &[u8]) -> Result<(), DeviceError>;
 }
@@ -36,6 +41,10 @@ impl MemoryBlockDevice {
 
 impl BlockDevice for MemoryBlockDevice {
     const BLOCK_SIZE: usize = 4096;
+
+    fn block_count(&self) -> Option<u64> {
+        Some((self.storage.lock().len() / Self::BLOCK_SIZE) as u64)
+    }
 
     fn read_block(&self, lba: u64, buffer: &mut [u8]) -> Result<(), DeviceError> {
         if buffer.len() != Self::BLOCK_SIZE {

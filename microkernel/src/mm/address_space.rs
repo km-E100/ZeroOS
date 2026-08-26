@@ -1,5 +1,5 @@
-use super::phys;
 use super::paging;
+use super::phys;
 use super::table_walk::PAGE_SIZE;
 
 pub use super::paging::{MapError, USER_STACK_LEN, USER_STACK_TOP};

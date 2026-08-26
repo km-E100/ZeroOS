@@ -5,6 +5,7 @@ use crate::mm;
 
 // 内核镜像（含 .bss）结束地址，由 boot/linker.ld 定义。
 extern "C" {
+    static __kernel_start: u8;
     static __bss_end: u8;
 }
 
@@ -60,18 +61,21 @@ pub fn init_arch(boot_info: &BootInfo) {
     let memory_bytes = memory_bytes_of(boot_info);
 
     crate::info!("boot::init_arch: mm init");
-    // 保留 RAM 内 [0, kernel_image_bytes) 给内核自身（镜像 + 页表 + 栈），
-    // 避免物理分配器把内核 .bss 页分配出去导致页表/栈被覆盖。
-    // 注意：__bss_end 是 VA（内核链接在 0x4000_0000 起），分配器的保留
-    // 参数是 RAM 内偏移字节数，必须减去 RAM_BASE，否则保留量会超过
-    // 总内存导致全部内存被保留、alloc 必 OOM。
-    let kernel_end = unsafe { &__bss_end as *const u8 as usize };
-    let kernel_image_bytes = kernel_end.saturating_sub(crate::mm::phys::RAM_BASE);
-    let reserved = kernel_image_bytes.max(16 * 1024 * 1024);
-    crate::info!(
-        "boot::init_arch: reserving 0x{:x} bytes of RAM for kernel image",
-        reserved
-    );
-    mm::init(memory_bytes, reserved);
+    // KASLR-aware reservation: the linker symbols resolve to the relocated
+    // runtime image. Only this exact interval is pinned. The 16 MiB legacy
+    // prefix is retained solely for total-bytes-only old bootloaders; modern
+    // UEFI memory-map boots do not waste the gap below a high random base.
+    let kernel_start=unsafe{&__kernel_start as *const u8 as usize};
+    let kernel_end=unsafe{&__bss_end as *const u8 as usize};
+    const LEGACY_LOW_RESERVE:usize=16*1024*1024;
+    crate::info!("boot::init_arch: kernel runtime range [0x{:x},0x{:x}) span=0x{:x}",kernel_start,kernel_end,kernel_end.saturating_sub(kernel_start));
+    mm::init_relocated(memory_bytes,LEGACY_LOW_RESERVE,kernel_start,kernel_end);
     crate::info!("boot::init_arch: mm init done");
+
+    // 固件表位于物理地址空间；等恒等映射/设备属性稳定后再解析，随后
+    // 立刻让 GIC/timer/PSCI 消费结果。这样 ACPI 不再只是“打印出来”。
+    crate::acpi::init();
+    arch::init_platform();
+    crate::display::init();
+    crate::info!("boot::init_arch: ACPI + platform IRQ/display init done");
 }

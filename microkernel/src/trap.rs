@@ -127,8 +127,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 // 非 COW 页原样落入下方 SIGSEGV 路径。
                 if let SyncExceptionKind::DataAbort(info) = decoded.kind {
                     if info.kind == FaultKind::Permission {
-                        let broken =
-                            process::handle_cow_write_fault(ctx.far as usize);
+                        let broken = process::handle_cow_write_fault(ctx.far as usize);
                         if broken {
                             unsafe { crate::arch::restore_frame(frame) }
                         } else {
@@ -148,9 +147,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 // 数据访问对齐错误 → SIGBUS；其余页故障（翻译/权限/
                 // 取指 abort）→ SIGSEGV。
                 let sig = match &decoded.kind {
-                    SyncExceptionKind::DataAbort(info)
-                        if info.kind == FaultKind::Alignment =>
-                    {
+                    SyncExceptionKind::DataAbort(info) if info.kind == FaultKind::Alignment => {
                         zero_abi::signals::SIGBUS
                     }
                     _ => zero_abi::signals::SIGSEGV,
@@ -176,10 +173,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                         && ctx.slot.is_some()
                         && process::handle_cow_write_fault(ctx.far as usize)
                     {
-                        crate::info!(
-                            "[trap] cow break on EL1 user-write far=0x{:016x}",
-                            ctx.far
-                        );
+                        crate::info!("[trap] cow break on EL1 user-write far=0x{:016x}", ctx.far);
                         unsafe { crate::arch::restore_frame(frame) }
                     }
                 }
@@ -188,7 +182,10 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 // 视为 EFAULT 类用户错误：杀调用进程，而非重启整机。
                 let elr = read_elr_el1();
                 if ctx.slot.is_some() && fault_in_user_copy_path(elr) {
-                    crate::error!("[trap] user-copy path fault; killing caller (ELR=0x{:016x})", elr);
+                    crate::error!(
+                        "[trap] user-copy path fault; killing caller (ELR=0x{:016x})",
+                        elr
+                    );
                     terminate_faulting_process(&ctx, zero_abi::signals::SIGSEGV)
                 }
                 crate::error!("{}", message);
@@ -417,9 +414,7 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         }),
         // 号位 25（Sleepticks，第十一刀）：x1=tick 数。ABI 冻结于
         // zero-abi（Syscall::Sleepticks）；唤醒侧经陷阱帧回写 elapsed。
-        25 => Some(Syscall::Sleepticks {
-            ticks: regs[1],
-        }),
+        25 => Some(Syscall::Sleepticks { ticks: regs[1] }),
         // 号位 26（CreateThread，第十五刀）：x1=entry/x2=stack/x3=tls/
         // x4=arg。ABI 冻结于 zero-abi；tid 为 wait_pid 可 join 的真 pid。
         26 => Some(Syscall::CreateThread {
@@ -460,6 +455,66 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
             user_buffer: regs[1] as usize,
             len: regs[2] as usize,
         }),
+        46 => Some(Syscall::ShmGrant {
+            handle: regs[1] as u32,
+            target_pid: regs[2],
+        }),
+        47 => Some(Syscall::InputRead {
+            user_event: regs[1] as usize,
+        }),
+        48 => Some(Syscall::DisplayPresent {
+            user_buffer: regs[1] as usize,
+            width: regs[2] as usize,
+            height: regs[3] as usize,
+            stride: regs[4] as usize,
+        }),
+        49 => Some(Syscall::ClockGet {
+            clock_id: regs[1] as u32,
+        }),
+        50 => Some(Syscall::SleepUntil {
+            deadline_ns: regs[1],
+        }),
+        51 => Some(Syscall::NetSend {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
+        52 => Some(Syscall::NetRecv {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
+        53 => Some(Syscall::NetGetMac {
+            user_buffer: regs[1] as usize,
+        }),
+        54 => Some(Syscall::IpcSendTo {
+            channel: regs[1] as u32,
+            target_pid: regs[2],
+            user_message: regs[3] as usize,
+        }),
+        55 => Some(Syscall::TryReceiveMessage {
+            channel: regs[1] as u32,
+            user_buffer: regs[2] as usize,
+        }),
+        56 => Some(Syscall::GetRandom {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
+        57 => Some(Syscall::BlockCapacity),
+        58 => Some(Syscall::SpawnImage {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
+        59 => Some(Syscall::AudioInfo { user_info: regs[1] as usize }),
+        60 => Some(Syscall::AudioPlay { user_buffer: regs[1] as usize, len: regs[2] as usize }),
+        61 => Some(Syscall::AudioStop),
+        62 => Some(Syscall::Gpu3dInfo { user_info: regs[1] as usize }),
+        63 => Some(Syscall::Gpu3dContextCreate { capset_id: regs[1] as u32 }),
+        64 => Some(Syscall::Gpu3dContextDestroy { ctx_id: regs[1] as u32 }),
+        65 => Some(Syscall::Gpu3dResourceCreate { user_desc: regs[1] as usize }),
+        66 => Some(Syscall::Gpu3dResourceDestroy { resource_id: regs[1] as u32 }),
+        67 => Some(Syscall::Gpu3dContextAttach { ctx_id: regs[1] as u32, resource_id: regs[2] as u32 }),
+        68 => Some(Syscall::Gpu3dSubmit { ctx_id: regs[1] as u32, user_buffer: regs[2] as usize, len: regs[3] as usize }),
+        69 => Some(Syscall::Gpu3dReadback { resource_id: regs[1] as u32, user_buffer: regs[2] as usize, len: regs[3] as usize }),
+        70 => Some(Syscall::Gpu3dGetCapset { capset_id: regs[1] as u32, version: regs[2] as u32, user_buffer: regs[3] as usize, len: regs[4] as usize }),
         _ => None,
     }
 }
@@ -577,11 +632,7 @@ fn dump_frame_registers(frame: *mut TrapFrame) {
             }
             match row {
                 7 => {
-                    let _ = write!(
-                        line,
-                        "x30=0x{:016x}",
-                        f.regs[30]
-                    );
+                    let _ = write!(line, "x30=0x{:016x}", f.regs[30]);
                 }
                 _ => {}
             }
@@ -626,8 +677,8 @@ fn reset_or_halt() -> ! {
         // 关机，pstore 双启动链路因此从未真正走通过（第十刀 drill
         // 实测抓获：QEMU 进程整体退出而非热复位）。
         let fid: u64 = 0x8400_0009; // PSCI SYSTEM_RESET
-        // QEMU virt (TCG) 的 PSCI conduit 是 HVC；SMC 会作为未定义异常
-        // 弹回 EL1 自家向量表（实测），故必须用 hvc。
+                                    // QEMU virt (TCG) 的 PSCI conduit 是 HVC；SMC 会作为未定义异常
+                                    // 弹回 EL1 自家向量表（实测），故必须用 hvc。
         asm!("hvc #0", in("x0") fid, options(nostack));
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -971,11 +1022,19 @@ mod tests {
         ));
         assert!(matches!(
             decode_syscall(&regs(7, [42, 0x8000_0000, 512, 0])),
-            Some(Syscall::BlockRead { lba: 42, len: 512, .. })
+            Some(Syscall::BlockRead {
+                lba: 42,
+                len: 512,
+                ..
+            })
         ));
         assert!(matches!(
             decode_syscall(&regs(8, [42, 0x8000_0000, 4096, 0])),
-            Some(Syscall::BlockWrite { lba: 42, len: 4096, .. })
+            Some(Syscall::BlockWrite {
+                lba: 42,
+                len: 4096,
+                ..
+            })
         ));
         assert!(matches!(
             decode_syscall(&regs(9, [0x8000_0000, 32, 0, 0])),
@@ -1049,7 +1108,9 @@ mod tests {
         ));
         assert!(matches!(
             decode_syscall(&regs(42, [0x8000_0000, 0, 0, 0])),
-            Some(Syscall::CreateChannel { user_desc: 0x8000_0000 })
+            Some(Syscall::CreateChannel {
+                user_desc: 0x8000_0000
+            })
         ));
         assert!(matches!(
             decode_syscall(&regs(43, [3, 0, 0, 0])),
@@ -1061,13 +1122,18 @@ mod tests {
         ));
         assert!(matches!(
             decode_syscall(&regs(45, [0x8000_0000, 64, 0, 0])),
-            Some(
-                Syscall::SessionList {
-                    user_buffer: 0x8000_0000,
-                    len: 64
-                }
-            )
+            Some(Syscall::SessionList {
+                user_buffer: 0x8000_0000,
+                len: 64
+            })
         ));
+        assert!(matches!(decode_syscall(&regs(59, [0x8000_0000,0,0,0])), Some(Syscall::AudioInfo { .. })));
+        assert!(matches!(decode_syscall(&regs(60, [0x8000_0000,2048,0,0])), Some(Syscall::AudioPlay { len: 2048, .. })));
+        assert!(matches!(decode_syscall(&regs(61, [0,0,0,0])), Some(Syscall::AudioStop)));
+        assert!(matches!(decode_syscall(&regs(62, [0x8000_0000,0,0,0])), Some(Syscall::Gpu3dInfo { .. })));
+        assert!(matches!(decode_syscall(&regs(63, [2,0,0,0])), Some(Syscall::Gpu3dContextCreate { capset_id: 2 })));
+        assert!(matches!(decode_syscall(&regs(68, [7,0x8000_0000,64,0])), Some(Syscall::Gpu3dSubmit { ctx_id: 7, len: 64, .. })));
+        assert!(matches!(decode_syscall(&regs(70, [2,1,0x8000_0000,512])), Some(Syscall::Gpu3dGetCapset { capset_id: 2, version: 1, len: 512, .. })));
         assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
     }
 

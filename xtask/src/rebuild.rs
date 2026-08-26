@@ -41,24 +41,24 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "bootloader",
-        &["bootloader-uefi/src", "bootloader-uefi/Cargo.toml", "bootloader-uefi/build.rs"],
+        &[
+            "bootloader-uefi/src",
+            "bootloader-uefi/Cargo.toml",
+            "bootloader-uefi/build.rs",
+        ],
     ),
-    (
-        "userland",
-        &["userland", "libs", "servers/launchd"],
-    ),
-    (
-        "rootfs_tree",
-        &["kernel/rootfs", "kernel/rootfs-recovery"],
-    ),
+    ("userland", &["userland", "libs", "servers/launchd"]),
+    ("rootfs_tree", &["kernel/rootfs", "kernel/rootfs-recovery"]),
     (
         "installer",
-        &["installer", "tools/src", "tools/Cargo.toml", "libs/zfs-core"],
+        &[
+            "installer",
+            "tools/src",
+            "tools/Cargo.toml",
+            "libs/zfs-core",
+        ],
     ),
-    (
-        "servers",
-        &["servers"],
-    ),
+    ("servers", &["servers"]),
 ];
 
 pub struct RebuildFastArgs {
@@ -77,7 +77,10 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
     let baseline = match state::load_state(&state_path) {
         Some(s) => s,
         None => {
-            println!("    首次运行（无 {}），按全量执行一次并建立基线", STATE_FILE);
+            println!(
+                "    首次运行（无 {}），按全量执行一次并建立基线",
+                STATE_FILE
+            );
             Snapshot::new()
         }
     };
@@ -95,7 +98,10 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
             } else {
                 println!(
                     "    [dirty] {name}: {n} 个文件变更（如 {}）",
-                    changed.first().cloned().unwrap_or_else(|| removed.first().cloned().unwrap_or_default())
+                    changed
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| removed.first().cloned().unwrap_or_default())
                 );
                 dirty.push(name);
             }
@@ -107,7 +113,10 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
         crate::image::build_full_image(sh)?;
         state::save_state(&state_path, &current)?;
         manifest::write_manifest(&project_root, "rebuild-fast(cold)")?;
-        println!("==> rebuild-fast 完成（cold 全链，耗时 {:.1}s）", t0.elapsed().as_secs_f32());
+        println!(
+            "==> rebuild-fast 完成（cold 全链，耗时 {:.1}s）",
+            t0.elapsed().as_secs_f32()
+        );
         return Ok(());
     }
 
@@ -155,14 +164,14 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
 
     if dirty.contains(&"servers") {
         println!("==> rebuild-fast: 构建 host 服务二进制");
-        cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
+        cmd!(sh, "cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv -p zero-ipc-router -p zero-securityd -p zero-inputd -p zero-windowserver -p zero-netd -p zero-webtest -p zero-pkgd -p zero-pkgtest -p zero-audiod -p zero-audiotest -p zero-gputest -p zero-service-controller -p zero-installer -p zero-recovery -p mkzfs").run()?;
         copy_host_bins(&project_root)?;
         need_repack = true;
     }
 
     if dirty.contains(&"kernel") || !kernel_in_staging_is_current(&project_root)? {
         println!("==> rebuild-fast: 构建 aarch64-unknown-none 内核");
-        cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-kernel").run()?;
+        crate::build_kernel_pie(sh)?;
         copy_kernel(&project_root)?;
         need_repack = true;
     }
@@ -178,8 +187,16 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
     let secs = t0.elapsed().as_secs_f32();
     println!(
         "==> rebuild-fast 完成{}（耗时 {secs:.1}s，目标 <30s）{}",
-        if need_repack { "" } else { "（up-to-date，未重打包）" },
-        if secs < 30.0 { " ✓" } else { " ⚠ 超出预算" }
+        if need_repack {
+            ""
+        } else {
+            "（up-to-date，未重打包）"
+        },
+        if secs < 30.0 {
+            " ✓"
+        } else {
+            " ⚠ 超出预算"
+        }
     );
     Ok(())
 }
@@ -201,8 +218,12 @@ fn group_snapshot<'a>(snap: &'a Snapshot, dirs: &[&str]) -> Snapshot {
 
 /// 暂存树是否由上一次 build-iso/rebuild-fast 建立（含 ESP 所需全部文件）。
 fn staging_ready(project_root: &Path) -> Result<bool> {
-    let ok = project_root.join(format!("{ISO_STAGING}/EFI/BOOT")).is_dir()
-        && project_root.join(format!("{ISO_STAGING}/EFI/ZEROOS")).is_dir();
+    let ok = project_root
+        .join(format!("{ISO_STAGING}/EFI/BOOT"))
+        .is_dir()
+        && project_root
+            .join(format!("{ISO_STAGING}/EFI/ZEROOS"))
+            .is_dir();
     Ok(ok)
 }
 
@@ -211,7 +232,7 @@ fn staging_zeroos(project_root: &Path) -> PathBuf {
 }
 
 fn copy_kernel(project_root: &Path) -> Result<()> {
-    let src = project_root.join("target/aarch64-unknown-none/debug/zero-kernel");
+    let src = project_root.join("target/aarch64-unknown-none-pic/release/zero-kernel");
     let dst = staging_zeroos(project_root).join("zero-kernel");
     fs_xcopy(&src, &dst)
 }
@@ -226,7 +247,10 @@ fn copy_bootloader(project_root: &Path) -> Result<()> {
     let z = staging_zeroos(project_root);
     fs_xcopy(&src, &z.join("zero-normal.efi"))?;
     fs_xcopy(&src, &z.join("zero-recovery.efi"))?;
-    fs_xcopy(&src, &project_root.join(format!("{ISO_STAGING}/EFI/BOOT/BOOTAA64.EFI")))?;
+    fs_xcopy(
+        &src,
+        &project_root.join(format!("{ISO_STAGING}/EFI/BOOT/BOOTAA64.EFI")),
+    )?;
     Ok(())
 }
 
@@ -237,7 +261,10 @@ fn copy_rootfs_img(project_root: &Path) -> Result<()> {
     }
     let rec = project_root.join("target/rootfs-recovery.bundle");
     if rec.exists() {
-        fs_xcopy(&rec, &staging_zeroos(project_root).join("rootfs-recovery.bundle"))?;
+        fs_xcopy(
+            &rec,
+            &staging_zeroos(project_root).join("rootfs-recovery.bundle"),
+        )?;
     }
     Ok(())
 }
@@ -253,6 +280,15 @@ fn copy_host_bins(project_root: &Path) -> Result<()> {
         "zero-blkdrv",
         "zero-ipc-router",
         "zero-securityd",
+        "zero-inputd",
+        "zero-windowserver",
+        "zero-netd",
+        "zero-webtest",
+        "zero-pkgd",
+        "zero-pkgtest",
+        "zero-audiod",
+        "zero-audiotest",
+        "zero-gputest",
         "zero-service-controller",
         "zero-installer",
         "zero-recovery",
@@ -268,7 +304,7 @@ fn copy_host_bins(project_root: &Path) -> Result<()> {
 
 /// 暂存树里的内核 ELF 是否落后于最新构建产物。
 fn kernel_in_staging_is_current(project_root: &Path) -> Result<bool> {
-    let built = project_root.join("target/aarch64-unknown-none/debug/zero-kernel");
+    let built = project_root.join("target/aarch64-unknown-none-pic/release/zero-kernel");
     let staged = staging_zeroos(project_root).join("zero-kernel");
     if !built.exists() || !staged.exists() {
         return Ok(false);
@@ -287,9 +323,15 @@ fn repack_iso(sh: &Shell, project_root: &Path) -> Result<()> {
     if esp_path.exists() {
         std::fs::remove_file(&esp_path)?;
     }
-    cmd!(sh, "dd if=/dev/zero of={esp_path} bs=1m count=256").run().context("creating blank ESP image")?;
-    cmd!(sh, "mformat -i {esp_path} -F -v ZEROESP ::").run().context("formatting ESP")?;
-    cmd!(sh, "mcopy -i {esp_path} -s {iso_dir}/EFI ::/").run().context("copying EFI tree into ESP")?;
+    cmd!(sh, "dd if=/dev/zero of={esp_path} bs=1m count=256")
+        .run()
+        .context("creating blank ESP image")?;
+    cmd!(sh, "mformat -i {esp_path} -F -v ZEROESP ::")
+        .run()
+        .context("formatting ESP")?;
+    cmd!(sh, "mcopy -i {esp_path} -s {iso_dir}/EFI ::/")
+        .run()
+        .context("copying EFI tree into ESP")?;
     let startup = iso_dir.join("startup.nsh");
     if startup.exists() {
         cmd!(sh, "mcopy -i {esp_path} {startup} ::/startup.nsh").run()?;

@@ -33,7 +33,7 @@ impl BootPaths {
 
         let mut rootfs = heapless::String::new();
         let default_rootfs = match variant {
-            BootVariant::Normal => "\\EFI\\ZEROOS\\zero-rootfs.img",
+            BootVariant::Normal => "\\EFI\\ZEROOS\\rootfs.bundle",
             BootVariant::Recovery => "\\EFI\\ZEROOS\\rootfs-recovery.bundle",
         };
         assign_path(

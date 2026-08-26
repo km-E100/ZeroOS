@@ -37,7 +37,9 @@
 
 #![no_std]
 
-use userlib::{console_write, extract_payload_text, ipc_receive, ipc_send, service_spawn, yield_now};
+use userlib::{
+    console_write, extract_payload_text, ipc_receive, ipc_send, service_spawn, yield_now,
+};
 use zero_abi::channels;
 use zero_abi::ipc::Message;
 use zero_abi::protocol::launchd::{
@@ -101,7 +103,10 @@ const STATUS_NOT_INSTALLED: u8 = 4;
 
 /// 已规划服务清单。二进制就绪并由内核登记前以 [not-installed] 呈现，
 /// 让 `launchd list` 如实反映系统蓝图而非空白。
-const KNOWN_SERVICES: [&str; 5] = ["fsd", "blkdrv", "securityd", "service-controller", "ipcrouter"];
+const KNOWN_SERVICES: [&str; 10] = [
+    "blkdrv", "fsd", "securityd", "inputd", "windowserver",
+    "netd", "pkgd", "audiod", "service-controller", "ipcrouter",
+];
 
 /// 服务表：全部状态驻留在 `server_main` 栈帧，单线程无需锁。
 struct ServiceTable {
@@ -315,7 +320,11 @@ fn handle_status(table: &ServiceTable, text: &mut TextBuf) -> u32 {
 
 /// 启动应用（payload 布局 `name\0binary\0flags`，对齐历史格式；
 /// flags 本轮只解析不强制）。
-fn handle_start_application(table: &mut ServiceTable, request: &Message, text: &mut TextBuf) -> u32 {
+fn handle_start_application(
+    table: &mut ServiceTable,
+    request: &Message,
+    text: &mut TextBuf,
+) -> u32 {
     if let Some((_name, binary)) = split_fields(&request.payload) {
         spawn_and_record(table, binary, text)
     } else {

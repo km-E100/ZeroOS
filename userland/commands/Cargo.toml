@@ -64,3 +64,5 @@ libfsclient = { path = "../libfsclient" }
 userlib = { path = "../userlib" }
 
 useralloc = { path = "../useralloc" }
+
+ed25519-dalek = { version = "2.2", default-features = false }

@@ -62,17 +62,18 @@ pub fn init(table_ptr: *const DriverTable) {
         let name = unsafe { descriptor.name() };
         debug!(
             "drivers::init: 探测 {} (kind={} mmio=0x{:016x} irq={})",
-            name,
-            descriptor.kind as u32,
-            descriptor.mmio_base,
-            descriptor.irq
+            name, descriptor.kind as u32, descriptor.mmio_base, descriptor.irq
         );
 
         match descriptor.kind {
             DriverKind::Pl011 => pl011::init(descriptor),
             DriverKind::VirtIOBlk => virtio::blk::init(descriptor),
             DriverKind::VirtIONet => virtio::net::init(descriptor),
-            DriverKind::VirtIOConsole | DriverKind::VirtIORng => {
+            DriverKind::VirtIOGpu => virtio::gpu::init(descriptor),
+            DriverKind::VirtIORng => virtio::rng::init(descriptor),
+            DriverKind::VirtIOInput => virtio::input::init(descriptor),
+            DriverKind::VirtIOSound => virtio::sound::init(descriptor),
+            DriverKind::VirtIOConsole => {
                 warn!("driver: 暂不支持 virtio kind {}", descriptor.kind as u32)
             }
             DriverKind::Nvme => {

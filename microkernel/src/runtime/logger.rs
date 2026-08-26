@@ -57,6 +57,7 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
         return;
     }
     serial::write_fmt_line(args);
+    crate::display::write_fmt_line(args);
 }
 
 /// 错误级：内核故障、无法恢复的不变量破坏。正常运行期不应出现。
@@ -117,7 +118,10 @@ pub fn log_panic(info: &PanicInfo) {
         use core::fmt::Write as _;
         let mut buf = [0u8; 256];
         let mut len = 0usize;
-        struct Buf<'a> { buf: &'a mut [u8], len: &'a mut usize }
+        struct Buf<'a> {
+            buf: &'a mut [u8],
+            len: &'a mut usize,
+        }
         impl Write for Buf<'_> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let remain = self.buf.len() - *self.len;
@@ -128,7 +132,10 @@ pub fn log_panic(info: &PanicInfo) {
             }
         }
         {
-            let mut w = Buf { buf: &mut buf, len: &mut len };
+            let mut w = Buf {
+                buf: &mut buf,
+                len: &mut len,
+            };
             let _ = write!(w, "{}", msg);
         }
         if let Ok(text) = core::str::from_utf8(&buf[..len]) {

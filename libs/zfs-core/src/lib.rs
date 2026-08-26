@@ -9,6 +9,7 @@ pub mod device;
 pub mod directory;
 pub mod error;
 pub mod journal;
+pub mod metadata;
 pub mod on_disk;
 pub mod snapshot;
 pub mod volume;

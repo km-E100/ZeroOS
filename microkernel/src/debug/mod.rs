@@ -28,8 +28,8 @@
 //! 之后   名字区：NUL 结尾字符串连续存放
 //! ```
 
-use core::cell::UnsafeCell;
 use alloc::string::String;
+use core::cell::UnsafeCell;
 
 pub mod pstore;
 
@@ -70,7 +70,10 @@ impl SymbolSink {
 /// （测试/宿主构建）不做段指定。用 `target_os = "none"` 区分：
 /// macOS 主机同为 aarch64，但 Mach-O 不接受 ELF 风格段名。
 #[no_mangle]
-#[cfg_attr(all(target_arch = "aarch64", target_os = "none"), link_section = ".data")]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_os = "none"),
+    link_section = ".data"
+)]
 pub static __zero_symbol_sink: SymbolSink = SymbolSink {
     bytes: UnsafeCell::new([0; SINK_SIZE]),
 };
@@ -109,7 +112,11 @@ pub fn symbolize(addr: u64) -> Option<(&'static str, u64)> {
     let idx = lo - 1;
     let sym_addr = entry_addr(buf, idx)?;
     let name_off = read_u32(buf, HEADER_LEN + idx * ENTRY_LEN + 8)? as usize;
-    let name = read_name(buf, names_base.checked_add(name_off)?, names_base + names_bytes)?;
+    let name = read_name(
+        buf,
+        names_base.checked_add(name_off)?,
+        names_base + names_bytes,
+    )?;
     Some((name, addr - sym_addr))
 }
 

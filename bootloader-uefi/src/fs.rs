@@ -33,11 +33,27 @@ impl<'a> FileSystem<'a> {
         let path = CString16::try_from(path).map_err(|_| Status::INVALID_PARAMETER)?;
         let mut file = self.open_regular(&path)?;
         let size = file_size(&mut file)?;
-        let mut buf = Vec::with_capacity(size);
-        unsafe {
-            buf.set_len(size);
+        // UEFI File::read is allowed to return a short read. The old loader
+        // called it once, ignored the returned byte count, and then parsed the
+        // uninitialised tail as ELF/rootfs data. This became deterministic once
+        // the PIE/KASLR kernel grew beyond the firmware's convenient read size.
+        let mut buf = alloc::vec![0u8; size];
+        let mut offset = 0usize;
+        while offset < size {
+            let n = file
+                .read(&mut buf[offset..])
+                .map_err(|_| Status::DEVICE_ERROR)?;
+            if n == 0 {
+                log_error!(
+                    "short UEFI file read: got {} of {} bytes for {}",
+                    offset,
+                    size,
+                    path
+                );
+                return Err(Status::DEVICE_ERROR);
+            }
+            offset = offset.checked_add(n).ok_or(Status::DEVICE_ERROR)?;
         }
-        file.read(&mut buf).map_err(|_| Status::DEVICE_ERROR)?;
         Ok(buf)
     }
 

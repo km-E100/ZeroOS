@@ -5,6 +5,7 @@
 
 #[derive(Debug, Copy, Clone)]
 pub struct ElfHeader {
+    pub e_type: u16,
     pub entry: u64,
     pub phoff: u64,
     pub phnum: u16,
@@ -26,6 +27,10 @@ pub enum ElfError {
     FileNotFound,
     OutOfMemory,
     TooManySegments,
+    MalformedDynamic,
+    TooManyRelocations,
+    UnsupportedRelocation,
+    TooManyNeeded,
 }
 
 #[repr(C)]
@@ -41,7 +46,10 @@ pub struct ElfProgramHeader {
     pub p_align: u64,
 }
 
+pub const ET_EXEC: u16 = 2;
+pub const ET_DYN: u16 = 3;
 pub const PT_LOAD: u32 = 1;
+pub const PT_DYNAMIC: u32 = 2;
 
 pub const PF_X: u32 = 0x1;
 pub const PF_W: u32 = 0x2;
@@ -70,9 +78,9 @@ pub fn parse_elf_header(data: &[u8]) -> Result<ElfHeader, ElfError> {
         return Err(ElfError::UnsupportedEndian);
     }
 
-    // e_type (offset 16, u16) must be ET_EXEC = 2.
+    // User images may be fixed ET_EXEC or position-independent ET_DYN.
     let e_type = u16::from_le_bytes([data[16], data[17]]);
-    if e_type != 2 {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::UnsupportedType);
     }
 
@@ -98,6 +106,7 @@ pub fn parse_elf_header(data: &[u8]) -> Result<ElfHeader, ElfError> {
     ]);
 
     Ok(ElfHeader {
+        e_type,
         entry,
         phoff,
         phnum,

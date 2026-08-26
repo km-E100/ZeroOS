@@ -41,7 +41,11 @@ unsafe impl Sync for FreeListHeap {}
 impl FreeListHeap {
     /// 构造（未含空闲块，调用前需 `init_region`）。
     pub const fn new(start: usize, end: usize) -> Self {
-        Self { start, end, head: 0 }
+        Self {
+            start,
+            end,
+            head: 0,
+        }
     }
 
     /// 设置区域边界并登记为单个空闲块。
@@ -57,11 +61,13 @@ impl FreeListHeap {
         let size = self.end - self.start;
         assert!(size >= MIN_FREE, "FreeListHeap: region too small");
         assert_eq!(
-            self.start % HEAP_ALIGN, 0,
+            self.start % HEAP_ALIGN,
+            0,
             "FreeListHeap: region start not 16-aligned"
         );
         assert_eq!(
-            size % HEAP_ALIGN, 0,
+            size % HEAP_ALIGN,
+            0,
             "FreeListHeap: region size not 16-aligned"
         );
         self.write_header(self.start, size, 0);
@@ -82,7 +88,10 @@ impl FreeListHeap {
             if _iters > 1 << 20 {
                 std::eprintln!(
                     "LOOP! layout={:?} head={:#x} prev={:#x} cur={:#x}",
-                    layout, self.head, prev, cur
+                    layout,
+                    self.head,
+                    prev,
+                    cur
                 );
                 panic!("alloc: free list cycle detected");
             }
@@ -258,7 +267,7 @@ impl FreeListHeap {
         }
     }
 
-#[inline]
+    #[inline]
     fn read_back(&self, ptr: usize) -> usize {
         unsafe { *((ptr - 8) as *const usize) }
     }
@@ -348,7 +357,9 @@ mod tests {
             };
             let base = align_up(h._words.as_ptr() as usize, HEAP_ALIGN);
             h.heap = FreeListHeap::new(base, base + REGION);
-            unsafe { h.heap.init_region(); }
+            unsafe {
+                h.heap.init_region();
+            }
             h
         }
     }
@@ -414,8 +425,9 @@ mod tests {
         let mut ptrs: [*mut u8; 64] = [core::ptr::null_mut(); 64];
         for i in 0..64 {
             let size = (i % 7) * 16 + 16;
-            let p =
-                h.heap.alloc(Layout::from_size_align(size, if i % 4 == 0 { 16 } else { 8 }).unwrap());
+            let p = h
+                .heap
+                .alloc(Layout::from_size_align(size, if i % 4 == 0 { 16 } else { 8 }).unwrap());
             assert!(!p.is_null(), "allocation {} failed", i);
             unsafe {
                 core::ptr::write_bytes(p, i as u8, size);
@@ -426,7 +438,9 @@ mod tests {
             h.heap.dealloc(ptrs[i]);
         }
         // 全部释放后应能合并回（几乎）整个堆：可再次分配接近整个堆的大块
-        let big = h.heap.alloc(Layout::from_size_align(REGION - 4096, 8).unwrap());
+        let big = h
+            .heap
+            .alloc(Layout::from_size_align(REGION - 4096, 8).unwrap());
         assert!(!big.is_null(), "heap did not reclaim all memory");
         h.heap.dealloc(big);
     }
@@ -500,11 +514,14 @@ mod tests {
         let before = h.heap.free_blocks();
         let refill = h.heap.alloc(Layout::from_size_align(240, 16).unwrap());
         assert_eq!(refill, b);
-        assert_eq!(h.heap.free_blocks(), before - 1, "tiny tail must not become a free node");
+        assert_eq!(
+            h.heap.free_blocks(),
+            before - 1,
+            "tiny tail must not become a free node"
+        );
         h.heap.dealloc(refill); // regression: used to inspect a phantom header
         h.heap.dealloc(a);
         h.heap.dealloc(c);
         assert_eq!(h.heap.free_blocks(), 1);
     }
-
 }

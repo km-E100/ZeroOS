@@ -12,7 +12,7 @@ const ARTIFACTS: &[&str] = &[
     "target/rootfs.bundle",
     "target/rootfs-recovery.bundle",
     "target/iso/esp.img",
-    "target/aarch64-unknown-none/debug/zero-kernel",
+    "target/aarch64-unknown-none-pic/release/zero-kernel",
     "target/aarch64-unknown-uefi/debug/bootloader-uefi",
     "target/aarch64-unknown-none/release/zero-launchd",
 ];

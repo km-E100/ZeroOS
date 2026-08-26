@@ -170,10 +170,7 @@ pub enum WalkOutcome {
     /// 未映射（某级入口无效）。
     Unmapped,
     /// 表遍历终止在块描述符（L2 block），返回块所在 2MiB 窗口基址。
-    Block {
-        desc: u64,
-        block_base: usize,
-    },
+    Block { desc: u64, block_base: usize },
     /// L3 页描述符。
     Page { desc: u64, phys: usize },
 }
@@ -245,7 +242,10 @@ pub unsafe fn bbm_split_block(
     target_desc: u64,
     barrier: &mut Barrier,
 ) {
-    assert!(index < 512 && target < 512, "bbm_split_block: slot out of range");
+    assert!(
+        index < 512 && target < 512,
+        "bbm_split_block: slot out of range"
+    );
     let old = *l2.add(index);
     assert!(
         old & DESC_VALID != 0 && old & DESC_TYPE_TABLE == 0,
@@ -353,7 +353,7 @@ mod tests {
         t.link_default();
         // L2[2] 放一个 block（0x40_0000 = 4MiB，2MiB block 粒度下的窗口 2）
         t.l2[2] = (0x40_0000u64) | DESC_VALID | DESC_AF; // 模拟 block 描述符（bit1=0）
-        // L3 挂一个页：VA 0x40_1000 → L3[1]
+                                                         // L3 挂一个页：VA 0x40_1000 → L3[1]
         t.l3[1] = make_leaf_descriptor(0x4100_3000, USER_AP_RW, false);
         let b = unsafe { walk(t.root(), 0x40_0000) };
         assert_eq!(
@@ -453,13 +453,19 @@ mod tests {
         // 开关关闭（第十四刀集成期默认）：一切叶子一律 eager 兜底，
         // 仅保留「只读直映射」判定供未来重开时对照。
         if !COW_SHARED_FORK {
-            assert_eq!(classify_leaf(rw_leaf(0x5000_1000)), LeafShareClass::EagerCopy);
+            assert_eq!(
+                classify_leaf(rw_leaf(0x5000_1000)),
+                LeafShareClass::EagerCopy
+            );
             let text = make_leaf_descriptor(0x5000_2000, USER_AP_RX, true);
             assert_eq!(classify_leaf(text), LeafShareClass::ReadOnlyDirect);
             return;
         }
         // 可写数据页 → 共享化
-        assert_eq!(classify_leaf(rw_leaf(0x5000_1000)), LeafShareClass::CowShare);
+        assert_eq!(
+            classify_leaf(rw_leaf(0x5000_1000)),
+            LeafShareClass::CowShare
+        );
         // 真只读 text 页（RX、无 COW 位）→ 直接映射
         let text = make_leaf_descriptor(0x5000_2000, USER_AP_RX, true);
         assert_eq!(classify_leaf(text), LeafShareClass::ReadOnlyDirect);
@@ -512,7 +518,9 @@ mod tests {
         // 真·只读 text 页不是 COW 页（写它必须 SIGSEGV 而非断链）
         assert!(!is_cow_leaf(make_leaf_descriptor(0x1000, USER_AP_RX, true)));
         // 可写但未标记的普通页（spawn 初始态）不是 COW 页
-        assert!(!is_cow_leaf(make_leaf_descriptor(0x3000, USER_AP_RW, false)));
+        assert!(!is_cow_leaf(make_leaf_descriptor(
+            0x3000, USER_AP_RW, false
+        )));
         // 无效描述符不算
         assert!(!is_cow_leaf(DESC_SW_COW));
         assert_eq!(is_cow_leaf(make_table_descriptor(0x2000)), false);

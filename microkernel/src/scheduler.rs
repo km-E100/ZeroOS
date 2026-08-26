@@ -1,11 +1,11 @@
 use spin::Mutex;
 use zero_abi::ProcessId;
 
-use alloc::vec::Vec;
-#[cfg(test)]
-use alloc::vec;
 use crate::mm::address_space::AddressSpace;
 use crate::process::{self, ProcessState};
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 // ═══════════════════════════════════════════════════════════════════════
 // 锁纪律（单核 spin::Mutex；内核态全程屏蔽 IRQ，仅 EL0 经 SPSR 打开中断）
@@ -84,6 +84,7 @@ struct SleepEntry {
     pid: ProcessId,
 }
 static SLEEP_QUEUE: Mutex<Vec<SleepEntry>> = Mutex::new(Vec::new());
+static SLEEP_TRACE_BUDGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// 当前内核单调 tick 快照（睡眠返回值的计算基准）。
 pub fn tick_now() -> u64 {
@@ -100,6 +101,14 @@ fn proc_level(slot: usize) -> usize {
 
 /// 时间片耗尽后的级别迁移（纯函数，主机测试钉死）。
 fn next_level_after_slice(level: usize) -> usize {
+    (level + 1).min(MLFQ_LEVELS - 1)
+}
+
+/// A voluntary yield consumed CPU too: retaining level 0 lets a polling daemon
+/// yield/requeue itself forever ahead of a preempted level-1 init process.
+/// Demote one level exactly like a cooperative timeslice boundary. Processes
+/// that truly block are still promoted by wake()/enqueue().
+fn next_level_after_yield(level: usize) -> usize {
     (level + 1).min(MLFQ_LEVELS - 1)
 }
 
@@ -204,7 +213,7 @@ fn dispatch(pid: ProcessId) -> ! {
     }
 
     unsafe {
-        // 地址空间激活与下一 tick 编程（不进用户态，此处允许持库调用；
+        // 地址空间激活（不进用户态，此处允许持库调用；
         // 注意 dispatch 到这里为止不持有任何 Mutex）。
         if let Some(space) = process::address_space(next_slot) {
             space.activate();
@@ -216,7 +225,9 @@ fn dispatch(pid: ProcessId) -> ! {
         // （异常入口硬件自动置 PSTATE.I=1）。理由：trap_entry → yield_current
         // 会锁 CURRENT_SLOT / PROCESS_TABLE，若 dispatch 在 first_run_context
         // 持锁窗口内被 IRQ 打断 → spin::Mutex 不可重入 → 单核死锁。
-        crate::arch::program_next_tick();
+        // Periodic timer is independent of context switches. Re-arming here
+        // postpones the deadline on every yield/dispatch and can starve ticks
+        // forever under cooperative workloads. Only timer IRQ/init own CVAL.
     }
 
     if let Some((space, tf)) = process::first_run_context(next_slot) {
@@ -251,14 +262,15 @@ fn idle() -> ! {
     }
     CPU_IDLE[cpu].store(true, core::sync::atomic::Ordering::Release);
     // 无可运行进程：WFI 休眠等待中断（对照 Linux do_idle 的 default_idle）。
-    // 唤醒源：定时器 tick（idle 循环里必须持续重编程，否则睡死）。
+    // 唤醒源：已由 init/上一轮 timer IRQ 预先 arm 的周期 tick；idle 绝不改写 deadline。
     //
     // ⚠ 此处运行于 EL1、IRQ 屏蔽状态 —— WFI 在 IRQ 屏蔽时不休眠！
     // 因此先解除 IRQ 屏蔽再 WFI，唤醒后立即重新屏蔽（与内核全程屏蔽
     // IRQ 的锁纪律兼容：屏蔽恢复后才可能触碰任何共享结构）。
     loop {
         unsafe {
-            crate::arch::program_next_tick();
+            // Timer was armed by init/previous timer IRQ. Do not move the
+            // deadline forward merely because the CPU entered idle.
             core::arch::asm!(
                 "msr daifclr, #2", // 解除 IRQ 屏蔽（bit1 = I）
                 "wfi",
@@ -414,9 +426,11 @@ pub fn yield_current() -> ! {
     let slot = current_slot();
     if let Some(pid) = process::pid_at_slot(slot) {
         process::set_state_slot(slot, ProcessState::Runnable);
-        // MLFQ（第十一刀）：主动让出保留当前级别——协作式让出不因
-        // 礼让而升级，防止 CPU 密集进程借高频 yield 钉死最高级。
-        let level = proc_level(slot);
+        // Voluntary yield is runnable-not-blocked: demote one level so a
+        // poll loop cannot permanently outrank lower-level runnable work.
+        let level = next_level_after_yield(proc_level(slot));
+        PROC_LEVEL[slot].store(level as u8, core::sync::atomic::Ordering::Relaxed);
+        SLICE_USED[slot].store(0, core::sync::atomic::Ordering::Relaxed);
         RUNQUEUE.lock().push_at(pid, level);
     }
     reschedule()
@@ -458,6 +472,8 @@ pub fn on_tick_consume() -> bool {
         due
     };
     for (pid, _elapsed) in expired {
+        if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        }
         if process::state(pid) == Some(ProcessState::Blocked) {
             process::set_state(pid, ProcessState::Runnable);
             enqueue(pid); // 唤醒即最高级：交互/定时器路径的延迟最优
@@ -533,6 +549,8 @@ pub fn sleep_current(ticks: u64) -> ! {
     let start = tick_now();
     let pid = process::pid_at_slot(current_slot())
         .expect("scheduler: sleep_current without live process");
+    if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
+    }
     {
         let mut q = SLEEP_QUEUE.lock();
         assert!(
@@ -542,7 +560,14 @@ pub fn sleep_current(ticks: u64) -> ! {
         );
         // 升序插入（到期扫描依赖队首最小 wake_at）
         let pos = q.partition_point(|e| e.wake_at <= start + ticks);
-        q.insert(pos, SleepEntry { wake_at: start + ticks, start, pid });
+        q.insert(
+            pos,
+            SleepEntry {
+                wake_at: start + ticks,
+                start,
+                pid,
+            },
+        );
     }
     block_current()
 }
@@ -574,9 +599,7 @@ fn kick_idle_cores() {
     let self_cpu = my_cpu();
     let mut mask: u8 = 0;
     for cpu in 0..crate::arch::smp::MAX_CPUS.min(crate::arch::smp::online_count()) {
-        if cpu != self_cpu
-            && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire)
-        {
+        if cpu != self_cpu && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire) {
             mask |= 1 << cpu;
         }
     }
@@ -588,9 +611,7 @@ fn kick_idle_cores() {
 /// 陈旧上下文 ⇒ 直接重新决策（多半取到刚入队的进程）。
 pub fn handle_resched_sgi() -> ! {
     match current_slot_opt() {
-        Some(slot) if process::state_slot(slot) == Some(ProcessState::Running) => {
-            yield_current()
-        }
+        Some(slot) if process::state_slot(slot) == Some(ProcessState::Running) => yield_current(),
         _ => reschedule(),
     }
 }
@@ -699,6 +720,15 @@ mod tests {
     }
 
     /// 各级时间片指数加倍（4/8/16/32），封顶后不再增长。
+    #[test]
+    fn voluntary_yield_demotes_and_caps() {
+        assert_eq!(next_level_after_yield(0), 1);
+        assert_eq!(next_level_after_yield(1), 2);
+        assert_eq!(next_level_after_yield(2), 3);
+        assert_eq!(next_level_after_yield(3), 3);
+        assert_eq!(next_level_after_yield(99), 3);
+    }
+
     #[test]
     fn slice_doubles_per_level() {
         assert_eq!(slice_for_level(0), SLICE_TICKS);
