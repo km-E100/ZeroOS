@@ -15,8 +15,10 @@ pub mod display;
 mod display_font;
 pub mod drivers; // drivers/ 目录模块（驱动与中断服务，拆分自 drivers.rs）
 pub mod elf;
+pub mod iommu;
 pub mod ipc;
 pub mod mm;
+pub mod pci;
 pub mod process;
 pub mod rng;
 pub mod rootfs;

@@ -364,7 +364,8 @@ impl NetStack {
                     }
                     // FIN occupies one sequence number and is only consumed
                     // after all payload in the same segment was accepted.
-                    if flags & 0x01 != 0 && data_fully_accepted
+                    if flags & 0x01 != 0
+                        && data_fully_accepted
                         && seq.wrapping_add(data.len() as u32) == s.rcv_nxt
                     {
                         s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
@@ -586,9 +587,7 @@ impl NetStack {
     }
     fn send_tcp_raw(&mut self, i: usize, seq: u32, ack: u32, flags: u8, data: &[u8]) {
         let s = &self.tcp[i];
-        let window = TCP_RX_CAP
-            .saturating_sub(s.rx.len())
-            .min(u16::MAX as usize) as u16;
+        let window = TCP_RX_CAP.saturating_sub(s.rx.len()).min(u16::MAX as usize) as u16;
         let seg = build_tcp(
             self.cfg.ip,
             s.remote,
@@ -812,7 +811,6 @@ fn response(target: u64, req: u32, code: u32, payload: &[u8]) {
     let _ = userlib::ipc_send_to(NET_RESP, target, &m);
 }
 
-
 pub extern "C" fn server_main() -> ! {
     let _ = userlib::console_write(b"Zero OS netd starting\r\n");
     let mac = loop {
@@ -993,9 +991,15 @@ fn handle_req(s: &mut NetStack, owner: u64, m: &Message) {
                 let cap = userlib::shm_len(shm).map_err(|_| ())?;
                 let ptr = userlib::shm_map(shm).map_err(|_| ())?;
                 let max = requested.min(cap).min(64 * 1024);
-                let Some(d) = s.tcp_recv(owner, h, max) else { return Err(()); };
-                if d.is_empty() { return Ok(None); }
-                unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), ptr, d.len()); }
+                let Some(d) = s.tcp_recv(owner, h, max) else {
+                    return Err(());
+                };
+                if d.is_empty() {
+                    return Ok(None);
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(d.as_ptr(), ptr, d.len());
+                }
                 Ok(Some(d.len()))
             })();
             // The client grants exactly one holder for this RPC. Drop it before

@@ -93,6 +93,7 @@ echo "==> acceptance: 启动 QEMU（串口日志 ${LOG}）"
     -m 1024 \
     -bios "$BIOS" \
     -display none \
+    -boot order=d \
     -serial mon:stdio \
     -cdrom "$ISO" \
     -drive if=none,file="$DISK",format=raw,id=zdisk,cache=writethrough \

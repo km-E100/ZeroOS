@@ -8,6 +8,7 @@ use crate::{debug, warn};
 use alloc::alloc::{alloc_zeroed, Layout};
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+pub mod pci_transport;
 
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
 pub const STATUS_DRIVER: u32 = 2;
@@ -74,10 +75,25 @@ pub struct VirtqUsed<const N: usize> {
 }
 
 pub unsafe fn mmio_read32(base: usize, offset: usize) -> u32 {
-    read_volatile((base + offset) as *const u32)
+    if pci_transport::is_handle(base) {
+        pci_transport::read32(base, offset)
+    } else {
+        read_volatile((base + offset) as *const u32)
+    }
 }
 pub unsafe fn mmio_write32(base: usize, offset: usize, value: u32) {
-    write_volatile((base + offset) as *mut u32, value)
+    if pci_transport::is_handle(base) {
+        pci_transport::write32(base, offset, value)
+    } else {
+        write_volatile((base + offset) as *mut u32, value)
+    }
+}
+pub unsafe fn transport_read8(base: usize, offset: usize) -> u8 {
+    if pci_transport::is_handle(base) {
+        pci_transport::read8(base, offset)
+    } else {
+        read_volatile((base + offset) as *const u8)
+    }
 }
 pub unsafe fn transport_version(base: usize) -> u32 {
     mmio_read32(base, REG_VERSION)
@@ -86,6 +102,7 @@ pub unsafe fn transport_version(base: usize) -> u32 {
 pub struct VirtQueue<const N: usize> {
     base: usize,
     queue_index: u32,
+    notify_offset: u16,
     pub(crate) desc: *mut VirtqDesc,
     avail: *mut VirtqAvail<N>,
     used: *mut VirtqUsed<N>,
@@ -104,7 +121,20 @@ impl<const N: usize> VirtQueue<N> {
             self.avail_idx = self.avail_idx.wrapping_add(1);
             avail.idx = self.avail_idx;
             dmb_oshst();
-            mmio_write32(self.base, REG_QUEUE_NOTIFY, self.queue_index);
+            if pci_transport::is_handle(self.base) {
+                pci_transport::notify_queue(self.base, self.queue_index, self.notify_offset);
+            } else {
+                mmio_write32(self.base, REG_QUEUE_NOTIFY, self.queue_index);
+            }
+        }
+    }
+    /// Suppress used-buffer interrupts for a polling-only queue. We do not
+    /// negotiate VIRTIO_F_EVENT_IDX, so avail.flags bit0 is the architectural
+    /// VIRTQ_AVAIL_F_NO_INTERRUPT control.
+    pub fn suppress_interrupts(&mut self) {
+        unsafe {
+            (*self.avail).flags |= 1;
+            dmb_oshst();
         }
     }
     pub fn pop_used(&mut self) -> Option<VirtqUsedElem> {
@@ -231,6 +261,11 @@ pub unsafe fn configure_queue<const N: usize>(
 ) -> Option<VirtQueue<N>> {
     let version = mmio_read32(base, REG_VERSION);
     mmio_write32(base, REG_QUEUE_SEL, queue_index);
+    let notify_offset = if pci_transport::is_handle(base) {
+        pci_transport::queue_notify_offset(base)
+    } else {
+        0
+    };
     if version == 2 {
         if mmio_read32(base, REG_QUEUE_READY) != 0 {
             warn!("virtio: queue {} already ready", queue_index);
@@ -292,6 +327,7 @@ pub unsafe fn configure_queue<const N: usize>(
     Some(VirtQueue {
         base,
         queue_index,
+        notify_offset,
         desc,
         avail,
         used,

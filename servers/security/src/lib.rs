@@ -26,8 +26,8 @@
 #![no_std]
 
 use core::cmp::min;
-use ed25519_dalek::{Signature, VerifyingKey};
 use core::slice;
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use heapless::{String, Vec};
 use spin::Mutex;
@@ -49,8 +49,8 @@ const USER_CAPACITY: usize = 8;
 const LIST_BUFFER: usize = 256;
 const PKG_TRUST_ORIGIN: &[u8] = b"zero-os";
 const PKG_ZERO_OS_PUBLIC_KEY: [u8; 32] = [
-    0x5e,0x0a,0x4d,0x36,0xe2,0x2c,0x3a,0xf5,0x5b,0xad,0xa3,0xf8,0x81,0x45,0xe3,0x22,
-    0xfe,0x3c,0xca,0x8a,0x0c,0x3c,0x06,0xfe,0x8b,0x14,0x35,0x1e,0x91,0xef,0x2a,0xd2,
+    0x5e, 0x0a, 0x4d, 0x36, 0xe2, 0x2c, 0x3a, 0xf5, 0x5b, 0xad, 0xa3, 0xf8, 0x81, 0x45, 0xe3, 0x22,
+    0xfe, 0x3c, 0xca, 0x8a, 0x0c, 0x3c, 0x06, 0xfe, 0x8b, 0x14, 0x35, 0x1e, 0x91, 0xef, 0x2a, 0xd2,
 ];
 
 /// 能力令牌台账容量（与内核 MAX_GRANTS 同量级；heapless 定长无堆）。
@@ -315,7 +315,10 @@ pub extern "C" fn server_main(bootfs_ptr: u64, bootfs_len: u64) -> ! {
         match userlib::ipc_receive_from(channels::SECURITY_USER_REQ, &mut message) {
             Ok(sender) => {
                 process_command(sender, &mut message);
-                let _ = userlib::ipc_send(channels::SECURITY_USER_RESP, &message);
+                // SECURITY_USER_RESP is shared by shell/pkgd/other clients.
+                // Replies must be targeted to the kernel-authenticated requester;
+                // an untargeted envelope can be consumed by another CPU/client.
+                let _ = userlib::ipc_send_to(channels::SECURITY_USER_RESP, sender, &message);
             }
             Err(_) => userlib::yield_now(),
         }
@@ -498,8 +501,12 @@ fn process_command(sender: u64, msg: &mut Message) {
 
 fn handle_pkg_verify(msg: &mut Message) {
     let origin_len = msg.payload[0] as usize;
-    let needed = 1usize.saturating_add(origin_len).saturating_add(32).saturating_add(64);
-    let ok = if origin_len == PKG_TRUST_ORIGIN.len() && needed <= msg.payload.len()
+    let needed = 1usize
+        .saturating_add(origin_len)
+        .saturating_add(32)
+        .saturating_add(64);
+    let ok = if origin_len == PKG_TRUST_ORIGIN.len()
+        && needed <= msg.payload.len()
         && &msg.payload[1..1 + origin_len] == PKG_TRUST_ORIGIN
     {
         let hash_off = 1 + origin_len;
@@ -507,10 +514,17 @@ fn handle_pkg_verify(msg: &mut Message) {
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(&msg.payload[sig_off..sig_off + 64]);
         match VerifyingKey::from_bytes(&PKG_ZERO_OS_PUBLIC_KEY) {
-            Ok(key) => key.verify_strict(&msg.payload[hash_off..hash_off + 32], &Signature::from_bytes(&sig_bytes)).is_ok(),
+            Ok(key) => key
+                .verify_strict(
+                    &msg.payload[hash_off..hash_off + 32],
+                    &Signature::from_bytes(&sig_bytes),
+                )
+                .is_ok(),
             Err(_) => false,
         }
-    } else { false };
+    } else {
+        false
+    };
     msg.payload.fill(0);
     msg.code = if ok { 0 } else { 1 };
 }

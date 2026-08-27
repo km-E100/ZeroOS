@@ -1,6 +1,7 @@
 use core::arch::asm;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub mod smp;
 use core::hint::spin_loop;
@@ -11,6 +12,13 @@ use crate::process::Context;
 
 mod gic;
 mod timer;
+
+// Translation regime frozen from the boot PE. PSCI CPU_ON starts a fresh PE;
+// these EL1 registers are per-CPU and must be installed before that PE can run
+// Zero OS user address spaces.
+static BOOT_TCR_EL1: AtomicU64 = AtomicU64::new(0);
+static BOOT_MAIR_EL1: AtomicU64 = AtomicU64::new(0);
+static BOOT_SCTLR_EL1: AtomicU64 = AtomicU64::new(0);
 
 // eret 进 EL0t 的 SPSR：M[3:0]=0b0000（EL0t），DAIF 全清 → EL0 可被 timer 抢占。
 // 内核侧全程保持 IRQ 屏蔽（异常入口硬件自动置 I=1），只有 eret 回 EL0 时
@@ -49,10 +57,10 @@ __vector_table:\n\
      // * 本宏生成的代码是进程寄存器状态的**唯一**写入者；任何 Rust 路径\n\
      //   （syscall 处理 / yield / exit / dispatch）都只读写 TRAP_FRAMES，\n\
      //   绝不重复保存（双保存曾用内核脏寄存器污染用户现场）。\n\
-     // * TPIDR_EL1 由 restore_context/enter_user_mode 在每次 eret 前指向\n\
-     //   当前进程的 TrapFrame —— 存根因此无需触碰任何锁或 Rust 代码即可\n\
-     //   定位保存目标。内核全程屏蔽 IRQ ⇒ 所有异常都来自 EL0 或内核自身\n\
-     //   bug，TPIDR_EL1 恒有效。\n\
+     // * TPIDR_EL1 在 eret 前指向当前用户 TrapFrame，仅用于完成**第一层**\n\
+     //   EL0 现场保存。进入 Rust 后 trap::enter_kernel_exception_context 会把\n\
+     //   TPIDR_EL1 切到 per-CPU scratch；因此内核中的 nested IRQ/sync 永远\n\
+     //   不会二次覆盖已经保存好的用户 TrapFrame。\n\
      // * x16/x17 必须完整保存。AAPCS64 的 caller-clobbered 规则只约束函数调用，\n\
      //   IRQ/Data Abort 等异步异常必须透明保全它们。入口先在 EL1 栈暂存\n\
      //   x16/x17，再用 x16 定位 TrapFrame，随后落回各自帧槽并恢复 SP。\n\
@@ -64,6 +72,9 @@ __vector_table:\n\
      //   CPACR_EL1.FPEN=0b11 —— 否则本存根的 stp q*/mrs fpsr 自身就会\n\
      //   同步异常。内核态浮点约定与 lazy-save 优化路径见 process::FpuState。\n\
      .macro SAVE_TRAP_AND_CALL kind\n\
+         // Do not depend on firmware/exception-entry DAIF policy. From the first\n\
+         // instruction onward, nested IRQ/FIQ cannot interleave with frame save.\n\
+         msr daifset, #0xf\n\
          sub sp, sp, #16\n\
          stp x16, x17, [sp]\n\
          mrs x16, tpidr_el1\n\
@@ -100,17 +111,23 @@ __vector_table:\n\
          // EL1 访问 TPIDR_EL0 无条件允许。\n\
          mrs x17, tpidr_el0\n\
          str x17, [x16, #280]\n\
-         // FPU/NEON 惰性保存门控（第十一刀）：仅当活寄存器归属本帧用户\n\
-         // （FPU_DIRTY == frame.owner_slot）才急切保存——同进程 syscall\n\
-         // 往返的现场保全；否则跳过（非 FP 用户零开销；他人现场由断链\n\
-         // 路径 fpu_trap_replay 落账）。FPEN=0b01 下 EL1 的 stp/mrs 不陷阱。\n\
-         // ⚠ 二分排查 C：完整门控复现（读+比较+b.ne 跳过保存）。
+         // FPU/NEON 保存双模：SMP eager 模式必须在**每次异常**无条件\n\
+         // 保存当前 PE 的 q0-q31/FPSR/FPCR；随后 restore_context 同样无条件\n\
+         // 装载目标帧。旧实现把 FPU_DIRTY 冻结为 NONE，却仍执行下面的\n\
+         // dirty==owner 比较，实际效果是“从不 save、每次 load 旧帧”，会让\n\
+         // TLS/Ed25519/SHA 等编译器生成的 NEON 代码跨抢占随机损坏。\n\
+         // 单核 lazy 模式仍保留 dirty==owner 快路径。\n\
+         adrp x17, FPU_EAGER_SMP\n\
+         add x17, x17, :lo12:FPU_EAGER_SMP\n\
+         ldr x17, [x17]\n\
+         cbnz x17, 91\\@f\n\
          adrp x17, FPU_DIRTY\n\
          add x17, x17, :lo12:FPU_DIRTY\n\
          ldr x15, [x16, #816]\n\
          ldr x17, [x17]\n\
          cmp x15, x17\n\
          b.ne 90\\@f\n\
+         91\\@:\n\
          // FPU/NEON 全量急切保存：#288..#799 = v0-v31，#800/#804 = FPSR/\n\
          // FPCR。v 寄存器独立于 x16/x17 暂存方案，零冲突；内核不使用 FP\n\
          // => 存根此刻的 v 寄存器仍是用户现场原值（约定见 process::FpuState）。\n\
@@ -138,6 +155,11 @@ __vector_table:\n\
          mrs x17, fpcr\n\
          str w17, [x16, #804]\n\
          90\\@:\n\
+         // Snapshot syndrome/address before entering Rust. ESR_EL1/FAR_EL1 are\n\
+         // live system registers and a later nested exception may overwrite them.\n\
+         // x2/x3 originals are already stored in TrapFrame, so use them as ABI args.\n\
+         mrs x2, esr_el1\n\
+         mrs x3, far_el1\n\
          mov x0, x16\n\
          mov x1, #\\kind\n\
          bl __zero_trap_handler\n\
@@ -211,9 +233,13 @@ pub fn init(_boot_info: &BootInfo) {
         let tcr: u64;
         let ttbr0: u64;
         let ttbr1: u64;
+        let sctlr: u64;
         asm!("mrs {0}, tcr_el1", out(reg) tcr);
         asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0);
         asm!("mrs {0}, ttbr1_el1", out(reg) ttbr1);
+        asm!("mrs {0}, sctlr_el1", out(reg) sctlr);
+        BOOT_TCR_EL1.store(tcr, AtomicOrdering::Release);
+        BOOT_SCTLR_EL1.store(sctlr, AtomicOrdering::Release);
         crate::info!(
             "arch/aarch64: TCR_EL1=0x{:016x} TTBR0_EL1=0x{:016x} TTBR1_EL1=0x{:016x}",
             tcr,
@@ -255,6 +281,7 @@ pub fn init(_boot_info: &BootInfo) {
         mair &= !(0xFFu64 << 8);
         mair |= 0x04u64 << 8;
         asm!("msr mair_el1, {}", in(reg) mair);
+        BOOT_MAIR_EL1.store(mair, AtomicOrdering::Release);
         asm!("tlbi vmalle1", options(nostack));
 
         // GIC/timer 延后到 MM + ACPI 完成之后；否则 ACPI 永远只能“解析但不消费”。
@@ -297,9 +324,12 @@ extern "C" fn __smp_secondary_rust(cpu: usize) -> ! {
     super::aarch64::smp::smp_secondary_main(cpu)
 }
 
-/// 冻结 FPU_DIRTY=NONE（SMP 翻闸时调用）：入口存根门控从此恒走急切保存。
+/// 切换到 SMP eager FP 模式：活寄存器不再用全局 FPU_DIRTY 表示归属，
+/// 异常入口无条件落回当前 TrapFrame，恢复路径无条件装载目标 TrapFrame。
+/// FPU_DIRTY 同时清为 NONE，防 lazy 路径遗留状态被后续误用。
 pub fn fpu_freeze_none() {
     FPU_DIRTY.store(FPU_OWNER_NONE, Relaxed);
+    FPU_EAGER_SMP.store(1, Relaxed);
 }
 
 // ═══ 第十一刀：FPU/NEON 惰性保存 ═══════════════════════════════════
@@ -316,6 +346,12 @@ pub fn fpu_freeze_none() {
 pub static FPU_DIRTY: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(FPU_OWNER_NONE);
 pub const FPU_OWNER_NONE: u64 = u64::MAX;
+
+/// 0 = single-core lazy ownership protocol; 1 = frame-relative eager SMP protocol.
+/// Kept as a plain no_mangle atomic so the exception-entry assembly can branch
+/// before touching any Rust state/locks.
+#[no_mangle]
+pub static FPU_EAGER_SMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -374,6 +410,66 @@ pub fn fpu_arm_full_access() {
         cpacr = (cpacr & !(0b11u64 << 20)) | (0b11u64 << 20);
         asm!("msr cpacr_el1, {}", in(reg) cpacr);
     }
+}
+
+/// Per-PE architectural state that PSCI CPU_ON does not inherit from the boot PE.
+/// VBAR_EL1 and CPACR_EL1 are banked per CPU; MAIR_EL1 is also made explicit
+/// because the shared Zero OS page tables use AttrIdx1 for Device-nGnRE.
+/// IRQs are still masked by the secondary trampoline while this runs.
+pub(super) unsafe fn init_secondary_local_state() {
+    asm!("msr SPSel, #1", options(nostack, preserves_flags));
+    fpu_arm_full_access();
+    set_vector_base(&__vector_table as *const _ as usize);
+
+    let tcr = BOOT_TCR_EL1.load(AtomicOrdering::Acquire);
+    let mair = BOOT_MAIR_EL1.load(AtomicOrdering::Acquire);
+    let sctlr = BOOT_SCTLR_EL1.load(AtomicOrdering::Acquire);
+    let root = crate::mm::paging::kernel_l0_phys();
+    if tcr == 0 || mair == 0 || root == 0 {
+        panic!("secondary translation regime not frozen");
+    }
+
+    // Program translation controls/tables before enabling the boot PE's SCTLR
+    // policy. This is safe when PSCI starts with MMU off because the Zero OS
+    // kernel page table identity-maps the executing KASLR image and device area;
+    // it is also idempotent if firmware already entered with MMU on.
+    asm!(
+        "dsb sy",
+        "msr mair_el1, {mair}",
+        "msr tcr_el1, {tcr}",
+        "isb",
+        "msr ttbr0_el1, {root}",
+        "msr ttbr1_el1, {root}",
+        "isb",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "msr sctlr_el1, {sctlr}",
+        "isb",
+        mair = in(reg) mair,
+        tcr = in(reg) tcr,
+        root = in(reg) root,
+        sctlr = in(reg) sctlr,
+        options(nostack)
+    );
+
+    let vbar: u64;
+    let cpacr: u64;
+    let cur_tcr: u64;
+    let cur_sctlr: u64;
+    asm!("mrs {0}, VBAR_EL1", out(reg) vbar, options(nostack));
+    asm!("mrs {0}, CPACR_EL1", out(reg) cpacr, options(nostack));
+    asm!("mrs {0}, TCR_EL1", out(reg) cur_tcr, options(nostack));
+    asm!("mrs {0}, SCTLR_EL1", out(reg) cur_sctlr, options(nostack));
+    crate::debug!(
+        "smp: local arch state cpu={} vbar={:#x} fpen={} mmu={} tcr={:#x} root={:#x}",
+        smp::cpu_id(),
+        vbar,
+        (cpacr >> 20) & 3,
+        cur_sctlr & 1,
+        cur_tcr,
+        root
+    );
 }
 
 /// FPEN ← 0b01（EL1 自由、EL0 陷阱）：eret 进用户态前的门位。
@@ -477,6 +573,35 @@ pub fn interrupt_number(raw: u32) -> u32 {
     gic::interrupt_number(raw)
 }
 
+pub fn reserve_pci_msi_affinity(
+    requester_id: u16,
+    event: u32,
+    cpu: usize,
+) -> Option<(u64, u32, u32)> {
+    gic::reserve_pci_msi_affinity(requester_id, event, cpu)
+}
+
+pub fn reserve_pci_msi(requester_id: u16, event: u32) -> Option<(u64, u32, u32)> {
+    gic::reserve_pci_msi(requester_id, event)
+}
+
+pub fn allocate_pci_msi_affinity(
+    requester_id: u16,
+    event: u32,
+    cpu: usize,
+    handler: fn(u32),
+) -> Option<(u64, u32, u32)> {
+    gic::allocate_pci_msi_affinity(requester_id, event, cpu, handler)
+}
+
+pub fn allocate_pci_msi(
+    requester_id: u16,
+    event: u32,
+    handler: fn(u32),
+) -> Option<(u64, u32, u32)> {
+    gic::allocate_pci_msi(requester_id, event, handler)
+}
+
 #[inline(always)]
 pub unsafe fn enable_irq(id: u32) {
     gic::enable_irq(id);
@@ -521,8 +646,134 @@ pub unsafe fn set_tpidr_el1(addr: usize) {
     asm!("msr tpidr_el1, {0}", in(reg) addr, options(nostack));
 }
 
+/// Permanently abandon the current EL1 call stack and enter the scheduler idle
+/// loop on this CPU's dedicated stack.  `br` (not `bl`) is deliberate: idle
+/// never returns to the process/IRQ stack it came from.
+pub unsafe fn enter_idle_stack(cpu: usize, entry: extern "C" fn(usize) -> !) -> ! {
+    let top = smp::idle_stack_top(cpu);
+    debug_assert_eq!(top & 0xf, 0);
+    asm!(
+        "msr daifset, #0xf",
+        "mov sp, x17",
+        "br x16",
+        in("x0") cpu,
+        in("x16") entry as usize,
+        in("x17") top,
+        options(noreturn)
+    )
+}
+
+/// Switch to the same per-CPU scheduler stack while carrying two machine-word
+/// arguments.  Used by yield/block/exit handoffs: the process remains globally
+/// Running until after SP has left its KERNEL_STACKS slot.
+pub unsafe fn enter_scheduler_stack(
+    cpu: usize,
+    entry: extern "C" fn(usize, usize, usize) -> !,
+    arg1: usize,
+    arg2: usize,
+) -> ! {
+    let top = smp::idle_stack_top(cpu);
+    debug_assert_eq!(top & 0xf, 0);
+    asm!(
+        "msr daifset, #0xf",
+        "mov sp, x17",
+        "br x16",
+        in("x0") cpu,
+        in("x1") arg1,
+        in("x2") arg2,
+        in("x16") entry as usize,
+        in("x17") top,
+        options(noreturn)
+    )
+}
+
+fn psci_power_call(fid: u64) -> i64 {
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut x0 = fid;
+        match crate::acpi::psci_conduit() {
+            crate::acpi::PsciConduit::Smc => asm!("smc #0", inout("x0") x0, options(nostack)),
+            crate::acpi::PsciConduit::Hvc | crate::acpi::PsciConduit::LegacyHvc => {
+                asm!("hvc #0", inout("x0") x0, options(nostack))
+            }
+        }
+        x0 as i64
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = fid;
+        -4
+    }
+}
+
+/// PSCI 0.2 power transition. Success never returns. For reset, a valid FADT
+/// ResetReg is attempted if firmware unexpectedly returns from SYSTEM_RESET.
+pub fn power_control(action: u32) {
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    let (name, fid) = match action {
+        zero_abi::syscall::POWER_OFF => ("shutdown", PSCI_SYSTEM_OFF),
+        zero_abi::syscall::POWER_REBOOT => ("reboot", PSCI_SYSTEM_RESET),
+        _ => return,
+    };
+    crate::info!(
+        "power: requesting {} via PSCI {:?}",
+        name,
+        crate::acpi::psci_conduit()
+    );
+    let ret = psci_power_call(fid);
+    crate::warn!("power: PSCI {} returned {}", name, ret);
+    if action == zero_abi::syscall::POWER_REBOOT && crate::acpi::try_fadt_reset() {
+        crate::warn!("power: FADT ResetReg write issued after PSCI failure");
+        for _ in 0..2_000_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 pub unsafe fn enable_interrupts() {
     asm!("msr daifclr, #0xf", options(nostack));
+}
+
+/// Publish freshly written executable bytes to every PE in the inner-shareable
+/// domain. AArch64 does not guarantee D-cache writes become visible to I-cache
+/// automatically; without this, a physical page reused for new user text can
+/// execute stale instructions after migration to another CPU (observed as EC=0
+/// at a perfectly valid A64 branch).
+///
+/// `addr..addr+len` is the kernel identity alias used to write the physical page.
+pub fn sync_instruction_cache(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let ctr: u64;
+        asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nostack, preserves_flags));
+        // CTR_EL0.DminLine is log2(number of 32-bit words per D-cache line).
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let start = addr & !(dline - 1);
+        let end = addr.saturating_add(len);
+        let mut p = start;
+        while p < end {
+            asm!("dc cvau, {0}", in(reg) p, options(nostack));
+            p = p.saturating_add(dline);
+        }
+        asm!(
+            "dsb ish",
+            // New executable pages may run on any PE immediately after enqueue.
+            // Invalidate all inner-shareable I-caches, not only this CPU's alias.
+            "ic ialluis",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (addr, len);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub unsafe fn set_user_ttbr(root_phys: u64) {

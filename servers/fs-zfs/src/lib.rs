@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::str;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use core::slice;
 use heapless::{String as HeaplessString, Vec as HeaplessVec};
@@ -29,6 +29,10 @@ const MAX_DESCRIPTORS: usize = 16;
 static OPEN_FILES: Mutex<[Option<OpenFile>; MAX_DESCRIPTORS]> =
     Mutex::new([const { None }; MAX_DESCRIPTORS]);
 static NEXT_DESCRIPTOR: AtomicU32 = AtomicU32::new(1);
+/// Current request sender. zfsd is single-threaded, so one atomic slot is enough
+/// to make every legacy `respond(...)` call targeted without threading sender
+/// through ~80 handlers. A targeted envelope cannot be stolen by another FS client.
+static REPLY_TARGET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct SnapshotSchedule {
@@ -72,12 +76,18 @@ pub fn server_main(boot_files: &[UserBootFile]) -> ! {
     }
     loop {
         let mut message = Message::empty();
-        match userlib::ipc_receive(channels::FS_REQ, &mut message) {
-            Ok(_) => handle_request(&message),
-            Err(SysError::ChannelUnavailable) => userlib::yield_now(),
+        match userlib::ipc_receive_from(channels::FS_REQ, &mut message) {
+            Ok(sender) => {
+                REPLY_TARGET.store(sender, Ordering::Release);
+                handle_request(&message);
+                REPLY_TARGET.store(0, Ordering::Release);
+            }
+            Err(SysError::ChannelUnavailable | SysError::WouldBlock) => userlib::yield_now(),
             Err(err) => {
+                // No valid requester exists on a receive failure, so broadcasting
+                // an ERR_DEVICE response would itself corrupt another client's RPC.
                 warn!("zfs: IPC receive error {:?}", err);
-                respond(fs_proto::ERR_DEVICE, &[]);
+                userlib::yield_now();
             }
         }
         process_snapshot_queue();
@@ -100,7 +110,9 @@ fn mount_root_volume(boot_files: &[UserBootFile]) {
     // - the final 4KiB block is the shell's raw `blktest` diagnostic sandbox.
     //   The shell derives its LBA from BlockCapacity, so this remains correct
     //   for any disk size rather than assuming the old 32MiB/60000 layout.
-    mount_options.reserved_blocks.extend_from_slice(&[256, 512, 513]);
+    mount_options
+        .reserved_blocks
+        .extend_from_slice(&[256, 512, 513]);
     if let Some(last) = device.logical_blocks().checked_sub(1) {
         mount_options.reserved_blocks.push(last);
     }
@@ -143,13 +155,19 @@ fn import_bootstrap_from_user(
         if path.starts_with("/System/Core/") || path == "/Applications/Shell" {
             continue;
         }
-        let data = unsafe { slice::from_raw_parts(file.data_ptr as *const u8, file.data_len as usize) };
+        let data =
+            unsafe { slice::from_raw_parts(file.data_ptr as *const u8, file.data_len as usize) };
         match volume.import_file(path, data) {
             Ok(_) => imported += 1,
             Err(err) => warn!("zfs: failed to import {}: {:?}", path, err),
         }
     }
-    if volume.import_file("/.zero-bootstrap", b"zfs-runtime-v1\n").is_ok() { imported += 1; }
+    if volume
+        .import_file("/.zero-bootstrap", b"zfs-runtime-v1\n")
+        .is_ok()
+    {
+        imported += 1;
+    }
     info!("zfs: imported {} persistent bootstrap files", imported);
 }
 
@@ -213,16 +231,30 @@ fn handle_request(message: &Message) {
 }
 
 fn respond(status: u32, payload: &[u8]) {
+    let target = REPLY_TARGET.load(Ordering::Acquire);
+    if target == 0 {
+        warn!(
+            "zfs: refusing response without request target status={}",
+            status
+        );
+        return;
+    }
     let mut response = Message::empty();
     response.code = status;
     let copy_len = payload.len().min(response.payload.len());
     response.payload[..copy_len].copy_from_slice(&payload[..copy_len]);
-    let _ = userlib::ipc_send(channels::FS_RESP, &response);
+    let _ = userlib::ipc_send_to(channels::FS_RESP, target, &response);
 }
 
 fn handle_open(message: &Message) {
-    let Some(raw) = extract_path(&message.payload) else { respond(fs_proto::ERR_INVALID, &[]); return; };
-    let Some(path) = canonical_path(raw) else { respond(fs_proto::ERR_INVALID, &[]); return; };
+    let Some(raw) = extract_path(&message.payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = canonical_path(raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
     match with_volume(|volume| volume.file_size(path.as_str()).map(|_| ())) {
         Ok(()) => match allocate_handle(path.as_str()) {
             Some(id) => respond(STATUS_OK, &id.to_le_bytes()),
@@ -234,58 +266,91 @@ fn handle_open(message: &Message) {
 
 fn parse_vt_open(payload: &[u8; 128]) -> Option<(&str, u8)> {
     let end = payload.iter().position(|&b| b == 0)?;
-    if end == 0 { return None; }
+    if end == 0 {
+        return None;
+    }
     let path = str::from_utf8(&payload[..end]).ok()?;
     let mode = payload.get(end + 1).copied().unwrap_or(vt::OPEN_EXISTING);
-    if mode != vt::OPEN_EXISTING && mode != vt::OPEN_CREATE { return None; }
+    if mode != vt::OPEN_EXISTING && mode != vt::OPEN_CREATE {
+        return None;
+    }
     Some((path, mode))
 }
 
 fn handle_vt_open(message: &Message) {
-    let Some((raw, mode)) = parse_vt_open(&message.payload) else { respond(fs_proto::ERR_INVALID, &[]); return; };
-    let Some(path) = canonical_path(raw) else { respond(fs_proto::ERR_INVALID, &[]); return; };
-    let result = with_volume(|volume| {
-        match volume.file_size(path.as_str()) {
-            Ok(_) => Ok(()),
-            Err(ZfsError::NotFound) if mode == vt::OPEN_CREATE => {
-                let parent = parent_path(path.as_str());
-                if parent != "/" {
-                    let Some(e)=volume.directory_index().get(parent) else{return Err(ZfsError::NotFound)};
-                    if e.kind()!=zero_zfs_core::on_disk::InodeKind::Directory{return Err(ZfsError::NotFound)}
+    let Some((raw, mode)) = parse_vt_open(&message.payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = canonical_path(raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let result = with_volume(|volume| match volume.file_size(path.as_str()) {
+        Ok(_) => Ok(()),
+        Err(ZfsError::NotFound) if mode == vt::OPEN_CREATE => {
+            let parent = parent_path(path.as_str());
+            if parent != "/" {
+                let Some(e) = volume.directory_index().get(parent) else {
+                    return Err(ZfsError::NotFound);
+                };
+                if e.kind() != zero_zfs_core::on_disk::InodeKind::Directory {
+                    return Err(ZfsError::NotFound);
                 }
-                volume.write_file(path.as_str(),&[],None)?; Ok(())
             }
-            Err(e)=>Err(e),
+            volume.write_file(path.as_str(), &[], None)?;
+            Ok(())
         }
+        Err(e) => Err(e),
     });
     match result {
         Ok(()) => match allocate_handle(path.as_str()) {
-            Some(id)=>respond(STATUS_OK,&id.to_le_bytes()),
-            None=>respond(fs_proto::ERR_NO_DESCRIPTOR,&[]),
+            Some(id) => respond(STATUS_OK, &id.to_le_bytes()),
+            None => respond(fs_proto::ERR_NO_DESCRIPTOR, &[]),
         },
-        Err(err)=>respond(map_error(err),&[]),
+        Err(err) => respond(map_error(err), &[]),
     }
 }
 
 fn handle_vt_write(message: &Message) {
-    let fd = u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0;4]));
-    let len = u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0;4])) as usize;
+    let fd = u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0; 4]));
+    let len = u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0; 4])) as usize;
     if len == 0 || len > 120 || 8 + len > message.payload.len() {
-        respond(fs_proto::ERR_INVALID, &[]); return;
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
     }
     let (path, offset) = {
-        let table=OPEN_FILES.lock();
-        let Some(h)=table.iter().flatten().find(|h|h.id==fd) else{respond(fs_proto::ERR_NO_DESCRIPTOR,&[]);return};
-        (h.path.clone(),h.offset)
+        let table = OPEN_FILES.lock();
+        let Some(h) = table.iter().flatten().find(|h| h.id == fd) else {
+            respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
+            return;
+        };
+        (h.path.clone(), h.offset)
     };
-    let end=match offset.checked_add(len){Some(v)=>v,None=>{respond(fs_proto::ERR_INVALID,&[]);return}};
-    let mut data=Vec::new();
-    if let Err(err)=with_volume(|v|v.read_file(path.as_str(),&mut data)){respond(map_error(err),&[]);return}
-    if data.len()<end{data.resize(end,0)}
-    data[offset..end].copy_from_slice(&message.payload[8..8+len]);
-    if let Err(err)=with_volume(|v|v.write_file(path.as_str(),&data,None)){respond(map_error(err),&[]);return}
-    let mut table=OPEN_FILES.lock();
-    if let Some(h)=table.iter_mut().flatten().find(|h|h.id==fd){h.offset=end;}
+    let end = match offset.checked_add(len) {
+        Some(v) => v,
+        None => {
+            respond(fs_proto::ERR_INVALID, &[]);
+            return;
+        }
+    };
+    let mut data = Vec::new();
+    if let Err(err) = with_volume(|v| v.read_file(path.as_str(), &mut data)) {
+        respond(map_error(err), &[]);
+        return;
+    }
+    if data.len() < end {
+        data.resize(end, 0)
+    }
+    data[offset..end].copy_from_slice(&message.payload[8..8 + len]);
+    if let Err(err) = with_volume(|v| v.write_file(path.as_str(), &data, None)) {
+        respond(map_error(err), &[]);
+        return;
+    }
+    let mut table = OPEN_FILES.lock();
+    if let Some(h) = table.iter_mut().flatten().find(|h| h.id == fd) {
+        h.offset = end;
+    }
     respond(STATUS_OK, &(len as u32).to_le_bytes());
 }
 
@@ -296,134 +361,296 @@ fn parent_path(path: &str) -> &str {
         Some(i) => &trimmed[..i],
     }
 }
-fn base_name(path: &str) -> &str { path.trim_end_matches('/').rsplit('/').next().unwrap_or("") }
+fn base_name(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+}
 
 /// FS wire contract accepts root-relative and absolute paths. Canonicalize at
 /// the service boundary so the ZFS core only ever sees one namespace form and
 /// traversal can never reach DirectoryIndex as a literal key.
 fn canonical_path(raw: &str) -> Option<String> {
-    if raw.is_empty() || raw.starts_with("//") { return None; }
-    if raw == "/" { return Some(String::from("/")); }
+    if raw.is_empty() || raw.starts_with("//") {
+        return None;
+    }
+    if raw == "/" {
+        return Some(String::from("/"));
+    }
     let body = raw.trim_matches('/');
-    if body.is_empty() { return Some(String::from("/")); }
+    if body.is_empty() {
+        return Some(String::from("/"));
+    }
     let mut out = String::from("/");
     for (i, part) in body.split('/').enumerate() {
-        if part.is_empty() || part == "." || part == ".." { return None; }
-        if i != 0 { out.push('/'); }
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+        if i != 0 {
+            out.push('/');
+        }
         out.push_str(part);
-        if out.len() > MAX_PATH { return None; }
+        if out.len() > MAX_PATH {
+            return None;
+        }
     }
     Some(out)
 }
 
 fn handle_vt_list(message: &Message) {
     let raw = extract_list_filter(&message.payload).unwrap_or("");
-    let Some(dir) = canonical_path(if raw.is_empty() { "/" } else { raw }) else { respond(fs_proto::ERR_INVALID,&[]); return; };
+    let Some(dir) = canonical_path(if raw.is_empty() { "/" } else { raw }) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
     let result = with_volume(|volume| {
         if dir.as_str() != "/" {
-            let Some(e) = volume.directory_index().get(dir.as_str()) else { return Err(ZfsError::NotFound); };
-            if e.kind() != zero_zfs_core::on_disk::InodeKind::Directory { return Err(ZfsError::NotFound); }
+            let Some(e) = volume.directory_index().get(dir.as_str()) else {
+                return Err(ZfsError::NotFound);
+            };
+            if e.kind() != zero_zfs_core::on_disk::InodeKind::Directory {
+                return Err(ZfsError::NotFound);
+            }
         }
         let snap = volume.directory_index().snapshot();
-        let prefix = if dir.as_str() == "/" { String::from("/") } else { let mut p=String::from(dir.as_str().trim_end_matches('/')); p.push('/'); p };
-        let mut out = [0u8;128]; let mut off=0usize;
+        let prefix = if dir.as_str() == "/" {
+            String::from("/")
+        } else {
+            let mut p = String::from(dir.as_str().trim_end_matches('/'));
+            p.push('/');
+            p
+        };
+        let mut out = [0u8; 128];
+        let mut off = 0usize;
         for (path, entry) in snap.iter() {
-            if !path.starts_with(&prefix) { continue; }
-            let rest=&path[prefix.len()..];
-            if rest.is_empty() || rest.contains('/') { continue; }
-            let name=base_name(path);
-            let extra = usize::from(entry.kind()==zero_zfs_core::on_disk::InodeKind::Directory);
-            if off+name.len()+extra+1 >= out.len() { break; }
-            out[off..off+name.len()].copy_from_slice(name.as_bytes()); off+=name.len();
-            if extra==1 { out[off]=b'/'; off+=1; }
-            out[off]=b'\n'; off+=1;
+            if !path.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &path[prefix.len()..];
+            if rest.is_empty() || rest.contains('/') {
+                continue;
+            }
+            let name = base_name(path);
+            let extra = usize::from(entry.kind() == zero_zfs_core::on_disk::InodeKind::Directory);
+            if off + name.len() + extra + 1 >= out.len() {
+                break;
+            }
+            out[off..off + name.len()].copy_from_slice(name.as_bytes());
+            off += name.len();
+            if extra == 1 {
+                out[off] = b'/';
+                off += 1;
+            }
+            out[off] = b'\n';
+            off += 1;
         }
-        Ok((out,off))
+        Ok((out, off))
     });
-    match result { Ok((out,n)) => respond(STATUS_OK,&out[..n]), Err(e)=>respond(map_error(e),&[]) }
+    match result {
+        Ok((out, n)) => respond(STATUS_OK, &out[..n]),
+        Err(e) => respond(map_error(e), &[]),
+    }
 }
 
 fn handle_mkdir(message: &Message) {
-    let Some(raw)=extract_path(&message.payload) else { respond(fs_proto::ERR_INVALID,&[]); return; };
-    let Some(path)=canonical_path(raw) else { respond(fs_proto::ERR_INVALID,&[]); return; };
-    let result=with_volume(|v| {
-        let parent=parent_path(path.as_str());
-        if parent!="/" {
-            let Some(e)=v.directory_index().get(parent) else { return Err(ZfsError::NotFound); };
-            if e.kind()!=zero_zfs_core::on_disk::InodeKind::Directory { return Err(ZfsError::NotFound); }
+    let Some(raw) = extract_path(&message.payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = canonical_path(raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let result = with_volume(|v| {
+        let parent = parent_path(path.as_str());
+        if parent != "/" {
+            let Some(e) = v.directory_index().get(parent) else {
+                return Err(ZfsError::NotFound);
+            };
+            if e.kind() != zero_zfs_core::on_disk::InodeKind::Directory {
+                return Err(ZfsError::NotFound);
+            }
         }
         v.create_dir(path.as_str())
     });
-    match result { Ok(())=>respond(STATUS_OK,&[]), Err(e)=>respond(map_error(e),&[]) }
+    match result {
+        Ok(()) => respond(STATUS_OK, &[]),
+        Err(e) => respond(map_error(e), &[]),
+    }
 }
 fn handle_rmdir(message: &Message) {
-    let Some(raw)=extract_path(&message.payload) else { respond(fs_proto::ERR_INVALID,&[]); return; };
-    let Some(path)=canonical_path(raw) else { respond(fs_proto::ERR_INVALID,&[]); return; };
-    match with_volume(|v| v.remove_dir(path.as_str())) { Ok(())=>respond(STATUS_OK,&[]), Err(e)=>respond(map_error(e),&[]) }
+    let Some(raw) = extract_path(&message.payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = canonical_path(raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    match with_volume(|v| v.remove_dir(path.as_str())) {
+        Ok(()) => respond(STATUS_OK, &[]),
+        Err(e) => respond(map_error(e), &[]),
+    }
 }
 fn handle_rename(message: &Message) {
-    let first=match message.payload.iter().position(|&b| b==0) { Some(v)=>v, None=>{respond(fs_proto::ERR_INVALID,&[]);return;} };
-    let rest=&message.payload[first+1..];
-    let second=match rest.iter().position(|&b| b==0) { Some(v)=>v, None=>{respond(fs_proto::ERR_INVALID,&[]);return;} };
-    let Some(old_raw)=str::from_utf8(&message.payload[..first]).ok() else {respond(fs_proto::ERR_INVALID,&[]);return;};
-    let Some(new_raw)=str::from_utf8(&rest[..second]).ok() else {respond(fs_proto::ERR_INVALID,&[]);return;};
-    let Some(old)=canonical_path(old_raw) else {respond(fs_proto::ERR_INVALID,&[]);return;};
-    let Some(new)=canonical_path(new_raw) else {respond(fs_proto::ERR_INVALID,&[]);return;};
-    let result=with_volume(|v| {
-        let parent=parent_path(new.as_str());
-        if parent!="/" {
-            let Some(e)=v.directory_index().get(parent) else { return Err(ZfsError::NotFound); };
-            if e.kind()!=zero_zfs_core::on_disk::InodeKind::Directory { return Err(ZfsError::NotFound); }
+    let first = match message.payload.iter().position(|&b| b == 0) {
+        Some(v) => v,
+        None => {
+            respond(fs_proto::ERR_INVALID, &[]);
+            return;
         }
-        v.rename_path(old.as_str(),new.as_str())
+    };
+    let rest = &message.payload[first + 1..];
+    let second = match rest.iter().position(|&b| b == 0) {
+        Some(v) => v,
+        None => {
+            respond(fs_proto::ERR_INVALID, &[]);
+            return;
+        }
+    };
+    let Some(old_raw) = str::from_utf8(&message.payload[..first]).ok() else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(new_raw) = str::from_utf8(&rest[..second]).ok() else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(old) = canonical_path(old_raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(new) = canonical_path(new_raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let result = with_volume(|v| {
+        let parent = parent_path(new.as_str());
+        if parent != "/" {
+            let Some(e) = v.directory_index().get(parent) else {
+                return Err(ZfsError::NotFound);
+            };
+            if e.kind() != zero_zfs_core::on_disk::InodeKind::Directory {
+                return Err(ZfsError::NotFound);
+            }
+        }
+        v.rename_path(old.as_str(), new.as_str())
     });
     if result.is_ok() {
-        let mut table=OPEN_FILES.lock();
-        for h in table.iter_mut().flatten() { if h.path==old.as_str() { h.path=new.clone(); } }
+        let mut table = OPEN_FILES.lock();
+        for h in table.iter_mut().flatten() {
+            if h.path == old.as_str() {
+                h.path = new.clone();
+            }
+        }
     }
-    match result { Ok(())=>respond(STATUS_OK,&[]), Err(e)=>respond(map_error(e),&[]) }
+    match result {
+        Ok(()) => respond(STATUS_OK, &[]),
+        Err(e) => respond(map_error(e), &[]),
+    }
 }
 
 fn handle_read_sized(message: &Message) {
-    let id=u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0;4]));
-    let requested=u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0;4])) as usize;
-    if requested==0||requested>124{respond(fs_proto::ERR_INVALID,&[]);return}
-    let (path,offset)={let table=OPEN_FILES.lock();let Some(h)=table.iter().flatten().find(|h|h.id==id)else{respond(fs_proto::ERR_NO_DESCRIPTOR,&[]);return};(h.path.clone(),h.offset)};
-    let mut out=[0u8;128];
-    let n=match with_volume(|v|v.read_file_at(path.as_str(),offset,&mut out[4..4+requested])){Ok(n)=>n,Err(e)=>{respond(map_error(e),&[]);return}};
+    let id = u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0; 4]));
+    let requested = u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0; 4])) as usize;
+    if requested == 0 || requested > 124 {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    let (path, offset) = {
+        let table = OPEN_FILES.lock();
+        let Some(h) = table.iter().flatten().find(|h| h.id == id) else {
+            respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
+            return;
+        };
+        (h.path.clone(), h.offset)
+    };
+    let mut out = [0u8; 128];
+    let n = match with_volume(|v| v.read_file_at(path.as_str(), offset, &mut out[4..4 + requested]))
+    {
+        Ok(n) => n,
+        Err(e) => {
+            respond(map_error(e), &[]);
+            return;
+        }
+    };
     out[..4].copy_from_slice(&(n as u32).to_le_bytes());
-    {let mut table=OPEN_FILES.lock();if let Some(h)=table.iter_mut().flatten().find(|h|h.id==id){h.offset=offset+n;}}
-    respond(STATUS_OK,&out[..4+n]);
+    {
+        let mut table = OPEN_FILES.lock();
+        if let Some(h) = table.iter_mut().flatten().find(|h| h.id == id) {
+            h.offset = offset + n;
+        }
+    }
+    respond(STATUS_OK, &out[..4 + n]);
 }
 
 fn handle_read_shared(message: &Message) {
-    let id=u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0;4]));
-    let shm_handle=u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0;4]));
-    let requested=u32::from_le_bytes(message.payload[8..12].try_into().unwrap_or([0;4])) as usize;
-    if requested==0{let _=userlib::shm_release(shm_handle);respond(fs_proto::ERR_INVALID,&[]);return}
-    let result=(||->Result<usize,ServerError>{
-        let available=userlib::shm_len(shm_handle).map_err(ServerError::Shared)?;
-        let cap=core::cmp::min(requested,available);
-        let ptr=userlib::shm_map(shm_handle).map_err(ServerError::Shared)?;
-        if ptr.is_null(){return Err(ServerError::Shared(SysError::InvalidArgument))}
-        let (path,offset)={let table=OPEN_FILES.lock();let h=table.iter().flatten().find(|h|h.id==id).ok_or(ServerError::Fs(ZfsError::NotFound))?;(h.path.clone(),h.offset)};
-        let dst=unsafe{slice::from_raw_parts_mut(ptr,cap)};
-        let n=with_volume(|v|v.read_file_at(path.as_str(),offset,dst))?;
-        let mut table=OPEN_FILES.lock();if let Some(h)=table.iter_mut().flatten().find(|h|h.id==id){h.offset=offset+n;}
+    let id = u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0; 4]));
+    let shm_handle = u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0; 4]));
+    let requested =
+        u32::from_le_bytes(message.payload[8..12].try_into().unwrap_or([0; 4])) as usize;
+    if requested == 0 {
+        let _ = userlib::shm_release(shm_handle);
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    }
+    let result = (|| -> Result<usize, ServerError> {
+        let available = userlib::shm_len(shm_handle).map_err(ServerError::Shared)?;
+        let cap = core::cmp::min(requested, available);
+        let ptr = userlib::shm_map(shm_handle).map_err(ServerError::Shared)?;
+        if ptr.is_null() {
+            return Err(ServerError::Shared(SysError::InvalidArgument));
+        }
+        let (path, offset) = {
+            let table = OPEN_FILES.lock();
+            let h = table
+                .iter()
+                .flatten()
+                .find(|h| h.id == id)
+                .ok_or(ServerError::Fs(ZfsError::NotFound))?;
+            (h.path.clone(), h.offset)
+        };
+        let dst = unsafe { slice::from_raw_parts_mut(ptr, cap) };
+        let n = with_volume(|v| v.read_file_at(path.as_str(), offset, dst))?;
+        let mut table = OPEN_FILES.lock();
+        if let Some(h) = table.iter_mut().flatten().find(|h| h.id == id) {
+            h.offset = offset + n;
+        }
         Ok(n)
     })();
-    let _=userlib::shm_release(shm_handle);
-    match result{Ok(n)=>respond(STATUS_OK,&(n as u32).to_le_bytes()),Err(ServerError::Fs(ZfsError::NotFound))=>respond(fs_proto::ERR_NO_DESCRIPTOR,&[]),Err(e)=>respond(map_error(e),&[])}
+    let _ = userlib::shm_release(shm_handle);
+    match result {
+        Ok(n) => respond(STATUS_OK, &(n as u32).to_le_bytes()),
+        Err(ServerError::Fs(ZfsError::NotFound)) => respond(fs_proto::ERR_NO_DESCRIPTOR, &[]),
+        Err(e) => respond(map_error(e), &[]),
+    }
 }
 
-fn handle_read(message:&Message){
-    let id=u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0;4]));
-    let requested=u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0;4])) as usize;
-    let cap=requested.min(128);
-    let (path,offset)={let table=OPEN_FILES.lock();let Some(h)=table.iter().flatten().find(|h|h.id==id)else{respond(fs_proto::ERR_NO_DESCRIPTOR,&[]);return};(h.path.clone(),h.offset)};
-    let mut out=[0u8;128];let n=match with_volume(|v|v.read_file_at(path.as_str(),offset,&mut out[..cap])){Ok(n)=>n,Err(e)=>{respond(map_error(e),&[]);return}};
-    {let mut table=OPEN_FILES.lock();if let Some(h)=table.iter_mut().flatten().find(|h|h.id==id){h.offset=offset+n;}}
-    respond(STATUS_OK,&out[..n]);
+fn handle_read(message: &Message) {
+    let id = u32::from_le_bytes(message.payload[0..4].try_into().unwrap_or([0; 4]));
+    let requested = u32::from_le_bytes(message.payload[4..8].try_into().unwrap_or([0; 4])) as usize;
+    let cap = requested.min(128);
+    let (path, offset) = {
+        let table = OPEN_FILES.lock();
+        let Some(h) = table.iter().flatten().find(|h| h.id == id) else {
+            respond(fs_proto::ERR_NO_DESCRIPTOR, &[]);
+            return;
+        };
+        (h.path.clone(), h.offset)
+    };
+    let mut out = [0u8; 128];
+    let n = match with_volume(|v| v.read_file_at(path.as_str(), offset, &mut out[..cap])) {
+        Ok(n) => n,
+        Err(e) => {
+            respond(map_error(e), &[]);
+            return;
+        }
+    };
+    {
+        let mut table = OPEN_FILES.lock();
+        if let Some(h) = table.iter_mut().flatten().find(|h| h.id == id) {
+            h.offset = offset + n;
+        }
+    }
+    respond(STATUS_OK, &out[..n]);
 }
 
 fn handle_close(message: &Message) {
@@ -485,7 +712,10 @@ fn handle_list(message: &Message) {
 fn handle_write(message: &Message) {
     match parse_write_payload(&message.payload) {
         Some((raw, data, _signature)) => {
-            let Some(path)=canonical_path(raw) else { respond(fs_proto::ERR_INVALID,&[]); return; };
+            let Some(path) = canonical_path(raw) else {
+                respond(fs_proto::ERR_INVALID, &[]);
+                return;
+            };
             let result = with_volume(|volume| volume.write_file(path.as_str(), data, None));
             match result {
                 Ok(_) => respond(STATUS_OK, &[]),
@@ -500,15 +730,11 @@ fn handle_write_shared(message: &Message) {
     match parse_shared_write(&message.payload) {
         Some(req) => {
             let result = match read_shared_slice(req.handle, req.length) {
-                Ok(view) => {
-                    with_volume(|volume| unsafe {
-                        let slice = slice::from_raw_parts(view.ptr, view.len);
-                        volume.write_file(req.path.as_str(), slice, None)
-                    })
-                },
-                Err(err) => {
-                    Err(err)
-                },
+                Ok(view) => with_volume(|volume| unsafe {
+                    let slice = slice::from_raw_parts(view.ptr, view.len);
+                    volume.write_file(req.path.as_str(), slice, None)
+                }),
+                Err(err) => Err(err),
             };
             // The client granted one holder reference specifically for this
             // transaction. Drop it after the copy/commit so the service never
@@ -524,8 +750,14 @@ fn handle_write_shared(message: &Message) {
 }
 
 fn handle_delete(message: &Message) {
-    let Some(raw) = extract_path(&message.payload) else { respond(fs_proto::ERR_INVALID, &[]); return; };
-    let Some(path)=canonical_path(raw) else { respond(fs_proto::ERR_INVALID,&[]); return; };
+    let Some(raw) = extract_path(&message.payload) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
+    let Some(path) = canonical_path(raw) else {
+        respond(fs_proto::ERR_INVALID, &[]);
+        return;
+    };
     match with_volume(|volume| volume.remove_file(path.as_str())) {
         Ok(_) => respond(STATUS_OK, &[]),
         Err(err) => respond(map_error(err), &[]),
@@ -535,8 +767,12 @@ fn handle_delete(message: &Message) {
 fn handle_install_bundle(message: &Message) {
     match parse_write_payload(&message.payload) {
         Some((raw, data, Some(signature))) => {
-            let Some(path)=canonical_path(raw) else { respond(fs_proto::ERR_INVALID,&[]); return; };
-            let result = with_volume(|volume| volume.write_file(path.as_str(), data, Some(signature)));
+            let Some(path) = canonical_path(raw) else {
+                respond(fs_proto::ERR_INVALID, &[]);
+                return;
+            };
+            let result =
+                with_volume(|volume| volume.write_file(path.as_str(), data, Some(signature)));
             match result {
                 Ok(_) => respond(STATUS_OK, &[]),
                 Err(err) => respond(map_error(err), &[]),
@@ -583,7 +819,11 @@ fn allocate_handle(path: &str) -> Option<u32> {
     let mut table = OPEN_FILES.lock();
     if let Some(slot) = table.iter_mut().find(|entry| entry.is_none()) {
         let id = NEXT_DESCRIPTOR.fetch_add(1, Ordering::SeqCst);
-        *slot = Some(OpenFile { id, path: String::from(path), offset: 0 });
+        *slot = Some(OpenFile {
+            id,
+            path: String::from(path),
+            offset: 0,
+        });
         Some(id)
     } else {
         None
@@ -866,7 +1106,9 @@ mod blockdev {
             // syscalls as securityd. This avoids ~40 IPC messages per 4KiB
             // block while preserving the single hardware-owner invariant.
             let capacity_sectors = block_capacity_sectors().map_err(libblkclient::Error::Ipc)?;
-            if capacity_sectors == 0 { return Err(libblkclient::Error::NoDevice); }
+            if capacity_sectors == 0 {
+                return Err(libblkclient::Error::NoDevice);
+            }
             let sectors_per_block = (Self::BLOCK_SIZE / 512) as u32;
             info!(
                 "zfs: selected kernel block device idx=0 block=512 capacity={} sectors",
@@ -880,7 +1122,9 @@ mod blockdev {
         }
 
         pub fn open_index(index: u8) -> Result<Self, libblkclient::Error> {
-            if index == 0 { return Self::open_default(); }
+            if index == 0 {
+                return Self::open_default();
+            }
             let info = libblkclient::device_info(index)?;
             Self::from_info(&info)
         }
@@ -910,7 +1154,9 @@ mod blockdev {
             Ok(())
         }
 
-        pub fn logical_blocks(&self) -> u64 { self.logical_blocks }
+        pub fn logical_blocks(&self) -> u64 {
+            self.logical_blocks
+        }
 
         fn hw_lba(&self, logical_block: u64) -> u64 {
             logical_block * self.sectors_per_block as u64

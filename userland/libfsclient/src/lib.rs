@@ -3,7 +3,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use core::{ptr, sync::atomic::{AtomicU64, Ordering}};
+use core::{
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use userlib;
 use zero_abi::channels;
 use zero_abi::ipc::Message;
@@ -70,74 +73,133 @@ impl FsHandle {
 
 pub fn read_file(path: &str, max_len: usize) -> Result<Vec<u8>, FsError> {
     use zero_abi::protocol::fs::vtable;
-    let mut q = Message::empty(); q.code = vtable::CMD_OPEN;
+    let mut q = Message::empty();
+    q.code = vtable::CMD_OPEN;
     encode_vt_open(&mut q.payload, path, vtable::OPEN_EXISTING)?;
-    userlib::ipc_send(channels::FS_REQ,&q).map_err(FsError::Ipc)?;
-    let mut r=Message::empty(); wait_response(&mut r)?;
-    if r.code != 0 { return Err(FsError::from_code(r.code)); }
-    let fd=u32::from_le_bytes(r.payload[..4].try_into().unwrap());
+    userlib::ipc_send(channels::FS_REQ, &q).map_err(FsError::Ipc)?;
+    let mut r = Message::empty();
+    wait_response(&mut r)?;
+    if r.code != 0 {
+        return Err(FsError::from_code(r.code));
+    }
+    let fd = u32::from_le_bytes(r.payload[..4].try_into().unwrap());
     let fsd_pid = FSD_PID.load(Ordering::Acquire);
-    if fsd_pid == 0 { let _=close_fd(fd); return Err(FsError::Syscall(SysError::NotFound)); }
+    if fsd_pid == 0 {
+        let _ = close_fd(fd);
+        return Err(FsError::Syscall(SysError::NotFound));
+    }
 
     // One reusable 16 KiB owner mapping; each transfer grants a one-shot fsd
     // holder which the server releases before replying. This keeps the secure
     // holder model intact while replacing hundreds of 124-byte IPC reads.
     const BULK: usize = 16 * 1024;
     let shm = userlib::shm_create(BULK).map_err(FsError::Syscall)?;
-    let mut out=Vec::new();
+    let mut out = Vec::new();
     let result = (|| -> Result<(), FsError> {
         loop {
-            let remaining=max_len.saturating_sub(out.len());
-            if remaining==0 { return Err(FsError::Invalid); }
-            let want=core::cmp::min(shm.len, remaining);
+            let remaining = max_len.saturating_sub(out.len());
+            if remaining == 0 {
+                return Err(FsError::Invalid);
+            }
+            let want = core::cmp::min(shm.len, remaining);
             userlib::shm_grant(shm.handle, fsd_pid).map_err(FsError::Syscall)?;
-            let mut q=Message::empty(); q.code=vtable::CMD_READ_SHARED;
+            let mut q = Message::empty();
+            q.code = vtable::CMD_READ_SHARED;
             q.payload[..4].copy_from_slice(&fd.to_le_bytes());
             q.payload[4..8].copy_from_slice(&shm.handle.to_le_bytes());
             q.payload[8..12].copy_from_slice(&(want as u32).to_le_bytes());
-            userlib::ipc_send(channels::FS_REQ,&q).map_err(FsError::Ipc)?;
-            let mut r=Message::empty(); wait_response(&mut r)?;
-            if r.code != 0 { return Err(FsError::from_code(r.code)); }
-            let n=u32::from_le_bytes(r.payload[..4].try_into().unwrap_or([0;4])) as usize;
-            if n>want || n>shm.len { return Err(FsError::Invalid); }
-            if n != 0 {
-                let old=out.len(); out.resize(old+n,0);
-                unsafe { core::ptr::copy_nonoverlapping(shm.ptr, out.as_mut_ptr().add(old), n); }
+            userlib::ipc_send(channels::FS_REQ, &q).map_err(FsError::Ipc)?;
+            let mut r = Message::empty();
+            wait_response(&mut r)?;
+            if r.code != 0 {
+                return Err(FsError::from_code(r.code));
             }
-            if n < want { break; }
+            let n = u32::from_le_bytes(r.payload[..4].try_into().unwrap_or([0; 4])) as usize;
+            if n > want || n > shm.len {
+                return Err(FsError::Invalid);
+            }
+            if n != 0 {
+                let old = out.len();
+                out.resize(old + n, 0);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(shm.ptr, out.as_mut_ptr().add(old), n);
+                }
+            }
+            if n < want {
+                break;
+            }
         }
         Ok(())
     })();
-    let _=userlib::shm_release(shm.handle);
-    let close_result=close_fd(fd);
-    result?; close_result?;
+    let _ = userlib::shm_release(shm.handle);
+    let close_result = close_fd(fd);
+    result?;
+    close_result?;
     Ok(out)
 }
 
-pub fn mkdir(path:&str)->Result<(),FsError>{ path_op(zero_abi::protocol::fs::vtable::CMD_MKDIR,path) }
-pub fn rmdir(path:&str)->Result<(),FsError>{ path_op(zero_abi::protocol::fs::vtable::CMD_RMDIR,path) }
-pub fn unlink(path:&str)->Result<(),FsError>{ path_op(zero_abi::protocol::fs::vtable::CMD_UNLINK,path) }
-pub fn rename(old:&str,new:&str)->Result<(),FsError>{
+pub fn mkdir(path: &str) -> Result<(), FsError> {
+    path_op(zero_abi::protocol::fs::vtable::CMD_MKDIR, path)
+}
+pub fn rmdir(path: &str) -> Result<(), FsError> {
+    path_op(zero_abi::protocol::fs::vtable::CMD_RMDIR, path)
+}
+pub fn unlink(path: &str) -> Result<(), FsError> {
+    path_op(zero_abi::protocol::fs::vtable::CMD_UNLINK, path)
+}
+pub fn rename(old: &str, new: &str) -> Result<(), FsError> {
     use zero_abi::protocol::fs::vtable;
-    if old.is_empty()||new.is_empty()||old.len()+new.len()+2>128{return Err(FsError::Invalid)}
-    let mut q=Message::empty(); q.code=vtable::CMD_RENAME;
+    if old.is_empty() || new.is_empty() || old.len() + new.len() + 2 > 128 {
+        return Err(FsError::Invalid);
+    }
+    let mut q = Message::empty();
+    q.code = vtable::CMD_RENAME;
     q.payload[..old.len()].copy_from_slice(old.as_bytes());
-    let o=old.len()+1; q.payload[o..o+new.len()].copy_from_slice(new.as_bytes());
-    userlib::ipc_send(channels::FS_REQ,&q).map_err(FsError::Ipc)?;
-    let mut r=Message::empty(); wait_response(&mut r)?; if r.code==0{Ok(())}else{Err(FsError::from_code(r.code))}
+    let o = old.len() + 1;
+    q.payload[o..o + new.len()].copy_from_slice(new.as_bytes());
+    userlib::ipc_send(channels::FS_REQ, &q).map_err(FsError::Ipc)?;
+    let mut r = Message::empty();
+    wait_response(&mut r)?;
+    if r.code == 0 {
+        Ok(())
+    } else {
+        Err(FsError::from_code(r.code))
+    }
 }
-fn path_op(code:u32,path:&str)->Result<(),FsError>{
-    let mut q=Message::empty(); q.code=code; encode_path(&mut q.payload,path)?;
-    userlib::ipc_send(channels::FS_REQ,&q).map_err(FsError::Ipc)?;
-    let mut r=Message::empty(); wait_response(&mut r)?; if r.code==0{Ok(())}else{Err(FsError::from_code(r.code))}
+fn path_op(code: u32, path: &str) -> Result<(), FsError> {
+    let mut q = Message::empty();
+    q.code = code;
+    encode_path(&mut q.payload, path)?;
+    userlib::ipc_send(channels::FS_REQ, &q).map_err(FsError::Ipc)?;
+    let mut r = Message::empty();
+    wait_response(&mut r)?;
+    if r.code == 0 {
+        Ok(())
+    } else {
+        Err(FsError::from_code(r.code))
+    }
 }
-fn close_fd(fd:u32)->Result<(),FsError>{
-    let mut q=Message::empty(); q.code=zero_abi::protocol::fs::vtable::CMD_CLOSE; q.payload[..4].copy_from_slice(&fd.to_le_bytes());
-    userlib::ipc_send(channels::FS_REQ,&q).map_err(FsError::Ipc)?; let mut r=Message::empty(); wait_response(&mut r)?;
-    if r.code==0{Ok(())}else{Err(FsError::from_code(r.code))}
+fn close_fd(fd: u32) -> Result<(), FsError> {
+    let mut q = Message::empty();
+    q.code = zero_abi::protocol::fs::vtable::CMD_CLOSE;
+    q.payload[..4].copy_from_slice(&fd.to_le_bytes());
+    userlib::ipc_send(channels::FS_REQ, &q).map_err(FsError::Ipc)?;
+    let mut r = Message::empty();
+    wait_response(&mut r)?;
+    if r.code == 0 {
+        Ok(())
+    } else {
+        Err(FsError::from_code(r.code))
+    }
 }
-fn encode_vt_open(payload:&mut [u8;128],path:&str,mode:u8)->Result<(),FsError>{
-    if path.is_empty()||path.len()+2>payload.len(){return Err(FsError::Invalid)} payload.fill(0); payload[..path.len()].copy_from_slice(path.as_bytes()); payload[path.len()+1]=mode; Ok(())
+fn encode_vt_open(payload: &mut [u8; 128], path: &str, mode: u8) -> Result<(), FsError> {
+    if path.is_empty() || path.len() + 2 > payload.len() {
+        return Err(FsError::Invalid);
+    }
+    payload.fill(0);
+    payload[..path.len()].copy_from_slice(path.as_bytes());
+    payload[path.len() + 1] = mode;
+    Ok(())
 }
 
 pub fn list_entries(buffer: &mut [u8]) -> Result<usize, FsError> {
@@ -156,7 +218,11 @@ pub fn list_directory(path: &str, buffer: &mut [u8]) -> Result<usize, FsError> {
         // legal path byte. Message payloads are zero-initialised, so the first
         // NUL is the authoritative response length; the old code returned all
         // 128 bytes and made callers interpret the zero tail as a bogus name.
-        let actual = response.payload.iter().position(|&b| b == 0).unwrap_or(response.payload.len());
+        let actual = response
+            .payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(response.payload.len());
         let len = buffer.len().min(actual);
         buffer[..len].copy_from_slice(&response.payload[..len]);
         Ok(len)

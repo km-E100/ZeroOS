@@ -73,14 +73,14 @@ pub fn online_mask() -> u32 {
 
 /// 主核侧：翻多核闸 → 探测点亮副核。幂等（仅 kernel_main 调用一次）。
 ///
-/// 顺序纪律：必须先翻 MULTI_CORE + 切 FPEN=0b11 + 冻结 FPU_DIRTY，
+/// 顺序纪律：必须先翻 MULTI_CORE + 切 FPEN=0b11 + 打开 FPU_EAGER_SMP，
 /// 再发 CPU_ON——副核一上线就可能与主核并发跑调度/陷阱，FP 语义
-/// 必须先行切换到"帧相对急切"这一跨核安全的形态。
+/// 必须先行切换到“每异常 save / 每恢复 load”的跨核安全形态。
 pub fn boot_secondaries() {
     unsafe { core::arch::asm!("msr tpidrro_el0, {}", in(reg) 0u64) };
     MULTI_CORE.store(true, Ordering::SeqCst);
-    // FP 门位全开（EL0 不再因 FP 陷阱进内核）；FPU_DIRTY 冻结 NONE，
-    // 入口存根的门控比较从此恒走"急切保存"分支。
+    // FP 门位全开（EL0 不再因 FP 陷阱进内核）；fpu_freeze_none 同时
+    // 打开 FPU_EAGER_SMP，入口存根从此无条件保存本 PE 的 FP/SIMD 现场。
     crate::arch::fpu_arm_full_access();
     crate::arch::fpu_freeze_none();
     // GICD 已由主核初始化；SGI0（RESCHED）在 GICv2 恒使能，无需配置。
@@ -147,6 +147,19 @@ pub fn boot_secondaries() {
             break;
         }
     }
+    // PSCI CPU_ON is asynchronous: wait for every MADT CPU we successfully
+    // requested to reach mark_online before publishing the final count or testing
+    // ITS affinity. This also removes the historically racy `online=1/3` log.
+    let expected = crate::acpi::cpu_mpidrs().len().clamp(1, MAX_CPUS);
+    for _ in 0..20_000_000usize {
+        if online_count() >= expected {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if online_count() > 1 {
+        let _ = super::gic::affinity_self_test(1);
+    }
     crate::info!(
         "smp: boot_secondaries done, online={} multi_core={}",
         online_count(),
@@ -156,6 +169,9 @@ pub fn boot_secondaries() {
 
 /// 副核 Rust 入口（entry 汇编设好栈/TPIDR 后调用，noreturn）。
 pub extern "C" fn smp_secondary_main(cpu: usize) -> ! {
+    // PSCI starts a fresh PE: VBAR/CPACR/MAIR are per-CPU state, not inherited
+    // from the boot PE. Install them before the first possible local IRQ.
+    unsafe { super::init_secondary_local_state() };
     // 本核 CPU 接口（GICC 为 banked 寄存器，GICD 由主核一次性配好）。
     unsafe { crate::arch::gic_init_cpu_interface() };
     // 本核定时器：TICKS_PER_SLICE 全局量主核已算好，直接 arm 第一个 tick。
@@ -234,7 +250,39 @@ pub struct SecondaryStacks(pub [[u8; SECONDARY_STACK_SIZE]; MAX_CPUS]);
 pub static SMP_SECONDARY_STACKS: SecondaryStacks =
     SecondaryStacks([[0; SECONDARY_STACK_SIZE]; MAX_CPUS]);
 
+/// Dedicated per-CPU scheduler-idle stack.  Secondary bring-up already owns
+/// one 64KiB stack per logical CPU; once a PE enters the scheduler that stack
+/// is no longer a process stack, so it becomes the permanent idle/exception
+/// continuation stack for that PE (CPU0's slot was previously unused).
+///
+/// This separation is mandatory on SMP: an idle PE must never keep sleeping on
+/// the kernel stack of the last process it ran, because that process may migrate
+/// and use the same KERNEL_STACKS[slot] concurrently on another PE.
+pub fn idle_stack_top(cpu: usize) -> usize {
+    let idx = cpu.min(MAX_CPUS - 1);
+    let base = core::ptr::addr_of!(SMP_SECONDARY_STACKS.0[idx]) as *const u8 as usize;
+    base + SECONDARY_STACK_SIZE
+}
+
 /// 副核入口符号（定义于 arch/aarch64.rs 的 global_asm）：
 /// 汇编读 MPIDR 得 idx → 从 SMP_SECONDARY_STACKS 取本核栈 →
 /// TPIDR_EL1 ← SMP_IDLE_FRAMES[idx] → bl __smp_secondary_rust。
 pub const IDLE_FRAME_STRIDE: usize = 832; // == size_of::<TrapFrame>()（有静态断言）
+
+#[cfg(test)]
+mod idle_stack_tests {
+    use super::*;
+
+    #[test]
+    fn idle_stack_geometry_is_per_cpu() {
+        for cpu in 0..MAX_CPUS {
+            assert_eq!(idle_stack_top(cpu) & 0xf, 0);
+            if cpu != 0 {
+                assert_eq!(
+                    idle_stack_top(cpu) - idle_stack_top(cpu - 1),
+                    SECONDARY_STACK_SIZE
+                );
+            }
+        }
+    }
+}

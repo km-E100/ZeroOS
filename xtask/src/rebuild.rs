@@ -143,12 +143,14 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
         need_repack = true;
     }
 
-    if dirty.contains(&"userland") {
-        println!("==> rebuild-fast: 构建用户态裸机组件 (launchd release / user-app)");
-        cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-launchd --release").run()?;
-        cmd!(sh, "cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app").run()?;
+    // Any userland/library/server source can affect a bare-metal ELF embedded in
+    // kernel/rootfs. Rebuild the complete runtime blob set once, rather than
+    // refreshing only launchd/user-app and silently shipping stale pkgd/netd/etc.
+    if dirty.contains(&"userland") || dirty.contains(&"servers") {
+        println!("==> rebuild-fast: 构建并同步用户态裸机 runtime blobs");
+        crate::build_baremetal_blobs(sh)?;
         crate::sync_userland_blobs(sh, true)?;
-        // blob 同步会改写 kernel/rootfs → 显式标记 rootfs_tree 待处理
+        // blob 同步改写 kernel/rootfs → rootfs bundle/installer 必须跟进。
         if !dirty.contains(&"rootfs_tree") {
             dirty.push("rootfs_tree");
         }
@@ -158,6 +160,10 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
         println!("==> rebuild-fast: 重建 rootfs bundle + 安装器写盘");
         crate::build_rootfs(sh)?;
         cmd!(sh, "cargo run -p zero-installer").run()?;
+        copy_rootfs_img(&project_root)?;
+        need_repack = true;
+    } else if !rootfs_in_staging_is_current(&project_root)? {
+        println!("==> rebuild-fast: 同步落后的 rootfs 产物到 ISO staging");
         copy_rootfs_img(&project_root)?;
         need_repack = true;
     }
@@ -182,7 +188,11 @@ pub fn run(sh: &Shell, args: RebuildFastArgs) -> Result<()> {
         manifest::write_manifest(&project_root, "rebuild-fast")?;
     }
 
-    state::save_state(&state_path, &current)?;
+    // Build steps may rewrite tracked rootfs blobs (sync_userland_blobs). Persist
+    // the post-build snapshot, otherwise the next invocation sees our own output
+    // as a fresh source change and rebuilds again.
+    let final_snapshot = full_snapshot(&project_root)?;
+    state::save_state(&state_path, &final_snapshot)?;
 
     let secs = t0.elapsed().as_secs_f32();
     println!(
@@ -255,6 +265,13 @@ fn copy_bootloader(project_root: &Path) -> Result<()> {
 }
 
 fn copy_rootfs_img(project_root: &Path) -> Result<()> {
+    // UEFI bootloader consumes rootfs.bundle directly. Keeping only the installed
+    // zero-rootfs.img current is insufficient: a stale staged bundle silently
+    // boots old userland even though rebuild-fast just rebuilt all runtime blobs.
+    let bundle = project_root.join("target/rootfs.bundle");
+    if bundle.exists() {
+        fs_xcopy(&bundle, &staging_zeroos(project_root).join("rootfs.bundle"))?;
+    }
     let src = project_root.join("target/zero-rootfs.img");
     if src.exists() {
         fs_xcopy(&src, &staging_zeroos(project_root).join("zero-rootfs.img"))?;
@@ -267,6 +284,20 @@ fn copy_rootfs_img(project_root: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn rootfs_in_staging_is_current(project_root: &Path) -> Result<bool> {
+    for name in ["rootfs.bundle", "rootfs-recovery.bundle", "zero-rootfs.img"] {
+        let built = project_root.join("target").join(name);
+        let staged = staging_zeroos(project_root).join(name);
+        if !built.exists() || !staged.exists() {
+            return Ok(false);
+        }
+        if hash::hash_file(&built)? != hash::hash_file(&staged)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn copy_host_bins(project_root: &Path) -> Result<()> {
@@ -323,7 +354,7 @@ fn repack_iso(sh: &Shell, project_root: &Path) -> Result<()> {
     if esp_path.exists() {
         std::fs::remove_file(&esp_path)?;
     }
-    cmd!(sh, "dd if=/dev/zero of={esp_path} bs=1m count=256")
+    cmd!(sh, "dd if=/dev/zero of={esp_path} bs=1m count=96")
         .run()
         .context("creating blank ESP image")?;
     cmd!(sh, "mformat -i {esp_path} -F -v ZEROESP ::")

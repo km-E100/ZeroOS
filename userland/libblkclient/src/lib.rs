@@ -164,9 +164,12 @@ pub fn passthrough_read(device: u8, lba: u64, out: &mut [u8]) -> Result<(), Erro
         q.payload[12..16].copy_from_slice(&(sector_off as u32).to_le_bytes());
         q.payload[16..20].copy_from_slice(&(n as u32).to_le_bytes());
         send_request(&q)?;
-        let mut r = Message::empty(); wait_response(&mut r)?;
-        if r.code != zero_abi::protocol::blk::STATUS_OK { return Err(Error::Status(r.code)); }
-        out[done..done+n].copy_from_slice(&r.payload[..n]);
+        let mut r = Message::empty();
+        wait_response(&mut r)?;
+        if r.code != zero_abi::protocol::blk::STATUS_OK {
+            return Err(Error::Status(r.code));
+        }
+        out[done..done + n].copy_from_slice(&r.payload[..n]);
         done += n;
     }
     Ok(())
@@ -185,12 +188,17 @@ pub fn passthrough_write(device: u8, lba: u64, data: &[u8]) -> Result<(), Error>
         q.payload[4..12].copy_from_slice(&sector.to_le_bytes());
         q.payload[12..16].copy_from_slice(&(sector_off as u32).to_le_bytes());
         q.payload[16..20].copy_from_slice(&(n as u32).to_le_bytes());
-        q.payload[20..20+n].copy_from_slice(&data[done..done+n]);
+        q.payload[20..20 + n].copy_from_slice(&data[done..done + n]);
         send_request(&q)?;
-        let mut r = Message::empty(); wait_response(&mut r)?;
-        if r.code != zero_abi::protocol::blk::STATUS_OK { return Err(Error::Status(r.code)); }
+        let mut r = Message::empty();
+        wait_response(&mut r)?;
+        if r.code != zero_abi::protocol::blk::STATUS_OK {
+            return Err(Error::Status(r.code));
+        }
         let wrote = u32::from_le_bytes(r.payload[..4].try_into().unwrap()) as usize;
-        if wrote != n { return Err(Error::InvalidResponse); }
+        if wrote != n {
+            return Err(Error::InvalidResponse);
+        }
         done += n;
     }
     Ok(())

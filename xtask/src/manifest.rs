@@ -45,7 +45,11 @@ pub fn write_manifest(project_root: &Path, trigger: &str) -> Result<Vec<String>>
         .current_dir(project_root)
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()))
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .unwrap_or_else(|| "unknown".into());
 
     let mut text = String::new();

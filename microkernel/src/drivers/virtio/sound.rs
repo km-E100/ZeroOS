@@ -66,7 +66,9 @@ static SOUND: Mutex<Option<State>> = Mutex::new(None);
 pub fn init(desc: &DriverDescriptor) {
     let base = desc.mmio_base as usize;
     unsafe {
-        if mmio_read32(base, 0x008) == 0 { return; }
+        if mmio_read32(base, 0x008) == 0 {
+            return;
+        }
         if !probe_device(base, DEVICE_ID_SOUND, "virtio-sound") || !negotiate_features(base) {
             return;
         }
@@ -140,7 +142,9 @@ fn query_playback(q: &mut VirtQueue<QSZ>, streams: u32) -> Option<PlaybackInfo> 
     put32(&mut req, 8, 1);
     put32(&mut req, 12, 32);
     let mut resp = [0u8; 36]; // status hdr + one pcm_info
-    if !control_xfer(q, &req, &mut resp) || get32(&resp, 0) != S_OK { return None; }
+    if !control_xfer(q, &req, &mut resp) || get32(&resp, 0) != S_OK {
+        return None;
+    }
     let formats = get64(&resp, 12); // response hdr(4) + info(hda4,features4)
     let rates = get64(&resp, 20);
     let direction = resp[28];
@@ -153,11 +157,18 @@ fn query_playback(q: &mut VirtQueue<QSZ>, streams: u32) -> Option<PlaybackInfo> 
     {
         return None;
     }
-    Some(PlaybackInfo { channels: CHANNELS as u8, format: FMT_S16, rate: RATE_48000, streams })
+    Some(PlaybackInfo {
+        channels: CHANNELS as u8,
+        format: FMT_S16,
+        rate: RATE_48000,
+        streams,
+    })
 }
 
 fn control_xfer(q: &mut VirtQueue<QSZ>, req: &[u8], resp: &mut [u8]) -> bool {
-    if req.is_empty() || resp.len() < 4 { return false; }
+    if req.is_empty() || resp.len() < 4 {
+        return false;
+    }
     unsafe {
         *q.desc.add(0) = VirtqDesc {
             addr: req.as_ptr() as u64,
@@ -174,7 +185,9 @@ fn control_xfer(q: &mut VirtQueue<QSZ>, req: &[u8], resp: &mut [u8]) -> bool {
     }
     q.push(0);
     for _ in 0..POLL_LIMIT {
-        if q.pop_used().is_some() { return true; }
+        if q.pop_used().is_some() {
+            return true;
+        }
         core::hint::spin_loop();
     }
     false
@@ -189,7 +202,9 @@ fn pcm_cmd(q: &mut VirtQueue<QSZ>, code: u32) -> bool {
 }
 
 fn ensure_prepared(s: &mut State) -> bool {
-    if s.prepared { return true; }
+    if s.prepared {
+        return true;
+    }
     let mut req = [0u8; 24];
     put32(&mut req, 0, R_PCM_SET_PARAMS);
     put32(&mut req, 4, 0);
@@ -204,7 +219,9 @@ fn ensure_prepared(s: &mut State) -> bool {
     if !control_xfer(&mut s.control, &req, &mut resp) || get32(&resp, 0) != S_OK {
         return false;
     }
-    if !pcm_cmd(&mut s.control, R_PCM_PREPARE) { return false; }
+    if !pcm_cmd(&mut s.control, R_PCM_PREPARE) {
+        return false;
+    }
     s.prepared = true;
     true
 }
@@ -213,10 +230,16 @@ fn ensure_prepared(s: &mut State) -> bool {
 /// The first period is queued before START, satisfying the output pre-buffering
 /// requirement. Subsequent periods run on the already-started stream.
 pub fn play_period(pcm: &[u8]) -> bool {
-    if pcm.is_empty() || pcm.len() > PERIOD_BYTES || pcm.len() % FRAME_BYTES != 0 { return false; }
+    if pcm.is_empty() || pcm.len() > PERIOD_BYTES || pcm.len() % FRAME_BYTES != 0 {
+        return false;
+    }
     let mut guard = SOUND.lock();
-    let Some(s) = guard.as_mut() else { return false; };
-    if !ensure_prepared(s) { return false; }
+    let Some(s) = guard.as_mut() else {
+        return false;
+    };
+    if !ensure_prepared(s) {
+        return false;
+    }
 
     let xfer = 0u32.to_le_bytes();
     let mut status = [0u8; 8];
@@ -242,7 +265,9 @@ pub fn play_period(pcm: &[u8]) -> bool {
     }
     s.tx.push(0);
     if !s.running {
-        if !pcm_cmd(&mut s.control, R_PCM_START) { return false; }
+        if !pcm_cmd(&mut s.control, R_PCM_START) {
+            return false;
+        }
         s.running = true;
     }
     for _ in 0..POLL_LIMIT {
@@ -256,34 +281,58 @@ pub fn play_period(pcm: &[u8]) -> bool {
 
 pub fn stop() -> bool {
     let mut guard = SOUND.lock();
-    let Some(s) = guard.as_mut() else { return false; };
-    if s.running && !pcm_cmd(&mut s.control, R_PCM_STOP) { return false; }
+    let Some(s) = guard.as_mut() else {
+        return false;
+    };
+    if s.running && !pcm_cmd(&mut s.control, R_PCM_STOP) {
+        return false;
+    }
     s.running = false;
-    if s.prepared && !pcm_cmd(&mut s.control, R_PCM_RELEASE) { return false; }
+    if s.prepared && !pcm_cmd(&mut s.control, R_PCM_RELEASE) {
+        return false;
+    }
     s.prepared = false;
     true
 }
 
-pub fn info() -> Option<PlaybackInfo> { SOUND.lock().as_ref().map(|s| s.info) }
-pub fn active() -> bool { SOUND.lock().is_some() }
+pub fn info() -> Option<PlaybackInfo> {
+    SOUND.lock().as_ref().map(|s| s.info)
+}
+pub fn active() -> bool {
+    SOUND.lock().is_some()
+}
 
 pub fn irq_handler(_irq: u32) {
     let mut guard = SOUND.lock();
-    let Some(s) = guard.as_mut() else { return; };
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
     unsafe {
         let status = super::mmio_read32(s.base, super::REG_INTERRUPT_STATUS);
-        if status != 0 { super::mmio_write32(s.base, super::REG_INTERRUPT_ACK, status); }
+        if status != 0 {
+            super::mmio_write32(s.base, super::REG_INTERRUPT_ACK, status);
+        }
     }
     // Recycle any event buffers completed by the device. We currently negotiate
     // no period/xrun event feature bits, but eventq must remain valid by spec.
     while let Some(e) = s.event.pop_used() {
-        if (e.id as usize) < QSZ { s.event.push(e.id as u16); } else { break; }
+        if (e.id as usize) < QSZ {
+            s.event.push(e.id as u16);
+        } else {
+            break;
+        }
     }
 }
 
-fn put32(b: &mut [u8], off: usize, v: u32) { b[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
-fn get32(b: &[u8], off: usize) -> u32 { u32::from_le_bytes(b[off..off + 4].try_into().unwrap()) }
-fn get64(b: &[u8], off: usize) -> u64 { u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) }
+fn put32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn get32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+fn get64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
 
 #[cfg(test)]
 mod tests {
@@ -291,8 +340,14 @@ mod tests {
     #[test]
     fn wire_constants_match_virtio_sound() {
         assert_eq!(DEVICE_ID_SOUND, 25);
-        assert_eq!((R_PCM_INFO, R_PCM_SET_PARAMS, R_PCM_PREPARE), (0x100, 0x101, 0x102));
-        assert_eq!((R_PCM_RELEASE, R_PCM_START, R_PCM_STOP), (0x103, 0x104, 0x105));
+        assert_eq!(
+            (R_PCM_INFO, R_PCM_SET_PARAMS, R_PCM_PREPARE),
+            (0x100, 0x101, 0x102)
+        );
+        assert_eq!(
+            (R_PCM_RELEASE, R_PCM_START, R_PCM_STOP),
+            (0x103, 0x104, 0x105)
+        );
         assert_eq!(FMT_S16, 5);
         assert_eq!(RATE_48000, 7);
         assert_eq!(PERIOD_BYTES % FRAME_BYTES, 0);
@@ -302,7 +357,9 @@ mod tests {
     fn pcm_info_offsets_are_spec_layout() {
         let mut r = [0u8; 36];
         put32(&mut r, 0, S_OK);
-        r[28] = D_OUTPUT; r[29] = 1; r[30] = 2;
+        r[28] = D_OUTPUT;
+        r[29] = 1;
+        r[30] = 2;
         r[12..20].copy_from_slice(&(1u64 << FMT_S16).to_le_bytes());
         r[20..28].copy_from_slice(&(1u64 << RATE_48000).to_le_bytes());
         assert_eq!(get32(&r, 0), S_OK);

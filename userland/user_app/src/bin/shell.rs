@@ -27,7 +27,7 @@ use userlib::{
     extract_payload_text, get_session, session_begin, session_list, wait_pid, wait_pid_flags,
     WAIT_NOHANG,
 };
-use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_SECURE_IPC, CAP_SESSION};
+use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_POWER, CAP_SECURE_IPC, CAP_SESSION};
 use zero_abi::channels::{
     FS_REQ, FS_RESP, LAUNCHD_CMD_REQ, LAUNCHD_CMD_RESP, SECURITY_USER_REQ, SECURITY_USER_RESP,
 };
@@ -141,7 +141,13 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  pkg:      pkg ls [dir] / pkg rename <old> <new>");
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  security: login/su/whoami/sessions/secdemo");
-            println("  system: launchd/pid/ppid/clear/history/echo/whoami/help/exit");
+            println(
+                "  system: launchd/pid/ppid/shutdown/reboot/clear/history/echo/whoami/help/exit",
+            );
+        } else if cmd == b"shutdown" {
+            power_command(zero_abi::syscall::POWER_OFF);
+        } else if cmd == b"reboot" {
+            power_command(zero_abi::syscall::POWER_REBOOT);
         } else if cmd.starts_with(b"echo ") {
             println_bytes(&cmd[5..]);
         } else if cmd == b"pid" {
@@ -1253,7 +1259,10 @@ fn blktest_command(cmd: &[u8]) {
     // now reserves the final 4KiB logical block exclusively for this raw test.
     let capacity = match userlib::block_capacity_sectors() {
         Ok(v) if v >= SECTORS_PER_ZFS_BLOCK * 2 => v,
-        _ => { println("blktest: cannot determine a usable block-device capacity"); return; }
+        _ => {
+            println("blktest: cannot determine a usable block-device capacity");
+            return;
+        }
     };
     let diagnostic_lba = ((capacity / SECTORS_PER_ZFS_BLOCK) - 1) * SECTORS_PER_ZFS_BLOCK;
 
@@ -1268,10 +1277,15 @@ fn blktest_command(cmd: &[u8]) {
             Some(_) => {
                 print("blktest: refused: only reserved diagnostic LBA ");
                 print_u64(diagnostic_lba);
-                print(".."); print_u64(diagnostic_lba + SECTORS_PER_ZFS_BLOCK - 1); println(" is writable");
+                print("..");
+                print_u64(diagnostic_lba + SECTORS_PER_ZFS_BLOCK - 1);
+                println(" is writable");
                 return;
             }
-            None => { println("usage: blktest [lba-within-final-reserved-4KiB-block]"); return; }
+            None => {
+                println("usage: blktest [lba-within-final-reserved-4KiB-block]");
+                return;
+            }
         }
     };
 
@@ -2015,6 +2029,30 @@ fn println_u64(v: u64) {
 ///   [3] 创建受保护通道成功
 ///   [4] 持动态能力发送成功
 ///   [5] 撤销令牌后再次发送 → PermissionDenied
+fn power_command(action: u32) {
+    let Ok(pid) = userlib::getpid() else {
+        println("power: getpid failed");
+        return;
+    };
+    let Some(token) = request_cap(pid, CAP_POWER) else {
+        println("power: denied (admin login required)");
+        return;
+    };
+    let label = if action == zero_abi::syscall::POWER_REBOOT {
+        "reboot"
+    } else {
+        "shutdown"
+    };
+    print("power: requesting ");
+    println(label);
+    if let Err(e) = userlib::power_control(action) {
+        let _ = request_revoke(token);
+        print("power: firmware transition failed (");
+        print_hex(e.code());
+        println(")");
+    }
+}
+
 fn secdemo_command() {
     const CH: u32 = zero_abi::channels::SECDEMO_CH;
     let desc = ChannelDesc {

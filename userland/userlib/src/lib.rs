@@ -391,11 +391,27 @@ pub fn block_capacity_sectors() -> Result<u64, SysError> {
     decode_result(svc_call(57, [0, 0, 0, 0]))
 }
 
+/// Active kernel block backend (`zero_abi::protocol::blk::DEVICE_TYPE_*`, syscall 71).
+/// Request a privileged platform power transition (syscall72). Successful
+/// shutdown/reboot never returns; a returned Ok would only mean a broken firmware path.
+pub fn power_control(action: u32) -> Result<(), SysError> {
+    decode_result(svc_call(72, [action as u64, 0, 0, 0])).map(|_| ())
+}
+
+pub fn block_backend_type() -> Result<u8, SysError> {
+    decode_result(svc_call(71, [0, 0, 0, 0])).map(|v| v as u8)
+}
+
 /// Spawn an ELF image from the caller's verified byte buffer (syscall58).
 /// Requires a dynamically granted CAP_SPAWN_APP.
 pub fn spawn_image(image: &[u8]) -> Result<u64, SysError> {
-    if image.len() < 64 { return Err(SysError::InvalidArgument); }
-    decode_result(svc_call(58, [image.as_ptr() as u64, image.len() as u64, 0, 0]))
+    if image.len() < 64 {
+        return Err(SysError::InvalidArgument);
+    }
+    decode_result(svc_call(
+        58,
+        [image.as_ptr() as u64, image.len() as u64, 0, 0],
+    ))
 }
 
 pub fn net_recv_frame(frame: &mut [u8]) -> Result<usize, SysError> {
@@ -411,33 +427,67 @@ pub fn net_get_mac() -> Result<[u8; 6], SysError> {
     decode_result(svc_call(53, [mac.as_mut_ptr() as u64, 0, 0, 0])).map(|_| mac)
 }
 
-
 /// Query the fixed first-generation PCM contract (syscall 59).
 pub fn audio_info() -> Result<zero_abi::audio::AudioInfo, SysError> {
-    let mut info=zero_abi::audio::AudioInfo::default();
-    decode_result(svc_call(59,[&mut info as *mut _ as u64,0,0,0]))?;
+    let mut info = zero_abi::audio::AudioInfo::default();
+    decode_result(svc_call(59, [&mut info as *mut _ as u64, 0, 0, 0]))?;
     Ok(info)
 }
 /// Submit one audio period (syscall 60; audiod-only capability).
-pub fn audio_play_period(pcm:&[u8])->Result<(),SysError>{
-    decode_result(svc_call(60,[pcm.as_ptr() as u64,pcm.len() as u64,0,0])).map(|_|())
+pub fn audio_play_period(pcm: &[u8]) -> Result<(), SysError> {
+    decode_result(svc_call(60, [pcm.as_ptr() as u64, pcm.len() as u64, 0, 0])).map(|_| ())
 }
-pub fn audio_stop()->Result<(),SysError>{decode_result(svc_call(61,[0,0,0,0])).map(|_|())}
+pub fn audio_stop() -> Result<(), SysError> {
+    decode_result(svc_call(61, [0, 0, 0, 0])).map(|_| ())
+}
 
 /// Query the negotiated VirtIO-GPU 3D contract (syscall 62; CAP_DISPLAY).
-pub fn gpu3d_info()->Result<zero_abi::gpu::Gpu3dInfo,SysError>{
-    let mut info=zero_abi::gpu::Gpu3dInfo::default();
-    decode_result(svc_call(62,[&mut info as *mut _ as u64,0,0,0]))?;
+pub fn gpu3d_info() -> Result<zero_abi::gpu::Gpu3dInfo, SysError> {
+    let mut info = zero_abi::gpu::Gpu3dInfo::default();
+    decode_result(svc_call(62, [&mut info as *mut _ as u64, 0, 0, 0]))?;
     Ok(info)
 }
-pub fn gpu3d_context_create(capset_id:u32)->Result<u32,SysError>{decode_result(svc_call(63,[capset_id as u64,0,0,0])).map(|v|v as u32)}
-pub fn gpu3d_context_destroy(ctx:u32)->Result<(),SysError>{decode_result(svc_call(64,[ctx as u64,0,0,0])).map(|_|())}
-pub fn gpu3d_resource_create(desc:&zero_abi::gpu::Gpu3dResourceDesc)->Result<u32,SysError>{decode_result(svc_call(65,[desc as *const _ as u64,0,0,0])).map(|v|v as u32)}
-pub fn gpu3d_resource_destroy(id:u32)->Result<(),SysError>{decode_result(svc_call(66,[id as u64,0,0,0])).map(|_|())}
-pub fn gpu3d_context_attach(ctx:u32,id:u32)->Result<(),SysError>{decode_result(svc_call(67,[ctx as u64,id as u64,0,0])).map(|_|())}
-pub fn gpu3d_submit(ctx:u32,stream:&[u8])->Result<(),SysError>{decode_result(svc_call(68,[ctx as u64,stream.as_ptr() as u64,stream.len() as u64,0])).map(|_|())}
-pub fn gpu3d_readback(id:u32,out:&mut[u8])->Result<usize,SysError>{decode_result(svc_call(69,[id as u64,out.as_mut_ptr() as u64,out.len() as u64,0])).map(|v|v as usize)}
-pub fn gpu3d_get_capset(capset_id:u32,version:u32,out:&mut[u8])->Result<usize,SysError>{decode_result(svc_call(70,[capset_id as u64,version as u64,out.as_mut_ptr() as u64,out.len() as u64])).map(|v|v as usize)}
+pub fn gpu3d_context_create(capset_id: u32) -> Result<u32, SysError> {
+    decode_result(svc_call(63, [capset_id as u64, 0, 0, 0])).map(|v| v as u32)
+}
+pub fn gpu3d_context_destroy(ctx: u32) -> Result<(), SysError> {
+    decode_result(svc_call(64, [ctx as u64, 0, 0, 0])).map(|_| ())
+}
+pub fn gpu3d_resource_create(desc: &zero_abi::gpu::Gpu3dResourceDesc) -> Result<u32, SysError> {
+    decode_result(svc_call(65, [desc as *const _ as u64, 0, 0, 0])).map(|v| v as u32)
+}
+pub fn gpu3d_resource_destroy(id: u32) -> Result<(), SysError> {
+    decode_result(svc_call(66, [id as u64, 0, 0, 0])).map(|_| ())
+}
+pub fn gpu3d_context_attach(ctx: u32, id: u32) -> Result<(), SysError> {
+    decode_result(svc_call(67, [ctx as u64, id as u64, 0, 0])).map(|_| ())
+}
+pub fn gpu3d_submit(ctx: u32, stream: &[u8]) -> Result<(), SysError> {
+    decode_result(svc_call(
+        68,
+        [ctx as u64, stream.as_ptr() as u64, stream.len() as u64, 0],
+    ))
+    .map(|_| ())
+}
+pub fn gpu3d_readback(id: u32, out: &mut [u8]) -> Result<usize, SysError> {
+    decode_result(svc_call(
+        69,
+        [id as u64, out.as_mut_ptr() as u64, out.len() as u64, 0],
+    ))
+    .map(|v| v as usize)
+}
+pub fn gpu3d_get_capset(capset_id: u32, version: u32, out: &mut [u8]) -> Result<usize, SysError> {
+    decode_result(svc_call(
+        70,
+        [
+            capset_id as u64,
+            version as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        ],
+    ))
+    .map(|v| v as usize)
+}
 
 /// 驱动信息记录（`DriverInfo` 系统调用回填的投影格式，
 /// 与内核 `syscalls.rs::write_driver_info` 输出布局一致）。
@@ -477,7 +527,7 @@ pub fn driver_info(index: u32) -> Result<DriverInfo, SysError> {
 /// MMIO 租约描述（映射成功后返回）。
 #[derive(Copy, Clone, Debug)]
 pub struct MmioRegion {
-    /// 寄存器区基地址（物理地址）。
+    /// Capability-gated user virtual address of the mapped register window.
     pub base: u64,
     /// 寄存器区长度。
     pub len: u64,
@@ -485,8 +535,9 @@ pub struct MmioRegion {
 
 /// 申请第 `index` 个驱动的 MMIO 租约（号位 18）。
 ///
-/// **仅特权进程**（引导期内核登记的服务）允许；普通进程返回
-/// `Err(PermissionDenied)`。成功后返回区域信息，此后才能合法访问。
+/// Requires CAP_MMIO. Success installs Device-nGnRE pages into the caller's
+/// address space and returns their EL0 virtual range; the physical BAR stays an
+/// inventory detail and is never directly dereferenced by EL0.
 pub fn mmio_map(index: u32) -> Result<MmioRegion, SysError> {
     let mut info = [0u64; 2];
     let ret = svc_call(18, [index as u64, info.as_mut_ptr() as u64, 0, 0]);
@@ -844,25 +895,33 @@ impl UserMutex {
         }
     }
 
-    /// 加锁：快路径 CAS；竞争时置 CONTENDED 并 futex 睡眠。
+    /// 加锁：快路径 CAS 0→1；一旦进入竞争慢路径，获得锁的线程保持
+    /// word=2（CONTENDED）而不是降回 1。这样它 unlock 时一定 wake 下一
+    /// 个 waiter，直到等待链耗尽。旧实现 wake 后递归走 0→1，会把
+    /// “还有其它 waiter”信息抹掉：三线程 SMP 下第一个被唤醒者解锁时
+    /// 不再 FutexWake，剩余线程永久睡眠。
     pub fn lock(&self) {
-        match self.word.compare_exchange(
-            MUTEX_UNLOCKED,
-            MUTEX_LOCKED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            Err(_) => {
-                // 已有人持锁：标记 CONTENDED（保证 unlock 时会 wake），
-                // 再睡到被唤醒后重试快路径。
-                if self.word.swap(MUTEX_CONTENDED, Ordering::Acquire) != MUTEX_UNLOCKED {
-                    while self.word.load(Ordering::Relaxed) == MUTEX_CONTENDED {
-                        let _ = futex_wait_raw(self.word.as_ptr() as usize, MUTEX_CONTENDED);
-                    }
-                }
-                // 醒来：重试整体 lock
-                self.lock();
+        if self
+            .word
+            .compare_exchange(
+                MUTEX_UNLOCKED,
+                MUTEX_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return;
+        }
+
+        loop {
+            // swap(2) 原子完成两件事：若前值非0则维持“有竞争者”标记；
+            // 若前值恰为0，则本线程直接以 state=2 获得锁，保留 wake 链。
+            if self.word.swap(MUTEX_CONTENDED, Ordering::Acquire) == MUTEX_UNLOCKED {
+                return;
+            }
+            while self.word.load(Ordering::Relaxed) == MUTEX_CONTENDED {
+                let _ = futex_wait_raw(self.word.as_ptr() as usize, MUTEX_CONTENDED);
             }
         }
     }
@@ -872,6 +931,38 @@ impl UserMutex {
         if self.word.swap(MUTEX_UNLOCKED, Ordering::Release) == MUTEX_CONTENDED {
             let _ = futex_wake(self.word.as_ptr() as usize, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_mutex_state_tests {
+    use super::*;
+
+    #[test]
+    fn contended_successor_keeps_state_two_and_chains_wakeup() {
+        let word = AtomicU32::new(MUTEX_LOCKED);
+        // Two contenders both advertise contention while the original owner runs.
+        assert_eq!(word.swap(MUTEX_CONTENDED, Ordering::Acquire), MUTEX_LOCKED);
+        assert_eq!(
+            word.swap(MUTEX_CONTENDED, Ordering::Acquire),
+            MUTEX_CONTENDED
+        );
+        // Original owner must observe 2 and therefore wake one waiter.
+        assert_eq!(
+            word.swap(MUTEX_UNLOCKED, Ordering::Release),
+            MUTEX_CONTENDED
+        );
+        // Woken waiter acquires through the slow path and deliberately leaves 2.
+        assert_eq!(
+            word.swap(MUTEX_CONTENDED, Ordering::Acquire),
+            MUTEX_UNLOCKED
+        );
+        assert_eq!(word.load(Ordering::Relaxed), MUTEX_CONTENDED);
+        // Its unlock must still observe 2, guaranteeing wake chaining.
+        assert_eq!(
+            word.swap(MUTEX_UNLOCKED, Ordering::Release),
+            MUTEX_CONTENDED
+        );
     }
 }
 

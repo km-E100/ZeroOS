@@ -5,10 +5,9 @@ use alloc::{string::String, vec, vec::Vec};
 use core::{fmt, num::NonZeroU32};
 use embedded_io::{ErrorKind, ErrorType, Read, Write};
 use embedded_tls::{
-    blocking::TlsConnection,
-    pki::CertVerifier as RustPkiCertVerifier,
-    Aes128GcmSha256, Certificate, CertificateEntryRef, CertificateRef, CertificateVerifyRef,
-    CryptoProvider, TlsClock, TlsConfig, TlsContext, TlsError, TlsVerifier,
+    blocking::TlsConnection, pki::CertVerifier as RustPkiCertVerifier, Aes128GcmSha256,
+    Certificate, CertificateEntryRef, CertificateRef, CertificateVerifyRef, CryptoProvider,
+    TlsClock, TlsConfig, TlsContext, TlsError, TlsVerifier,
 };
 use p256::ecdsa::DerSignature;
 use rand_core::{CryptoRng, Error as RandError, RngCore};
@@ -60,7 +59,12 @@ impl TcpStream {
         };
         for _ in 0..TCP_TIMEOUT_TICKS {
             match libnetclient::tcp_state(h) {
-                Ok(2) => return Ok(Self { handle: h, bulk: libnetclient::BulkBuffer::new().ok() }),
+                Ok(2) => {
+                    return Ok(Self {
+                        handle: h,
+                        bulk: libnetclient::BulkBuffer::new().ok(),
+                    })
+                }
                 Ok(3) => return Err(Error::Network),
                 Ok(_) | Err(libnetclient::Error::Again) => {
                     let _ = userlib::sleep_ticks(1);
@@ -175,7 +179,9 @@ struct IpVerifiedProvider<'a> {
 impl CryptoProvider for IpVerifiedProvider<'_> {
     type CipherSuite = Aes128GcmSha256;
     type Signature = DerSignature;
-    fn rng(&mut self) -> impl embedded_tls::CryptoRngCore { &mut self.rng }
+    fn rng(&mut self) -> impl embedded_tls::CryptoRngCore {
+        &mut self.rng
+    }
     fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Aes128GcmSha256>, TlsError> {
         Ok(&mut self.verifier)
     }
@@ -190,7 +196,10 @@ struct IpSanVerifier<'a> {
 }
 impl<'a> IpSanVerifier<'a> {
     fn new(expected: [u8; 4], ca: &'a [u8]) -> Self {
-        Self { expected, inner: RustPkiCertVerifier::new(Certificate::X509(ca)) }
+        Self {
+            expected,
+            inner: RustPkiCertVerifier::new(Certificate::X509(ca)),
+        }
     }
 }
 impl TlsVerifier<Aes128GcmSha256> for IpSanVerifier<'_> {
@@ -222,16 +231,27 @@ impl TlsVerifier<Aes128GcmSha256> for IpSanVerifier<'_> {
 }
 
 fn der_len(bytes: &[u8], off: &mut usize) -> Option<usize> {
-    let first = *bytes.get(*off)?; *off += 1;
-    if first & 0x80 == 0 { return Some(first as usize); }
+    let first = *bytes.get(*off)?;
+    *off += 1;
+    if first & 0x80 == 0 {
+        return Some(first as usize);
+    }
     let n = (first & 0x7f) as usize;
-    if n == 0 || n > core::mem::size_of::<usize>() { return None; }
+    if n == 0 || n > core::mem::size_of::<usize>() {
+        return None;
+    }
     let mut len = 0usize;
-    for _ in 0..n { len = len.checked_mul(256)?.checked_add(*bytes.get(*off)? as usize)?; *off += 1; }
+    for _ in 0..n {
+        len = len
+            .checked_mul(256)?
+            .checked_add(*bytes.get(*off)? as usize)?;
+        *off += 1;
+    }
     Some(len)
 }
 fn der_tlv<'a>(bytes: &'a [u8], off: &mut usize) -> Option<(u8, &'a [u8])> {
-    let tag = *bytes.get(*off)?; *off += 1;
+    let tag = *bytes.get(*off)?;
+    *off += 1;
     let len = der_len(bytes, off)?;
     let end = off.checked_add(len)?;
     let content = bytes.get(*off..end)?;
@@ -239,56 +259,88 @@ fn der_tlv<'a>(bytes: &'a [u8], off: &mut usize) -> Option<(u8, &'a [u8])> {
     Some((tag, content))
 }
 fn general_names_has_ipv4(bytes: &[u8], expected: [u8; 4]) -> bool {
-    let mut o=0; let Some((0x30, seq))=der_tlv(bytes,&mut o) else{return false};
-    let mut i=0;
-    while i<seq.len(){
-        let Some((tag,c))=der_tlv(seq,&mut i) else{return false};
-        if tag==0x87 && c==expected { return true; } // [7] iPAddress, raw network bytes
+    let mut o = 0;
+    let Some((0x30, seq)) = der_tlv(bytes, &mut o) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < seq.len() {
+        let Some((tag, c)) = der_tlv(seq, &mut i) else {
+            return false;
+        };
+        if tag == 0x87 && c == expected {
+            return true;
+        } // [7] iPAddress, raw network bytes
     }
     false
 }
-fn scan_for_san(bytes: &[u8], expected: [u8;4], depth:u8)->bool{
-    if depth>16{return false}
-    let mut o=0;
-    while o<bytes.len(){
-        let before=o; let Some((tag,c))=der_tlv(bytes,&mut o) else{return false};
-        if tag==0x30 {
+fn scan_for_san(bytes: &[u8], expected: [u8; 4], depth: u8) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let mut o = 0;
+    while o < bytes.len() {
+        let before = o;
+        let Some((tag, c)) = der_tlv(bytes, &mut o) else {
+            return false;
+        };
+        if tag == 0x30 {
             // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN OPTIONAL,
             //                          extnValue OCTET STRING }
-            let mut e=0;
-            if let Some((0x06,oid))=der_tlv(c,&mut e) {
-                if oid==[0x55,0x1d,0x11] { // 2.5.29.17 subjectAltName
-                    if let Some((0x01,_))=peek_tlv(c,e){ let _=der_tlv(c,&mut e); }
-                    if let Some((0x04,octets))=der_tlv(c,&mut e) {
-                        if general_names_has_ipv4(octets,expected){return true}
+            let mut e = 0;
+            if let Some((0x06, oid)) = der_tlv(c, &mut e) {
+                if oid == [0x55, 0x1d, 0x11] {
+                    // 2.5.29.17 subjectAltName
+                    if let Some((0x01, _)) = peek_tlv(c, e) {
+                        let _ = der_tlv(c, &mut e);
+                    }
+                    if let Some((0x04, octets)) = der_tlv(c, &mut e) {
+                        if general_names_has_ipv4(octets, expected) {
+                            return true;
+                        }
                     }
                 }
             }
         }
-        if tag & 0x20 != 0 && scan_for_san(c,expected,depth+1){return true}
-        if o<=before{return false}
+        if tag & 0x20 != 0 && scan_for_san(c, expected, depth + 1) {
+            return true;
+        }
+        if o <= before {
+            return false;
+        }
     }
     false
 }
-fn peek_tlv<'a>(bytes:&'a[u8], mut off:usize)->Option<(u8,&'a[u8])>{der_tlv(bytes,&mut off)}
-fn certificate_has_ipv4_san(der:&[u8],expected:[u8;4])->bool{scan_for_san(der,expected,0)}
+fn peek_tlv<'a>(bytes: &'a [u8], mut off: usize) -> Option<(u8, &'a [u8])> {
+    der_tlv(bytes, &mut off)
+}
+fn certificate_has_ipv4_san(der: &[u8], expected: [u8; 4]) -> bool {
+    scan_for_san(der, expected, 0)
+}
 
 static DNS_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x5a00);
 
 fn parse_ipv4_literal(s: &str) -> Option<[u8; 4]> {
-    let mut out=[0u8;4]; let mut i=0usize;
-    for part in s.split('.') { if i>=4{return None}; out[i]=part.parse::<u8>().ok()?; i+=1; }
-    (i==4).then_some(out)
+    let mut out = [0u8; 4];
+    let mut i = 0usize;
+    for part in s.split('.') {
+        if i >= 4 {
+            return None;
+        };
+        out[i] = part.parse::<u8>().ok()?;
+        i += 1;
+    }
+    (i == 4).then_some(out)
 }
 
 pub fn resolve_a(host: &str) -> Result<[u8; 4], Error> {
     validate_hostname(host)?;
-    if let Some(ip)=parse_ipv4_literal(host){ return Ok(ip); }
+    if let Some(ip) = parse_ipv4_literal(host) {
+        return Ok(ip);
+    }
     let status = loop {
         match libnetclient::status() {
-            Ok(s) => {
-                break s
-            },
+            Ok(s) => break s,
             Err(libnetclient::Error::Again) => {
                 let _ = userlib::sleep_ticks(1);
             }
@@ -422,30 +474,51 @@ pub fn http_get(host: &str, path: &str) -> Result<HttpResponse, Error> {
 }
 
 pub fn https_get(host: &str, path: &str) -> Result<HttpResponse, Error> {
-    https_get_with_ca(host,443,path,ROOT_CA_DER)
+    https_get_with_ca(host, 443, path, ROOT_CA_DER)
 }
 
-pub fn https_get_with_ca(host:&str,port:u16,path:&str,ca_der:&[u8])->Result<HttpResponse,Error>{
-    let ip=resolve_a(host)?;
-    let tcp=TcpStream::connect(ip,port)?;
-    let mut rb=vec![0u8;16640]; let mut wb=vec![0u8;4096];
-    let cfg=TlsConfig::new().with_server_name(host).enable_rsa_signatures();
-    let req=request(host,path);
+pub fn https_get_with_ca(
+    host: &str,
+    port: u16,
+    path: &str,
+    ca_der: &[u8],
+) -> Result<HttpResponse, Error> {
+    let ip = resolve_a(host)?;
+    let tcp = TcpStream::connect(ip, port)?;
+    let mut rb = vec![0u8; 16640];
+    let mut wb = vec![0u8; 4096];
+    let cfg = TlsConfig::new()
+        .with_server_name(host)
+        .enable_rsa_signatures();
+    let req = request(host, path);
     if parse_ipv4_literal(host).is_some() {
         // rustpki in embedded-tls 0.19 only extracts dNSName SANs. For an
         // IP-literal repository use the webpki verifier, which validates an
         // actual iPAddress SAN and still checks CA, validity and CertificateVerify.
-        let provider=IpVerifiedProvider{rng:ZeroRng,verifier:IpSanVerifier::new(ip,ca_der)};
-        let mut tls:TlsConnection<'_,_,Aes128GcmSha256>=TlsConnection::new(tcp,&mut rb,&mut wb);
-        tls.open(TlsContext::new(&cfg,provider)).map_err(|_|Error::Tls)?;
-        tls.write_all(req.as_bytes()).map_err(|_|Error::Tls)?; tls.flush().map_err(|_|Error::Tls)?;
-        read_http(&mut tls)
+        let provider = IpVerifiedProvider {
+            rng: ZeroRng,
+            verifier: IpSanVerifier::new(ip, ca_der),
+        };
+        let mut tls: TlsConnection<'_, _, Aes128GcmSha256> =
+            TlsConnection::new(tcp, &mut rb, &mut wb);
+        tls.open(TlsContext::new(&cfg, provider))
+            .map_err(|_| Error::Tls)?;
+        tls.write_all(req.as_bytes()).map_err(|_| Error::Tls)?;
+        tls.flush().map_err(|_| Error::Tls)?;
+        let result = read_http_tls(&mut tls);
+        result
     } else {
-        let provider=VerifiedProvider{rng:ZeroRng,verifier:RustPkiCertVerifier::new(Certificate::X509(ca_der))};
-        let mut tls:TlsConnection<'_,_,Aes128GcmSha256>=TlsConnection::new(tcp,&mut rb,&mut wb);
-        tls.open(TlsContext::new(&cfg,provider)).map_err(|_|Error::Tls)?;
-        tls.write_all(req.as_bytes()).map_err(|_|Error::Tls)?; tls.flush().map_err(|_|Error::Tls)?;
-        read_http(&mut tls)
+        let provider = VerifiedProvider {
+            rng: ZeroRng,
+            verifier: RustPkiCertVerifier::new(Certificate::X509(ca_der)),
+        };
+        let mut tls: TlsConnection<'_, _, Aes128GcmSha256> =
+            TlsConnection::new(tcp, &mut rb, &mut wb);
+        tls.open(TlsContext::new(&cfg, provider))
+            .map_err(|_| Error::Tls)?;
+        tls.write_all(req.as_bytes()).map_err(|_| Error::Tls)?;
+        tls.flush().map_err(|_| Error::Tls)?;
+        read_http_tls(&mut tls)
     }
 }
 
@@ -455,6 +528,34 @@ fn request(host: &str, path: &str) -> String {
     let _=write!(s,"GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: ZeroOS/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",if path.is_empty(){"/"}else{path},host);
     s
 }
+fn read_http_tls<R>(r: &mut R) -> Result<HttpResponse, Error>
+where
+    R: Read<Error = TlsError>,
+{
+    let mut raw = Vec::new();
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        if http_message_complete(&raw)? {
+            return parse_http(&raw);
+        }
+        match r.read(&mut tmp) {
+            Ok(0) | Err(TlsError::ConnectionClosed) => break,
+            Ok(n) => {
+                if raw.len() + n > MAX_HTTP_RESPONSE {
+                    return Err(Error::TooLarge);
+                }
+                raw.extend_from_slice(&tmp[..n]);
+            }
+            Err(_) => return Err(Error::Network),
+        }
+    }
+    // HTTP/1.0 and HTTP/1.1 `Connection: close` responses legitimately use
+    // transport close as message framing. embedded-tls reports close_notify (and
+    // an underlying EOF) as ConnectionClosed; at that point the bytes already
+    // authenticated by TLS are the complete close-delimited response.
+    parse_http(&raw)
+}
+
 fn read_http<R: Read>(r: &mut R) -> Result<HttpResponse, Error> {
     let mut raw = Vec::new();
     let mut tmp = [0u8; 16 * 1024];
@@ -487,8 +588,13 @@ fn http_message_complete(raw: &[u8]) -> Result<bool, Error> {
     let mut content_len = None;
     let mut chunked = false;
     for line in head.split(|b| *b == b'\n') {
-        let line = core::str::from_utf8(line).map_err(|_| Error::Protocol)?.trim();
-        if let Some(v) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+        let line = core::str::from_utf8(line)
+            .map_err(|_| Error::Protocol)?
+            .trim();
+        if let Some(v) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+        {
             content_len = Some(v.trim().parse::<usize>().map_err(|_| Error::Protocol)?);
         }
         if line.eq_ignore_ascii_case("Transfer-Encoding: chunked") {
@@ -507,16 +613,24 @@ fn http_message_complete(raw: &[u8]) -> Result<bool, Error> {
 
 fn chunked_complete(mut b: &[u8]) -> bool {
     loop {
-        let Some(e) = b.windows(2).position(|w| w == b"\r\n") else { return false };
-        let Ok(line) = core::str::from_utf8(&b[..e]) else { return false };
-        let Ok(n) = usize::from_str_radix(line.split(';').next().unwrap_or(""), 16) else { return false };
+        let Some(e) = b.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let Ok(line) = core::str::from_utf8(&b[..e]) else {
+            return false;
+        };
+        let Ok(n) = usize::from_str_radix(line.split(';').next().unwrap_or(""), 16) else {
+            return false;
+        };
         b = &b[e + 2..];
         if n == 0 {
             // RFC 9112 allows trailers terminated by an empty line. Accept the
             // common no-trailer form and any complete trailer block.
             return b.starts_with(b"\r\n") || b.windows(4).any(|w| w == b"\r\n\r\n");
         }
-        if b.len() < n + 2 || &b[n..n + 2] != b"\r\n" { return false; }
+        if b.len() < n + 2 || &b[n..n + 2] != b"\r\n" {
+            return false;
+        }
         b = &b[n + 2..];
     }
 }
@@ -597,25 +711,29 @@ mod tests {
     #[test]
     fn parses_real_qemu_slirp_dns_answer() {
         let b: &[u8] = &[
-            0x5a,0x00,0x85,0x80,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x00,
-            0x10,b'v',b'a',b'l',b'i',b'd',b'-',b'i',b's',b'r',b'g',b'r',b'o',b'o',b't',b'x',b'1',
-            0x0b,b'l',b'e',b't',b's',b'e',b'n',b'c',b'r',b'y',b'p',b't',0x03,b'o',b'r',b'g',0x00,
-            0x00,0x01,0x00,0x01,0xc0,0x0c,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x04,
-            0xc6,0x12,0x01,0x9e
+            0x5a, 0x00, 0x85, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, b'v',
+            b'a', b'l', b'i', b'd', b'-', b'i', b's', b'r', b'g', b'r', b'o', b'o', b't', b'x',
+            b'1', 0x0b, b'l', b'e', b't', b's', b'e', b'n', b'c', b'r', b'y', b'p', b't', 0x03,
+            b'o', b'r', b'g', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0xc6, 0x12, 0x01, 0x9e,
         ];
         assert_eq!(parse_dns_a(0x5a00, b), Some([198, 18, 1, 158]));
     }
     #[test]
-    #[test]
     fn strict_ip_san_matches_real_dev_certificate() {
-        let cert=include_bytes!("../../../tools/testkeys/zeropkg-repo-server.cert.der");
-        assert!(certificate_has_ipv4_san(cert,[10,0,2,2]));
-        assert!(!certificate_has_ipv4_san(cert,[10,0,2,3]));
+        let cert = include_bytes!("../../../tools/testkeys/zeropkg-repo-server.cert.der");
+        assert!(certificate_has_ipv4_san(cert, [10, 0, 2, 2]));
+        assert!(!certificate_has_ipv4_san(cert, [10, 0, 2, 3]));
     }
+    #[test]
     fn http_plain_and_chunked() {
         let r = parse_http(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(&r.body, b"ok");
+        let r =
+            parse_http(b"HTTP/1.0 200 ok\r\nContent-type: text/plain\r\n\r\nclose-body").unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(&r.body, b"close-body");
         let r = parse_http(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
         )
@@ -623,6 +741,9 @@ mod tests {
         assert_eq!(&r.body, b"ok");
         assert!(http_message_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap());
         assert!(!http_message_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok").unwrap());
-        assert!(http_message_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n").unwrap());
+        assert!(http_message_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+        )
+        .unwrap());
     }
 }

@@ -57,6 +57,22 @@ pub fn receive(caller: ProcessId, chan: u32) -> Result<(ProcessId, Message), Ipc
     CHANNEL_TABLE.lock().receive(caller, chan)
 }
 
+/// Atomically receive an eligible envelope or register `caller` as a waiter.
+///
+/// This is the only safe primitive for blocking receive on SMP. A split
+/// `receive() -> Empty; register_waiter()` sequence has a lost-wakeup window:
+/// another CPU can enqueue the response between the two calls, observe no
+/// waiter, and leave the receiver sleeping forever with a message already in
+/// the queue. Holding CHANNEL_TABLE across both decisions closes that window.
+pub fn receive_or_register_waiter(
+    caller: ProcessId,
+    chan: u32,
+) -> Result<Option<(ProcessId, Message)>, IpcError> {
+    CHANNEL_TABLE
+        .lock()
+        .receive_or_register_waiter(caller, chan)
+}
+
 #[derive(Debug)]
 pub enum IpcError {
     NotReady,
@@ -142,6 +158,37 @@ impl ChannelTable {
         channel.ensure_groups(channel.rx_groups, caller)?;
         let env = channel.queue.pop_for(caller)?;
         Ok((env.sender, env.message))
+    }
+
+    /// Atomic blocking-receive decision: dequeue now if possible, otherwise
+    /// install the waiter before releasing CHANNEL_TABLE.
+    fn receive_or_register_waiter(
+        &mut self,
+        caller: ProcessId,
+        chan: u32,
+    ) -> Result<Option<(ProcessId, Message)>, IpcError> {
+        let channel = self
+            .channels
+            .iter_mut()
+            .find(|c| c.in_use && c.id == chan)
+            .ok_or(IpcError::Invalid)?;
+        channel.ensure_access(caller)?;
+        channel.ensure_groups(channel.rx_groups, caller)?;
+        match channel.queue.pop_for(caller) {
+            Ok(env) => Ok(Some((env.sender, env.message))),
+            Err(IpcError::Empty) => {
+                if channel.waiters.iter().any(|w| *w == Some(caller)) {
+                    return Ok(None);
+                }
+                if let Some(slot) = channel.waiters.iter_mut().find(|w| w.is_none()) {
+                    *slot = Some(caller);
+                    Ok(None)
+                } else {
+                    Err(IpcError::ChannelBusy)
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// 登记接收等待者（阻塞式接收的挂起点）。容量 4：超出返回 Busy，
@@ -397,6 +444,41 @@ mod tests {
             assert_eq!(q.pop().unwrap().message.code, n);
         }
         assert!(matches!(q.pop(), Err(IpcError::Empty)));
+    }
+
+    #[test]
+    fn atomic_receive_register_closes_prequeued_wakeup_gap() {
+        let mut t = ChannelTable::new();
+        t.create(ChannelDesc::open(0x2a0, 4), None).unwrap();
+        let alice = ProcessId::new(7);
+        let bob = ProcessId::new(8);
+        let m = msg(99);
+        // Response lands before the would-be receiver registers. The atomic
+        // primitive must consume it immediately and leave no stale waiter.
+        t.send(bob, Some(alice), 0x2a0, m).unwrap();
+        let got = t.receive_or_register_waiter(alice, 0x2a0).unwrap();
+        assert_eq!(got.unwrap().1.code, 99);
+        let c = t
+            .channels
+            .iter()
+            .find(|c| c.in_use && c.id == 0x2a0)
+            .unwrap();
+        assert!(!c.waiters.iter().any(|w| *w == Some(alice)));
+    }
+
+    #[test]
+    fn atomic_receive_register_wakes_after_registration() {
+        let mut t = ChannelTable::new();
+        t.create(ChannelDesc::open(0x2a1, 4), None).unwrap();
+        let alice = ProcessId::new(7);
+        let bob = ProcessId::new(8);
+        assert!(t
+            .receive_or_register_waiter(alice, 0x2a1)
+            .unwrap()
+            .is_none());
+        let wake = t.send(bob, Some(alice), 0x2a1, msg(42)).unwrap();
+        assert_eq!(wake, Some(alice));
+        assert_eq!(t.receive(alice, 0x2a1).unwrap().1.code, 42);
     }
 
     #[test]

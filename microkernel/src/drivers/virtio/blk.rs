@@ -341,13 +341,19 @@ fn wait_idle() -> Result<(), BlockError> {
     for _ in 0..MAX_POLL_SPINS {
         {
             let mut state = STATE.lock();
-            if !state.inflight { return Ok(()); }
+            if !state.inflight {
+                return Ok(());
+            }
             // Do not make forward progress depend on an IRQ arriving while the
             // caller is runnable; harvest a delayed used-ring element here too.
             poll_completion_locked(&mut state);
-            if !state.inflight { return Ok(()); }
+            if !state.inflight {
+                return Ok(());
+            }
         }
-        if crate::time::monotonic_ns() >= deadline { break; }
+        if crate::time::monotonic_ns() >= deadline {
+            break;
+        }
         core::hint::spin_loop();
     }
     warn!("virtio-blk: 上一次 I/O 在 2s deadline 内未完成，放弃本次请求");
@@ -366,12 +372,18 @@ fn wait_for_completion() -> Result<usize, BlockError> {
         {
             let mut state = STATE.lock();
             // IRQ 路径已完成：直接取缓存结果。
-            if !state.inflight { return finish_result(&state); }
+            if !state.inflight {
+                return finish_result(&state);
+            }
             // 主动轮询：取 used 环 + 应答中断原因。
             poll_completion_locked(&mut state);
-            if !state.inflight { return finish_result(&state); }
+            if !state.inflight {
+                return finish_result(&state);
+            }
         }
-        if crate::time::monotonic_ns() >= deadline { break; }
+        if crate::time::monotonic_ns() >= deadline {
+            break;
+        }
         core::hint::spin_loop();
     }
     warn!("virtio-blk: 完成等待超过 2s deadline，中止当前 I/O");

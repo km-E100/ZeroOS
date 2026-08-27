@@ -141,28 +141,43 @@ pub fn tcp_recv(h: u32, out: &mut [u8]) -> Result<Option<usize>, Error> {
     Ok(Some(actual))
 }
 
-
 pub struct BulkBuffer {
     shm: userlib::SharedMemory,
 }
 impl BulkBuffer {
     pub fn new() -> Result<Self, Error> {
-        if NETD_PID.load(Ordering::Acquire) == 0 { return Err(Error::Protocol); }
+        if NETD_PID.load(Ordering::Acquire) == 0 {
+            return Err(Error::Protocol);
+        }
         let shm = userlib::shm_create(BULK_SIZE).map_err(Error::Sys)?;
         Ok(Self { shm })
     }
-    pub fn capacity(&self) -> usize { self.shm.len }
-    pub fn handle(&self) -> u32 { self.shm.handle }
+    pub fn capacity(&self) -> usize {
+        self.shm.len
+    }
+    pub fn handle(&self) -> u32 {
+        self.shm.handle
+    }
 }
 impl Drop for BulkBuffer {
-    fn drop(&mut self) { let _ = userlib::shm_release(self.shm.handle); }
+    fn drop(&mut self) {
+        let _ = userlib::shm_release(self.shm.handle);
+    }
 }
 
-pub fn tcp_recv_bulk(h: u32, bulk: &mut BulkBuffer, out: &mut [u8]) -> Result<Option<usize>, Error> {
+pub fn tcp_recv_bulk(
+    h: u32,
+    bulk: &mut BulkBuffer,
+    out: &mut [u8],
+) -> Result<Option<usize>, Error> {
     let max = out.len().min(bulk.shm.len).min(u32::MAX as usize);
-    if max == 0 { return Ok(Some(0)); }
+    if max == 0 {
+        return Ok(Some(0));
+    }
     let pid = NETD_PID.load(Ordering::Acquire);
-    if pid == 0 { return Err(Error::Protocol); }
+    if pid == 0 {
+        return Err(Error::Protocol);
+    }
     userlib::shm_grant(bulk.shm.handle, pid).map_err(Error::Sys)?;
     let mut p = [0u8; 12];
     p[0..4].copy_from_slice(&h.to_le_bytes());
@@ -173,9 +188,14 @@ pub fn tcp_recv_bulk(h: u32, bulk: &mut BulkBuffer, out: &mut [u8]) -> Result<Op
         Err(Error::Again) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let actual = u32::from_le_bytes(r.payload[4..8].try_into().map_err(|_| Error::Protocol)?) as usize;
-    if actual > max { return Err(Error::Protocol); }
-    unsafe { core::ptr::copy_nonoverlapping(bulk.shm.ptr, out.as_mut_ptr(), actual); }
+    let actual =
+        u32::from_le_bytes(r.payload[4..8].try_into().map_err(|_| Error::Protocol)?) as usize;
+    if actual > max {
+        return Err(Error::Protocol);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bulk.shm.ptr, out.as_mut_ptr(), actual);
+    }
     Ok(Some(actual))
 }
 

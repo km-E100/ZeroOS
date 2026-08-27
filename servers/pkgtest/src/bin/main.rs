@@ -7,15 +7,23 @@ use core::panic::PanicInfo;
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     unsafe {
-        extern "C" { static mut __bss_start: u8; static mut __bss_end: u8; }
+        extern "C" {
+            static mut __bss_start: u8;
+            static mut __bss_end: u8;
+        }
         let mut p = &raw mut __bss_start as *mut u8;
         let end = &raw mut __bss_end as *mut u8;
-        while p < end { core::ptr::write_volatile(p, 0); p = p.add(1); }
+        while p < end {
+            core::ptr::write_volatile(p, 0);
+            p = p.add(1);
+        }
     }
     zero_pkgtest::server_main()
 }
 #[cfg(target_os = "none")]
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! { userlib::exit(97) }
+fn panic(_: &PanicInfo) -> ! {
+    userlib::exit(97)
+}
 #[cfg(not(target_os = "none"))]
 fn main() {}

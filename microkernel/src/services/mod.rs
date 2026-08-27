@@ -175,9 +175,19 @@ fn init_channels() {
         ChannelDesc::open(channels::WINDOW_RESP, 16),
         ChannelDesc::open(channels::NET_REQ, 32),
         ChannelDesc::open(channels::NET_RESP, 32),
-        ChannelDesc { id: channels::PKG_REQ, capacity: 8, tx_groups: zero_abi::cap::CAP_PKG_CLIENT, rx_groups: 0 },
+        ChannelDesc {
+            id: channels::PKG_REQ,
+            capacity: 8,
+            tx_groups: zero_abi::cap::CAP_PKG_CLIENT,
+            rx_groups: 0,
+        },
         ChannelDesc::open(channels::PKG_RESP, 8),
-        ChannelDesc { id: channels::AUDIO_REQ, capacity: 8, tx_groups: zero_abi::cap::CAP_AUDIO_CLIENT, rx_groups: 0 },
+        ChannelDesc {
+            id: channels::AUDIO_REQ,
+            capacity: 8,
+            tx_groups: zero_abi::cap::CAP_AUDIO_CLIENT,
+            rx_groups: 0,
+        },
         ChannelDesc::open(channels::AUDIO_RESP, 8),
     ];
 

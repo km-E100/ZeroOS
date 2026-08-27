@@ -36,6 +36,7 @@ impl AddressSpace {
     /// 见 `paging::destroy_user_address_space`：严禁释放 L1[KERNEL_SHARED_L1]
     /// 指向的内核 L2_1 表本体；进程退出时必须调用（remove_slot 已接好）。
     pub unsafe fn destroy(&self) {
+        crate::syscalls::on_address_space_destroy(self.ttbr0_phys());
         paging::destroy_user_address_space(&self.inner);
     }
 
@@ -51,6 +52,16 @@ impl AddressSpace {
         executable: bool,
     ) -> Result<(), MapError> {
         paging::map_user_phys_page(&mut self.inner, virt, phys, writable, executable)
+    }
+
+    /// Map a PCI/MMIO page as EL0 RW Device-nGnRE. The physical page is not
+    /// owned by the process and is therefore never freed by address-space teardown.
+    pub unsafe fn map_device_page(&mut self, virt: usize, phys: usize) -> Result<(), MapError> {
+        paging::map_user_device_page(&mut self.inner, virt, phys)
+    }
+
+    pub unsafe fn unmap_device_region(&self, start: usize, end: usize) -> usize {
+        paging::unmap_user_device_range(&self.inner, start, end)
     }
 
     /// brk 增长路径（号位 24）：为 `[start, end)`（页对齐）逐页分配零页并以

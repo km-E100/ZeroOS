@@ -2,6 +2,36 @@
 
 > 新会话先读本文件 + `git log --oneline` 接上进度。
 
+## 2026-08-27 · 第35～44刀：真机硬件链与可靠性收口（当前最高权威状态）
+
+> 第20～34刀全栈基线继续成立；本节记录其后的 PCIe/ITS/IOMMU/xHCI/NVMe、
+> 电源与生产级硬化，以及这轮真正解决的 SMP 调度/栈/futex 并发根因。
+
+### 最终总闸
+- 第35～40刀 QEMU 真设备专项：`scripts/hardware-acceptance.sh --no-build` **45/45 ALL PASS**。
+- 第41～44刀生产硬化专项：`scripts/hardening-acceptance.sh --no-build` **36/36 ALL PASS**；
+  shutdown/reboot（含 runner clean-exit）、双 root-port、4KiB NVMe、多 namespace、USB hub/hotplug/recovery 均有真设备路径证据。
+- 基础兼容矩阵：`scripts/acceptance.sh --no-build` **15/15 ALL PASS**。
+- 全仓质量闸：`tools/check.sh` **57/57，0 失败**（host、AArch64 bare-metal、PIC/KASLR、UEFI、单测、kernel build）。
+- SMP4 压力：`scripts/stress-loop.sh 3` **3 轮 × 6/6 + online=4 + zero fault**；每轮 QEMU 自身 rc=0。
+- 额外根因验证：owner/state 收口后连续 **20/20 SMP4 冷启动**无 `unknown sync`、ownership mismatch、panic。
+- 当前最终 ISO（2026-08-27 11:30:31）：SHA-256
+  `8cc3ced62264c6bf80d4f7250734d3ec6dbaa799e2ab3a44194db7c4e37f344f`；
+  `rootfs.bundle` SHA-256 `f4e6478ef018f5e3ec262b0cfaa7d3d016769b0564ac19c4d9201200ada8c46d`。
+
+### 本轮关键可靠性结案
+- **SMP4 随机 EC=0 真根因**并不是 AArch64 随机“不认识合法 B/RET”：
+  1. idle CPU 曾继续睡在最后一个进程的 `KERNEL_STACKS[slot]` 上，进程迁核后两 PE 会同时写同一内核栈；
+  2. yield/block/exit 曾在旧 PE 仍使用 process stack 时就发布 Runnable/Blocked/Zombie，允许新 PE 过早复用同一栈；
+  3. `ProcessState` 与独立 `FRAME_OWNER` 是双源真相，可观察到 `Runnable + old owner` 的非法组合。
+  现已改为 **per-CPU scheduler/idle stack + 离栈后再发布状态 + owner/state 在 PROCESS_TABLE 同锁原子迁移**。
+- **SMP FPU/NEON** 改为多核 eager save/load；副核显式安装 VBAR/CPACR/MAIR/TCR/SCTLR/TTBR；
+  nested EL1 异常切 per-CPU scratch TrapFrame；ELF/共享库可执行页补 AArch64 D-cache→I-cache 发布。
+- **futex/UserMutex SMP 死锁**双根因已修：FutexWait 在 futex 表锁内二次检查用户字，关闭 wake-before-register；
+  UserMutex 慢路径持有 state=2 维持 waiter wake chain。最终 SMP4 `mutextest` 三 worker 全退出，`counter=1500`。
+- **验收 runner** 也完成工程化：硬件矩阵显式 `-boot order=d`；stress 每轮独立盘并由 `Ctrl-A x` 让 QEMU 自退出，
+  不再产生 orphan QEMU/磁盘锁假失败；K41 reboot runner 同样不再泄漏后台 QEMU。
+
 ## 2026-08-26 · 第20～34刀：现代 OS 全栈闭环（当前权威状态）
 
 > 基线：第十九刀的 COW/TLBI、free-list、SMP、securityd、useralloc 与
@@ -144,8 +174,92 @@
 - 正常 launchd 自启：`blkdrv / fsd(zfsd) / securityd / inputd / windowserver / netd / pkgd / audiod`
   （service-controller/ipcrouter 若 blob/策略允许仍按 registry 管理）。
 - `webtest / pkgtest / pietest / dynapp / audiotest / gputest` 为**手动回归资产**，不会污染正常开机。
-- 结构性下一阶段已不再是“补基础 OS 功能”，而是真机平台：PCIe BAR/MSI/MSI-X → IOMMU/IORT → USB/xHCI → 电源管理；
-  AML 只在真机需求出现时开启。
+- 第35～44刀已把 PCIe/ITS/IOMMU/xHCI/NVMe/电源与生产硬化全部落地并验收；当前 STATUS **没有登记中的下一刀**。
+  AML 继续是“出现明确真机需求再立项”的按需能力，不属于未完成登记项。
+
+## 第35～40刀：✅ 已完成（2026-08-27 最终封板）
+
+### 第35刀 · PCIe Core
+- MCFG → ECAM → bus/device/function 枚举；Vendor/Device/Class/Subclass/ProgIF/multifunction；
+- PCI capability / PCIe extended capability；32/64-bit BAR 解析与 sizing；
+- bridge/root-port 最小枚举；BAR/MMIO 资源以 capability/lease 边界暴露给 EL0 driver。
+验收：QEMU `pci-testdev` + virtio-pci 可枚举，BAR 读写 PASS。
+
+### 第36刀 · GICv3 / ITS / MSI-X
+- GICv3 Redistributor / per-CPU GICR；LPI；ITS command queue；device/event ID；
+- PCI MSI / MSI-X capability、table/PBA、ITS doorbell 与 IRQ affinity。
+验收：`-machine virt,gic-version=3,its=on,msi=its` 下 PCI 设备 MSI-X 真中断，`-smp4` 回归全绿。
+
+### 第37刀 · VirtIO PCI Transport
+- VirtIO PCI common/notify/ISR/device config；modern feature negotiation；MSI-X queue vector；
+- 现有 blk/net/gpu/sound device logic 复用，不复制一套 driver。
+验收：QEMU 只挂 `virtio-*-pci`，现有块/网/图形/音频链继续工作。
+
+### 第38刀 · IOMMU / IORT / SMMUv3
+- IORT parser；SMMUv3 discovery；stream ID/domain/IOVA allocator/map/unmap/fault；
+- DMA object 与 secure SHM/capability 对齐，设备不能直接拿任意 PA。
+验收：`iommu=smmuv3` + `iommu-testdev`，合法 IOVA DMA PASS，未映射 IOVA 触发 fault。
+
+### 第39刀 · USB Core / xHCI / HID
+- PCIe xHCI：command/event ring、ERST、slot/context、control/interrupt transfer；
+- USB descriptor / enumeration；HID keyboard/mouse/tablet；事件接现有 inputd ABI。
+验收：移除 virtio-input，使用 `qemu-xhci + usb-kbd + usb-tablet`，WindowServer 键鼠路径继续工作。
+
+### 第40刀 · NVMe
+- PCI NVMe controller、admin queue、Identify、namespace、I/O queue、PRP、read/write/flush、MSI-X；
+- blk service 后端抽象为 VirtIO Blk / NVMe，ZFS 上层无感。
+验收：不挂 virtio-blk，只挂 QEMU NVMe，ZFS `fstest/fsdemo` 与包管理存储链通过。
+
+> 第35～40刀的共同约束：优先复用现有 capability/SHM/IPC/device-service 边界；QEMU 有真设备则必须实机验收，禁止只以 host parser test 判定完成。
+
+
+### 第35～40刀收口阻塞项 · SMP4 偶发 `EC=0`：✅ 根因结案
+- **历史表象**：曾在合法 AArch64 `B/RET` 或 SVC 返回点观察到 `EC=0`，进程/PC 不固定；仅按 EL0/EL1 分流处置并不构成根因修复。
+- **最终第一现场**最终在 owner guard 与 EL1 诊断下被抓住：idle PE/旧 PE 与迁移后的新 PE 会复用同一 process kernel stack；
+  随后又直接抓到 `TrapFrame double ownership`，证明问题是跨核调度 handoff 生命周期，而非指令解码。
+- **最终修复**：
+  1. 每 CPU 独立 64KiB scheduler/idle stack，WFI 永不借进程 kernel stack；
+  2. yield/block/exit 先切 scheduler stack，再 detach/publish 进程状态；
+  3. 删除独立 `FRAME_OWNER` 双源状态，`ProcessState + owner_cpu` 在 `PROCESS_TABLE` 同锁完成 claim/release；
+  4. scheduler stack AArch64 asm 使用固定寄存器约束，避免 LLVM clobber/分配歧义；
+  5. 异常入口继续保留 ESR/FAR 快照与 per-CPU scratch TrapFrame，作为长期 crash diagnostics。
+- **并发后续根因**：SMP4 `mutextest` 还暴露 FutexWait wake-before-register 与 UserMutex waiter-chain 丢失，两者均已修复。
+- **最终证据**：20/20 SMP4 冷启动零 fault；`stress-loop.sh 3` 三轮均 6/6 + `online=4` + zero fault；
+  第35～40刀当前最终镜像 `hardware-acceptance` **45/45**。本阻塞项正式关闭。
+
+
+## 第41～44刀：✅ 全部完成（2026-08-27）
+
+
+### 第41刀 · Power Management / Firmware Runtime：✅
+- 新增动态 `CAP_POWER` + syscall72；Shell `shutdown/reboot` 必须先经 securityd 的 admin 身份签发，未登录请求明确拒绝。
+- PSCI `SYSTEM_OFF/SYSTEM_RESET` 按 FADT conduit 走 HVC/SMC；reboot 另解析 FADT Reset Register 作为 firmware 返回后的 fallback。
+- 电源切换前做 block flush/NVMe shutdown；idle/WFI 已迁到 per-CPU dedicated scheduler stack。
+- 验收：未登录 shutdown DENY；root shutdown 让 QEMU rc=0 真关机；reboot 后观察到第二次 EDK2 firmware banner。
+
+### 第42刀 · PCIe Real-Hardware Hardening：✅
+- bridge/root-port 解析 primary/secondary/subordinate bus、memory/prefetch window；保留多个 MCFG segment/高 ECAM 支持。
+- 未分配 downstream BAR 可在明确 bridge window 内安全 relocation；root bus 无 `_CRS` 时不猜平台资源。
+- PCIe FLR、secondary bus reset、AER status clear 与 refresh path 已落地。
+- 验收：两个 QEMU root-port 分别挂 NVMe/xHCI，bus1/bus2、16MiB memory window、64-bit prefetch window 均被解析；
+  两个下游驱动与各自 reset/recovery 全绿。
+
+### 第43刀 · NVMe Production Hardening：✅
+- Active Namespace List + 多 namespace metadata；MDTS；Number of Queues；最多一套 per-CPU I/O SQ/CQ/bounce/PRP path。
+- 公共 block ABI 保持 512B sector；4KiB native namespace 的边缘访问走 RMW，未触碰字节保持不变。
+- timeout 记录 qid/cid → Admin Abort → CC.EN controller reset/re-init；失败才升级 PCIe FLR，随后重建 queues/namespaces。
+- 验收：QEMU ns1=4KiB + ns2=512B，`io_queues=4`、`512B ABI/NATIVE RMW SELFTEST PASS`、
+  `RESET/RECOVERY PASS queues=4 namespaces=2`，且 ZFS `fstest/fsdemo` 在 4KiB active namespace 上通过。
+
+### 第44刀 · USB / xHCI Production Hardening：✅
+- scratchpad、controller teardown/rebuild、FLR recovery、root Port Status Change、hub port poll/hotplug 全部落地。
+- USB2 hub class：descriptor、port power/reset/status、Route String、LS/FS behind HS hub 的 TT Hub Slot/Port；递归枚举下游 HID。
+- HID keyboard/mouse/tablet 继续注入原 input ABI；拔除会 Disable Slot 并释放 ring/report/context，防生命周期泄漏。
+- 验收：`xHCI → hub → keyboard` route=0x1；QMP 真按键到 inputd；运行时 hot-add mouse route=0x2 再 hot-unplug；
+  controller recovery 后仍保持 `hid=1 hubs=1`，全程无 kernel fault。
+
+> 第41～44刀共同原则：优先把已经“能工作”的硬件链变成可长期运行、可恢复、可迁移到真机的工程实现；不以新增设备数量替代可靠性收口。
+> 正式验收入口：`scripts/hardening-acceptance.sh --no-build`，当前 **36/36 ALL PASS**（含 K41 reboot runner clean-exit）。
 
 ## 当前里程碑（2026-08-24 · 第十~十四刀单日走完，四线并行+集成）
 
@@ -235,12 +349,12 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 | ZeroPkg 生态 | docs/zeropkg_inos_plan.md | ✅ 第29刀已实施：HTTPS/install/verify/launch/remove 全闭环 |
 | ACPI 静态表 | docs/acpi_static_plan.md | ✅ 第20刀已实施：MADT/GIC/GTDT/FADT/MCFG 真消费；AML 按需 |
 
-## 第十七刀（进行中 · 四档菜单全干）
+## 第十七/十八刀历史阶段（✅ 已结案；后续由第20～44刀覆盖）
 
 | 档 | 内容 | 状态 |
 | --- | --- | --- |
 | 🥇 | 堆损坏猎杀：最终定位 free-list 不可分裂尾巴形成 ghost gap；修复并加回归 | ✅2026-08-25 结案 |
-| 🥈 | ZeroPkg 设备内：WS-A(abi::zpkg 解析核)+WS-B(fsd CMD_RENAME 原子改名)+WS-C(shell pkg ls/rename) 已交付；WS-D 安装全流待卷预置链路 | ✅WS-A~C·实机 15/15 |
+| 🥈 | ZeroPkg 设备内早期 WS-A~D | ✅ 后续由第29刀 HTTPS→签名→ZFS→launch/remove 全闭环正式替代 |
 | 🥉 | 线程二期：号位 27/28 FutexWait/Wake + userlib UserMutex + mutextest | ✅实机 PASS |
 | 小件 | threaddemo+mutextest 注入 acceptance（15 项）；crashlog 缓行 | ✅ |
 | ➕ | **第十八刀·ACPI 静态表第一阶段**：RSDP 经 UEFI config table 抓取→boot.S 槽位补丁→no_std RSDP/XSDT/MADT 解析器(host矩阵测试)→SMP 按 MADT 点亮(legacy 回退保留)；GIC/GTDT/FADT/MCFG 消费归第20刀 | ✅-smp4 实机验证 |
@@ -249,8 +363,8 @@ PROCESS_TABLE 改 Vec 按需生长至 256 槽（空洞复用优先）；full_rea
 **压力长跑：-smp4 三轮 6/6 functional 全绿**（scripts/stress-loop.sh）
 **P1-P3 收口**：stress-loop 脚本入库 / README 现代化 / perf-history 首期
 入库 / knife10~13 worktree 与分支清理。
-**第十八刀追加**：userlib Condvar（futex 实现）交付；COW 重开阻塞立案
-（Vec 生长假说已排除，见调查文档「已排除」节）；ZeroPkg WS-B/C 交付。
+**第十八刀追加（历史）**：userlib Condvar（futex 实现）交付；当时的 COW 重开阻塞已于 2026-08-25
+由 TLBI operand + free-list ghost gap 双根因正式结案；ZeroPkg 早期 WS-B/C 也已由第29刀完整事务链替代。
 
 解锁路径已完成：堆损坏结案 → COW_SHARED_FORK 重开 → SMP 阶段 3 收口。
 结构性天花板已越过：镜像级 KASLR 已由第31刀实施；后续转入真机硬件路线。

@@ -33,6 +33,16 @@ pub const DESC_PXN: u64 = 1 << 53;
 /// 纪律：仅叶子页描述符使用；clone 时父子双侧同时置位并把 AP 改只读，
 /// COW 断链（handle_cow_fault）时清除并恢复原 AP。
 pub const DESC_SW_COW: u64 = 1 << 11;
+/// Software marker for user-visible device/MMIO leaves. Bit55 is software-use
+/// in the stage-1 leaf format used by Zero OS. Device leaves are not allocator-
+/// owned RAM: destroy/fork must never free or COW their output physical address.
+pub const DESC_SW_DEVICE: u64 = 1 << 55;
+/// Software ownership marker for leaves inherited from a kernel identity-map
+/// block when BBM splits that block into a private user L3 table. These output
+/// pages remain kernel/device-owned and must never be refcounted/freed as user
+/// allocations. A process may replace individual borrowed slots with owned RAM,
+/// SHM, or MMIO leaves; only the untouched filler leaves retain this bit.
+pub const DESC_SW_BORROWED: u64 = 1 << 56;
 pub const AP_SHIFT: u64 = 6;
 /// AP[2:1] 字段掩码：改 AP 必须整字段清再置，禁止手写位移散落各处。
 pub const AP_MASK: u64 = 0b11 << AP_SHIFT;
@@ -101,6 +111,9 @@ pub fn make_leaf_descriptor(phys: u64, ap: u64, executable: bool) -> u64 {
 /// host 单测钉死判定矩阵；paging 侧按此分派）。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LeafShareClass {
+    /// Kernel/device-owned identity-map filler produced by a block split. Clone
+    /// copies the descriptor verbatim without phys retain/COW; destroy skips it.
+    BorrowedDirect,
     /// 真只读页（text/rodata，AP=0b11 且无 COW 位）：父子直接映射同一物理页，
     /// 不复制、不打 COW 标记（配 retain_page 保命，防一方退出误回收）。
     ReadOnlyDirect,
@@ -109,6 +122,9 @@ pub enum LeafShareClass {
     CowShare,
     /// 其他 AP 编码（防御兜底，用户空间理论上不出现）：保持旧 eager 复制。
     EagerCopy,
+    /// Device/MMIO mapping owned by a capability lease. A fork does not inherit
+    /// hardware access: the child must independently hold CAP_MMIO and map it.
+    SkipDevice,
 }
 
 /// 判定一个有效叶描述符的克隆策略。
@@ -120,6 +136,12 @@ pub const COW_BISECT_SKIP_ASLR: bool = false;
 pub const COW_BISECT_SKIP_PARENT_BBM: bool = false;
 
 pub fn classify_leaf(leaf: u64) -> LeafShareClass {
+    if leaf & DESC_SW_BORROWED != 0 {
+        return LeafShareClass::BorrowedDirect;
+    }
+    if leaf & DESC_SW_DEVICE != 0 {
+        return LeafShareClass::SkipDevice;
+    }
     if !COW_SHARED_FORK {
         // 关闭共享：可写页一律 eager 复制兜底（语义正确，仅牺牲 fork
         // 性能）；真只读页保留直接映射——无写语义即无 COW 依赖，省内存
@@ -256,7 +278,7 @@ pub unsafe fn bbm_split_block(
     *l2.add(index) = 0;
     barrier(virt_base);
     // 回填：整窗恒等 4K 页（沿用旧 block 的 AP/Attr 属性）
-    let leaf_flags = (block_desc & !0b11) | DESC_VALID | DESC_TYPE_TABLE;
+    let leaf_flags = (block_desc & !0b11) | DESC_VALID | DESC_TYPE_TABLE | DESC_SW_BORROWED;
     for slot in 0..512 {
         let pa = (virt_base + slot * PAGE_SIZE) as u64;
         *l3.add(slot) = (pa & PHYS_ADDR_MASK) | leaf_flags;
@@ -428,9 +450,11 @@ mod tests {
             assert!(is_valid(d));
             assert_eq!(d & PHYS_ADDR_MASK, (0x40_0000 + slot * PAGE_SIZE) as u64);
             assert_eq!((d >> AP_SHIFT) & 0b11, AP_EL1_RW_EL0_NONE);
+            assert_ne!(d & DESC_SW_BORROWED, 0, "identity filler must be borrowed");
         }
-        // 目标页被替换
+        // 目标页被替换，不能继承 borrowed 标记。
         assert_eq!(l3_new.0[1], target_desc);
+        assert_eq!(l3_new.0[1] & DESC_SW_BORROWED, 0);
         // 走表验证：VA 0x40_1000 现在走进 L3
         let p = unsafe { walk(t.root(), 0x40_1000) };
         assert_eq!(
@@ -450,6 +474,11 @@ mod tests {
 
     #[test]
     fn classify_leaf_matrix() {
+        let borrowed =
+            make_leaf_descriptor(0x1000_0000, AP_EL1_RW_EL0_NONE, false) | DESC_SW_BORROWED;
+        assert_eq!(classify_leaf(borrowed), LeafShareClass::BorrowedDirect);
+        let device = make_leaf_descriptor(0x1000_0000, USER_AP_RW, false) | DESC_SW_DEVICE;
+        assert_eq!(classify_leaf(device), LeafShareClass::SkipDevice);
         // 开关关闭（第十四刀集成期默认）：一切叶子一律 eager 兜底，
         // 仅保留「只读直映射」判定供未来重开时对照。
         if !COW_SHARED_FORK {

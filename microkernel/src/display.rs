@@ -59,6 +59,9 @@ struct Framebuffer {
     height: usize,
     stride: usize,
     format: Format,
+    /// GOP is firmware/device memory and requires volatile accesses; VirtIO-GPU
+    /// backing is ordinary coherent RAM and can use bulk copies.
+    volatile: bool,
 }
 
 impl Framebuffer {
@@ -93,6 +96,7 @@ impl Framebuffer {
             height,
             stride,
             format,
+            volatile: true,
         })
     }
 
@@ -107,7 +111,15 @@ impl Framebuffer {
 
     fn pixel(&self, x: usize, y: usize) -> Option<Rgb> {
         let off = self.offset(x, y)?;
-        let v = unsafe { read_volatile((self.base + off) as *const u32) }.to_le_bytes();
+        let ptr = (self.base + off) as *const u32;
+        let raw = unsafe {
+            if self.volatile {
+                read_volatile(ptr)
+            } else {
+                ptr.read()
+            }
+        };
+        let v = raw.to_le_bytes();
         Some(match self.format {
             Format::Rgbx => Rgb {
                 r: v[0],
@@ -128,7 +140,15 @@ impl Framebuffer {
             Format::Rgbx => [c.r, c.g, c.b, 0],
             Format::Bgrx => [c.b, c.g, c.r, 0],
         };
-        unsafe { write_volatile((self.base + off) as *mut u32, u32::from_le_bytes(bytes)) };
+        let ptr = (self.base + off) as *mut u32;
+        let value = u32::from_le_bytes(bytes);
+        unsafe {
+            if self.volatile {
+                write_volatile(ptr, value)
+            } else {
+                ptr.write(value)
+            }
+        };
     }
 }
 
@@ -206,6 +226,7 @@ pub fn install_virtio_gpu_framebuffer(
         height,
         stride,
         format: Format::Bgrx,
+        volatile: false,
     };
     let mut c = Console {
         fb,
@@ -325,13 +346,21 @@ pub fn present_xrgb(data: &[u8], width: usize, height: usize, stride: usize) -> 
 /// 的增量解码器见 [`Utf8Decoder`]。
 pub fn write_fmt_line(args: fmt::Arguments<'_>) {
     {
-        let mut guard = CONSOLE.lock();
+        // Graphical logging is a best-effort mirror. Never make a kernel control
+        // path wait behind another CPU doing framebuffer work during SMP bring-up.
+        let Some(mut guard) = CONSOLE.try_lock() else {
+            return;
+        };
         let Some(c) = guard.as_mut() else { return };
         let _ = c.write_fmt(args);
         c.newline();
     }
-    // GOP is immediately visible; a virtio-gpu resource needs explicit flush.
-    crate::drivers::virtio::gpu::flush_all();
+    // Kernel logging must never synchronously submit GPU commands. On SMP,
+    // several CPUs can log while secondaries are coming online; coupling every
+    // log line to TRANSFER+FLUSH serialises boot on the VirtIO control queue and
+    // can deadlock/stall against device IRQ/queue activity. GOP remains directly
+    // visible, while a VirtIO-GPU console is flushed by explicit presentation
+    // paths (WindowServer/present_xrgb). Serial is the authoritative log sink.
 }
 
 impl Console {
@@ -383,12 +412,28 @@ impl Console {
     }
 
     fn scroll(&mut self) {
-        // Console correctness > speed: move rows up by one glyph line, volatile.
         let dy = GLYPH_HEIGHT + 2;
-        for y in MARGIN..self.fb.height.saturating_sub(dy) {
-            for x in 0..self.fb.width {
-                if let Some(px) = self.fb.pixel(x, y + dy) {
-                    self.fb.put(x, y, px);
+        let end = self.fb.height.saturating_sub(dy);
+        if !self.fb.volatile && end > MARGIN {
+            // VirtIO-GPU backing is normal RAM: one overlap-safe memmove replaces
+            // ~1M volatile pixel read/writes on a 1280x800 scanout. This matters
+            // during SMP boot where several CPUs can emit log lines concurrently.
+            let rows = end - MARGIN;
+            let row_bytes = self.fb.stride * 4;
+            unsafe {
+                core::ptr::copy(
+                    (self.fb.base + (MARGIN + dy) * row_bytes) as *const u8,
+                    (self.fb.base + MARGIN * row_bytes) as *mut u8,
+                    rows * row_bytes,
+                );
+            }
+        } else {
+            // GOP/device memory requires volatile accesses.
+            for y in MARGIN..end {
+                for x in 0..self.fb.width {
+                    if let Some(px) = self.fb.pixel(x, y + dy) {
+                        self.fb.put(x, y, px);
+                    }
                 }
             }
         }

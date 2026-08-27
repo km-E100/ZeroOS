@@ -7,7 +7,10 @@ use xshell::{cmd, Shell};
 
 mod hash;
 mod image;
+mod manifest;
 mod qemu;
+mod rebuild;
+mod state;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -26,6 +29,12 @@ enum Commands {
     BuildImage,
     BuildIso,
     BuildRootfs,
+    /// 按源码指纹只重建受影响组件并快速重打 ISO。
+    RebuildFast {
+        /// 即使指纹无变化也强制重打包 ISO。
+        #[arg(long)]
+        force: bool,
+    },
     Run {
         #[arg(default_value = "normal")]
         mode: String,
@@ -55,6 +64,7 @@ fn main() -> Result<()> {
         Commands::BuildRecovery => build_recovery(&sh)?,
         Commands::BuildImage => build_image(&sh)?,
         Commands::BuildRootfs => build_rootfs(&sh)?,
+        Commands::RebuildFast { force } => rebuild::run(&sh, rebuild::RebuildFastArgs { force })?,
         Commands::BuildIso => {
             // 先把用户态裸机 blob（zero-securityd 等）编到最新，随后的
             // sync_userland_blobs（build-rootfs 内）才会把新产物嵌入内核。
@@ -82,7 +92,6 @@ fn build_kernel_pie(sh: &Shell) -> Result<()> {
     cmd!(sh, "cargo +nightly -Z json-target-spec -Z build-std=core,compiler_builtins,alloc build --target {KERNEL_PIE_TARGET_SPEC} -p zero-kernel --release").run()?;
     Ok(())
 }
-
 
 fn enforce_size_limit(sh: &Shell) -> Result<()> {
     let out = cmd!(sh, "du -sm .").read()?;
@@ -326,7 +335,9 @@ fn build_image(sh: &Shell) -> Result<()> {
     let project_root = sh.current_dir();
     let elf = project_root.join(KERNEL_PIE_REL);
     let dest = project_root.join("target/zero-os.elf");
-    if let Some(parent) = dest.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::copy(&elf, &dest)?;
     println!("KASLR-ready ET_DYN image generated at {}", dest.display());
     Ok(())

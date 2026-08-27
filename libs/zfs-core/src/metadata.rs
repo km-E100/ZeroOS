@@ -41,7 +41,11 @@ pub fn store<D: BlockDevice>(
     logical_time: u64,
 ) -> Result<u64, ZfsError> {
     let next_generation = generation.saturating_add(1).max(1);
-    let target = if next_generation & 1 == 1 { BANK_A } else { BANK_B };
+    let target = if next_generation & 1 == 1 {
+        BANK_A
+    } else {
+        BANK_B
+    };
     let payload = encode(entries, next_inode, logical_time)?;
     let capacity = ((BANK_BLOCKS - 1) as usize) * D::BLOCK_SIZE;
     if payload.len() > capacity {
@@ -93,7 +97,9 @@ fn load_bank<D: BlockDevice>(device: &D, start: u64) -> Result<Option<MetadataSt
     let mut payload = vec![0u8; len];
     let mut offset = 0usize;
     for i in 1..BANK_BLOCKS {
-        if offset >= len { break; }
+        if offset >= len {
+            break;
+        }
         let mut block = vec![0u8; D::BLOCK_SIZE];
         device.read_block(start + i, &mut block)?;
         let n = core::cmp::min(D::BLOCK_SIZE, len - offset);
@@ -104,7 +110,12 @@ fn load_bank<D: BlockDevice>(device: &D, start: u64) -> Result<Option<MetadataSt
         return Ok(None);
     }
     let (entries, next_inode, logical_time) = decode(&payload)?;
-    Ok(Some(MetadataState { generation, entries, next_inode, logical_time }))
+    Ok(Some(MetadataState {
+        generation,
+        entries,
+        next_inode,
+        logical_time,
+    }))
 }
 
 fn encode(
@@ -133,8 +144,12 @@ fn encode(
         out.extend_from_slice(&entry.inode.ctime.to_le_bytes());
         out.extend_from_slice(&entry.inode.mtime.to_le_bytes());
         out.extend_from_slice(path.as_bytes());
-        for block in &entry.blocks { out.extend_from_slice(&block.to_le_bytes()); }
-        if let Some(sig) = entry.signature { out.extend_from_slice(&sig); }
+        for block in &entry.blocks {
+            out.extend_from_slice(&block.to_le_bytes());
+        }
+        if let Some(sig) = entry.signature {
+            out.extend_from_slice(&sig);
+        }
     }
     Ok(out)
 }
@@ -170,33 +185,69 @@ fn decode(data: &[u8]) -> Result<(BTreeMap<String, DirectoryEntry>, u64, u64), Z
             return Err(ZfsError::PathInvalid);
         }
         let mut blocks = Vec::with_capacity(blocks_len);
-        for _ in 0..blocks_len { blocks.push(c.u64()?); }
+        for _ in 0..blocks_len {
+            blocks.push(c.u64()?);
+        }
         let signature = if has_sig {
             let mut sig = [0u8; 32];
             sig.copy_from_slice(c.bytes(32)?);
             Some(sig)
-        } else { None };
-        let mut inode = Inode {
-            id, kind, size, mode, uid, gid, links, data: [0; 12], extent_root: 0, ctime, mtime,
+        } else {
+            None
         };
-        for (i, block) in blocks.iter().take(12).enumerate() { inode.data[i] = *block; }
-        entries.insert(String::from(path), DirectoryEntry::new(inode, blocks, signature));
+        let mut inode = Inode {
+            id,
+            kind,
+            size,
+            mode,
+            uid,
+            gid,
+            links,
+            data: [0; 12],
+            extent_root: 0,
+            ctime,
+            mtime,
+        };
+        for (i, block) in blocks.iter().take(12).enumerate() {
+            inode.data[i] = *block;
+        }
+        entries.insert(
+            String::from(path),
+            DirectoryEntry::new(inode, blocks, signature),
+        );
     }
-    if c.off != data.len() { return Err(ZfsError::JournalCorrupt); }
+    if c.off != data.len() {
+        return Err(ZfsError::JournalCorrupt);
+    }
     Ok((entries, next_inode.max(2), logical_time.max(1)))
 }
 
-struct Cursor<'a> { data: &'a [u8], off: usize }
+struct Cursor<'a> {
+    data: &'a [u8],
+    off: usize,
+}
 impl<'a> Cursor<'a> {
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], ZfsError> {
         let end = self.off.checked_add(n).ok_or(ZfsError::JournalCorrupt)?;
-        let s = self.data.get(self.off..end).ok_or(ZfsError::JournalCorrupt)?;
-        self.off = end; Ok(s)
+        let s = self
+            .data
+            .get(self.off..end)
+            .ok_or(ZfsError::JournalCorrupt)?;
+        self.off = end;
+        Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, ZfsError> { Ok(self.bytes(1)?[0]) }
-    fn u16(&mut self) -> Result<u16, ZfsError> { Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap())) }
-    fn u32(&mut self) -> Result<u32, ZfsError> { Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap())) }
-    fn u64(&mut self) -> Result<u64, ZfsError> { Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap())) }
+    fn u8(&mut self) -> Result<u8, ZfsError> {
+        Ok(self.bytes(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, ZfsError> {
+        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, ZfsError> {
+        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, ZfsError> {
+        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
 }
 
 #[cfg(test)]
@@ -211,13 +262,31 @@ mod tests {
         MEM.lock().resize(512 * 4096, 0);
         let dev = crate::device::MemoryBlockDevice::new(&MEM);
         let mut map = BTreeMap::new();
-        let inode = Inode { id: InodeId(7), kind: InodeKind::File, size: 3, mode: 0o644, uid: 1, gid: 2, links: 1, data: [0;12], extent_root: 0, ctime: 9, mtime: 10 };
-        map.insert(String::from("/a"), DirectoryEntry::new(inode, vec![100], Some([3;32])));
+        let inode = Inode {
+            id: InodeId(7),
+            kind: InodeKind::File,
+            size: 3,
+            mode: 0o644,
+            uid: 1,
+            gid: 2,
+            links: 1,
+            data: [0; 12],
+            extent_root: 0,
+            ctime: 9,
+            mtime: 10,
+        };
+        map.insert(
+            String::from("/a"),
+            DirectoryEntry::new(inode, vec![100], Some([3; 32])),
+        );
         let g1 = store(&dev, 0, &map, 8, 11).unwrap();
         let one = load(&dev).unwrap().unwrap();
         assert_eq!(one.generation, g1);
         assert_eq!(one.entries.get("/a").unwrap().blocks, vec![100]);
-        map.insert(String::from("/b"), DirectoryEntry::new(inode, vec![101], None));
+        map.insert(
+            String::from("/b"),
+            DirectoryEntry::new(inode, vec![101], None),
+        );
         let g2 = store(&dev, g1, &map, 9, 12).unwrap();
         assert_eq!(load(&dev).unwrap().unwrap().generation, g2);
         // Tear newest bank payload: loader must fall back to previous valid bank.

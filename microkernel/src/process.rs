@@ -10,7 +10,7 @@ use crate::user_elf;
 use alloc::{string::String, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 use zero_abi::syscall::SysError;
 use zero_abi::{ProcessId, ThreadEntry};
@@ -218,6 +218,12 @@ struct ProcessRecord {
     entry_point: Option<usize>,
     user_stack_top: Option<usize>,
     started: bool,
+    /// SMP blocking handshake. `block_intent` is set while the current CPU is
+    /// still finishing a blocking syscall but before it releases CURRENT_SLOT.
+    /// A concurrent wake in this window records `wake_pending` instead of
+    /// enqueuing the still-running TrapFrame on another CPU.
+    block_intent: bool,
+    wake_pending: bool,
     /// 挂起的阻塞接收（通道号）：进程在阻塞中被唤醒后，由 dispatch 在
     /// 重入用户态前完成该系统调用的收尾（continuation 语义，对照 XNU）。
     pending_recv: Option<u32>,
@@ -348,14 +354,25 @@ pub(crate) fn alloc_pid() -> ProcessId {
 /// None 空洞复用），故全部既有下标语义不变。
 static PROCESS_TABLE: Mutex<Vec<Option<ProcessRecord>>> = Mutex::new(Vec::new());
 
+/// CPU ownership of each process execution context/kernel stack.  This is a
+/// second field of the process state machine, but every transition is serialized
+/// by PROCESS_TABLE: callers must never publish `Runnable` while owner != NONE.
+/// Keeping owner and ProcessState under one lock removes the former split-brain
+/// race between PROCESS_TABLE and scheduler::FRAME_OWNER.
+pub(crate) const PROCESS_OWNER_NONE: u8 = u8::MAX;
+static PROCESS_OWNER: [AtomicU8; MAX_PROCESSES] =
+    [const { AtomicU8::new(PROCESS_OWNER_NONE) }; MAX_PROCESSES];
+
 /// 取一个空闲槽位：优先复用空洞；无可复用且未达上限则追加。
 /// 调用方必须已持 PROCESS_TABLE 锁（本函数不加锁）。
 fn alloc_table_slot_locked(table: &mut Vec<Option<ProcessRecord>>) -> Option<usize> {
     if let Some(idx) = table.iter().position(|slot| slot.is_none()) {
+        PROCESS_OWNER[idx].store(PROCESS_OWNER_NONE, Ordering::Relaxed);
         return Some(idx);
     }
     if table.len() < MAX_PROCESSES {
         let idx = table.len();
+        PROCESS_OWNER[idx].store(PROCESS_OWNER_NONE, Ordering::Relaxed);
         table.push(None);
         return Some(idx);
     }
@@ -409,6 +426,9 @@ pub enum ProcessError {
 
 pub fn init() {
     init_kernel_stack_tops();
+    for owner in PROCESS_OWNER.iter() {
+        owner.store(PROCESS_OWNER_NONE, Ordering::Relaxed);
+    }
     let mut table = PROCESS_TABLE.lock();
     for slot in table.iter_mut() {
         *slot = None;
@@ -461,6 +481,8 @@ pub fn spawn(entry: ThreadEntry, name: &'static str) -> Result<ProcessId, Proces
         entry_point: None,
         user_stack_top: None,
         started: true,
+        block_intent: false,
+        wake_pending: false,
         pending_recv: None,
         pending_signals: 0,
         parent: None, // 内核直生的根进程：无父，退出即完全回收
@@ -507,7 +529,9 @@ pub fn spawn_user_from_bootfs(
     };
 
     let bias = choose_user_load_bias(&elf)?;
-    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
+    let runtime_entry = elf
+        .runtime_entry(bias)
+        .ok_or(ProcessError::InvalidArgument)?;
     let result = unsafe {
         let mut space = AddressSpace::new();
         map_user_elf_segments(&mut space, &elf, path, bias).map_err(ProcessError::MapError)?;
@@ -562,24 +586,37 @@ pub fn spawn_user_from_image(
 ) -> Result<ProcessId, ProcessError> {
     let elf = user_elf::parse_user_elf(elf_bytes).map_err(ProcessError::ElfError)?;
     let bias = choose_user_load_bias(&elf)?;
-    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
+    let runtime_entry = elf
+        .runtime_entry(bias)
+        .ok_or(ProcessError::InvalidArgument)?;
     let pid = spawn(thread_exit, name)?;
-    let Some(slot) = slot_for_pid(pid) else { return Err(ProcessError::NoSuchProcess); };
+    let Some(slot) = slot_for_pid(pid) else {
+        return Err(ProcessError::NoSuchProcess);
+    };
     let result = unsafe {
         let mut space = AddressSpace::new();
         map_user_elf_segments_from_bytes(&mut space, &elf, elf_bytes, "spawn-image", bias)
             .map_err(ProcessError::MapError)?;
         let _libs = load_dynamic_runtime(&mut space, &elf, bias)?;
-        space.map_stack(USER_STACK_TOP, USER_STACK_LEN).map_err(ProcessError::MapError)?;
-        let bootfs_info = rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE)
+        space
+            .map_stack(USER_STACK_TOP, USER_STACK_LEN)
             .map_err(ProcessError::MapError)?;
+        let bootfs_info =
+            rootfs::build_user_bootfs_for_process(&mut space, rootfs::USER_BOOTFS_BASE)
+                .map_err(ProcessError::MapError)?;
         configure_user_process(slot, space, runtime_entry, USER_STACK_TOP);
-        set_initial_user_args(slot, [bootfs_info.entries_ptr, bootfs_info.entries_len, 0, 0]);
+        set_initial_user_args(
+            slot,
+            [bootfs_info.entries_ptr, bootfs_info.entries_len, 0, 0],
+        );
         let tf = TRAP_FRAMES[slot].get();
         (*tf).elr_el1 = runtime_entry as u64;
         Ok::<(), ProcessError>(())
     };
-    if let Err(err) = result { remove_slot(slot); return Err(err); }
+    if let Err(err) = result {
+        remove_slot(slot);
+        return Err(err);
+    }
     set_parent(pid, parent);
     Ok(pid)
 }
@@ -713,6 +750,191 @@ pub fn set_state_slot(slot: usize, state: ProcessState) {
     let mut table = PROCESS_TABLE.lock();
     if let Some(record) = &mut table[slot] {
         record.state = state;
+    }
+}
+
+/// Atomically claim one runnable process and its TrapFrame/kernel stack for one
+/// CPU. ProcessState + owner are one PROCESS_TABLE-serialized transition: there
+/// is no externally visible `Running` without an owner or `Runnable` with one.
+pub fn claim_runnable(pid: ProcessId, cpu: u8) -> Option<usize> {
+    let mut table = PROCESS_TABLE.lock();
+    let record = table
+        .iter_mut()
+        .flatten()
+        .find(|record| record.pid == pid)?;
+    if record.state != ProcessState::Runnable {
+        return None;
+    }
+    let slot = record.slot;
+    let owner = PROCESS_OWNER[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        owner,
+        PROCESS_OWNER_NONE,
+        "process: Runnable slot={} pid={} still owned by cpu{}",
+        slot,
+        pid.raw(),
+        owner
+    );
+    PROCESS_OWNER[slot].store(cpu, Ordering::Relaxed);
+    record.state = ProcessState::Running;
+    record.block_intent = false;
+    record.wake_pending = false;
+    Some(slot)
+}
+
+/// Publish a voluntary yield after the caller has already moved to its per-CPU
+/// scheduler stack and cleared CURRENT_SLOT. Owner release + Runnable publication
+/// happen under one PROCESS_TABLE lock, so another PE cannot observe them apart.
+pub fn release_running(slot: usize, cpu: u8) -> Option<ProcessId> {
+    let mut table = PROCESS_TABLE.lock();
+    let record = table.get_mut(slot)?.as_mut()?;
+    if record.state != ProcessState::Running {
+        return None;
+    }
+    let owner = PROCESS_OWNER[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        owner, cpu,
+        "process: release_running owner mismatch slot={} cpu={} owner={}",
+        slot, cpu, owner
+    );
+    PROCESS_OWNER[slot].store(PROCESS_OWNER_NONE, Ordering::Relaxed);
+    record.state = ProcessState::Runnable;
+    record.block_intent = false;
+    record.wake_pending = false;
+    Some(record.pid)
+}
+
+/// Drop CPU ownership while deliberately keeping state Running. Used only by
+/// the exit path after switching off the process stack: Running prevents any
+/// dispatcher from reclaiming the record while exit converts it to Zombie/reap.
+pub fn release_owner_for_exit(slot: usize, cpu: u8) {
+    let mut table = PROCESS_TABLE.lock();
+    let record = table
+        .get_mut(slot)
+        .and_then(|entry| entry.as_mut())
+        .expect("process: exit owner release without record");
+    assert_eq!(record.state, ProcessState::Running);
+    let owner = PROCESS_OWNER[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        owner, cpu,
+        "process: exit owner mismatch slot={} cpu={} owner={}",
+        slot, cpu, owner
+    );
+    PROCESS_OWNER[slot].store(PROCESS_OWNER_NONE, Ordering::Relaxed);
+}
+
+pub fn owner_cpu(slot: usize) -> Option<u8> {
+    if slot >= MAX_PROCESSES {
+        return None;
+    }
+    let owner = PROCESS_OWNER[slot].load(Ordering::Acquire);
+    (owner != PROCESS_OWNER_NONE).then_some(owner)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WakeTransition {
+    /// Blocked -> Runnable happened under PROCESS_TABLE lock; enqueue exactly once.
+    Enqueue { pid: ProcessId, slot: usize },
+    /// Target is still executing its blocking syscall. The wake is latched and
+    /// block_current will requeue it only after CPU ownership is detached.
+    Pending,
+    /// Target is already runnable/running for unrelated work, gone, or terminal.
+    Ignore,
+}
+
+/// Atomic wake transition used by IPC/futex/timer paths. This closes two SMP
+/// races at once: duplicate wakeups cannot enqueue twice, and a wake that lands
+/// between waiter registration and block_current is latched rather than lost.
+pub fn request_wake(pid: ProcessId) -> WakeTransition {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(record) = table.iter_mut().flatten().find(|record| record.pid == pid) else {
+        return WakeTransition::Ignore;
+    };
+    match record.state {
+        ProcessState::Blocked => {
+            let owner = PROCESS_OWNER[record.slot].load(Ordering::Relaxed);
+            assert_eq!(
+                owner,
+                PROCESS_OWNER_NONE,
+                "process: waking Blocked slot={} pid={} still owned by cpu{}",
+                record.slot,
+                record.pid.raw(),
+                owner
+            );
+            record.state = ProcessState::Runnable;
+            record.block_intent = false;
+            record.wake_pending = false;
+            WakeTransition::Enqueue {
+                pid: record.pid,
+                slot: record.slot,
+            }
+        }
+        ProcessState::Running => {
+            // A legitimate scheduler::wake only originates from a registered
+            // IPC/futex/sleep/wait condition, so Running here means the target
+            // is in the short register->block kernel window.
+            record.wake_pending = true;
+            WakeTransition::Pending
+        }
+        _ => WakeTransition::Ignore,
+    }
+}
+
+/// Phase 1 of a blocking handoff: keep global state Running while marking the
+/// intent. No other CPU may claim this process until CURRENT_SLOT is detached.
+pub fn begin_block(slot: usize, cpu: u8) -> bool {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(record) = table.get_mut(slot).and_then(|entry| entry.as_mut()) else {
+        return false;
+    };
+    if record.state != ProcessState::Running {
+        return false;
+    }
+    let owner = PROCESS_OWNER[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        owner, cpu,
+        "process: begin_block owner mismatch slot={} cpu={} owner={}",
+        slot, cpu, owner
+    );
+    record.block_intent = true;
+    true
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockFinish {
+    Blocked,
+    Requeue(ProcessId),
+    Invalid,
+}
+
+/// Phase 2, called only after local CURRENT_SLOT has been detached. If a wake
+/// raced with phase 1 (or even arrived just before it), consume the latch and
+/// publish Runnable now; otherwise publish Blocked.
+pub fn finish_block(slot: usize, cpu: u8) -> BlockFinish {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(record) = table.get_mut(slot).and_then(|entry| entry.as_mut()) else {
+        return BlockFinish::Invalid;
+    };
+    if record.state != ProcessState::Running || !record.block_intent {
+        return BlockFinish::Invalid;
+    }
+    let owner = PROCESS_OWNER[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        owner, cpu,
+        "process: finish_block owner mismatch slot={} cpu={} owner={}",
+        slot, cpu, owner
+    );
+    // Owner disappears in the same table critical section that publishes the
+    // final Blocked/Runnable state.
+    PROCESS_OWNER[slot].store(PROCESS_OWNER_NONE, Ordering::Relaxed);
+    record.block_intent = false;
+    if record.wake_pending {
+        record.wake_pending = false;
+        record.state = ProcessState::Runnable;
+        BlockFinish::Requeue(record.pid)
+    } else {
+        record.state = ProcessState::Blocked;
+        BlockFinish::Blocked
     }
 }
 
@@ -1214,7 +1436,28 @@ pub fn remove_slot(slot: usize) {
 /// 最后 reschedule()（noreturn，绝不回到调用方）。
 pub fn exit_current_with_status(status: i32) -> ! {
     let slot = crate::scheduler::current_slot();
+    let cpu = crate::arch::smp::cpu_id();
+    // Do not publish Zombie/free the slot while still executing on its kernel
+    // stack. Switch first; the helper detaches ownership on the scheduler stack.
+    unsafe {
+        crate::arch::enter_scheduler_stack(
+            cpu,
+            __zero_process_exit_handoff,
+            slot,
+            status as u32 as usize,
+        )
+    }
+}
 
+extern "C" fn __zero_process_exit_handoff(cpu: usize, slot: usize, status_bits: usize) -> ! {
+    debug_assert_eq!(cpu, crate::arch::smp::cpu_id());
+    unsafe { crate::arch::set_tpidr_el1(idle_trap_frame_for(cpu) as usize) };
+    crate::scheduler::detach_current(slot);
+    release_owner_for_exit(slot, cpu as u8);
+    exit_current_with_status_on_scheduler_stack(slot, status_bits as u32 as i32)
+}
+
+fn exit_current_with_status_on_scheduler_stack(slot: usize, status: i32) -> ! {
     // —— 单一临界区：定处置 / 写 exit_code / 摘 addr_space / 取走父等待标记 ——
     struct ZombiePlan {
         wake_parent: Option<(usize, ProcessId)>,
@@ -1403,10 +1646,18 @@ pub fn futex_wait_check(uaddr: usize, expected: u32) -> Result<Option<u32>, SysE
     let pid = pid_at_slot(me).ok_or(SysError::NotFound)?;
     {
         let mut t = FUTEX_TABLE.lock();
+        // SMP lost-wakeup closure: another PE may change *uaddr and complete
+        // FutexWake after our first load but before we acquire this bucket lock.
+        // Re-read while holding the same lock FutexWake uses. If the value has
+        // already changed, do not enqueue/sleep. If it changes after this read,
+        // the waker must wait for `t` and will observe the waiter we insert below.
+        let actual_locked = read_user_u32(uaddr);
+        if actual_locked != expected {
+            return Ok(Some(actual_locked));
+        }
         if t.len() >= FUTEX_TABLE_CAP {
             return Err(SysError::NoMemory);
         }
-        // 双登记防丢唤：先入队再由调用方 block（IRQ 屏蔽窗口内无竞态）。
         t.push(FutexWaiter { uaddr, pid });
     }
     Ok(None)
@@ -1414,6 +1665,13 @@ pub fn futex_wait_check(uaddr: usize, expected: u32) -> Result<Option<u32>, SysE
 
 /// 登记后阻塞（syscalls 层在 futex_wait_check==None 时调用）。
 pub fn futex_block_current() -> ! {
+    // FutexWait success returns 0 after a real or latched wake. The syscall
+    // handler does not return normally once it enters block_current, so write the
+    // saved result before handing the TrapFrame to the scheduler.
+    let slot = crate::scheduler::current_slot();
+    unsafe {
+        (*trap_frame(slot)).regs[0] = 0;
+    }
     crate::scheduler::block_current()
 }
 
@@ -1433,13 +1691,11 @@ pub fn futex_wake(uaddr: usize, max: usize) -> usize {
         }
         out
     };
+    let count = woken.len();
     for pid in woken {
-        if state(pid) == Some(ProcessState::Blocked) {
-            set_state(pid, ProcessState::Runnable);
-            crate::scheduler::enqueue(pid);
-        }
+        crate::scheduler::wake(pid);
     }
-    0
+    count
 }
 
 /// 进程死亡时摘除其全部 futex 登记（remove/full_reap 前调用）。
@@ -1777,9 +2033,13 @@ fn choose_user_load_bias(elf: &user_elf::UserElf) -> Result<usize, ProcessError>
 }
 
 fn library_bias_for_index(index: usize, elf: &user_elf::UserElf) -> Option<usize> {
-    if index >= MAX_LOADED_LIBRARIES { return None; }
+    if index >= MAX_LOADED_LIBRARIES {
+        return None;
+    }
     let span = align_up(elf.image_span()?, PAGE_SIZE);
-    if span == 0 || span > USER_LIB_SLOT { return None; }
+    if span == 0 || span > USER_LIB_SLOT {
+        return None;
+    }
     let bias = USER_LIB_BASE.checked_add(index.checked_mul(USER_LIB_SLOT)?)?;
     (bias.checked_add(span)? <= USER_LIB_END).then_some(bias)
 }
@@ -1791,16 +2051,23 @@ fn checked_bias_add(bias: usize, value: u64) -> Result<usize, ProcessError> {
 
 fn checked_signed_add(base: usize, addend: i64) -> Result<u64, ProcessError> {
     let v = (base as i128) + (addend as i128);
-    if !(0..=u64::MAX as i128).contains(&v) { return Err(ProcessError::InvalidArgument); }
+    if !(0..=u64::MAX as i128).contains(&v) {
+        return Err(ProcessError::InvalidArgument);
+    }
     Ok(v as u64)
 }
 
 fn global_symbol(libs: &[LoadedLibrary], name: &str) -> Option<usize> {
-    if name.is_empty() { return None; }
+    if name.is_empty() {
+        return None;
+    }
     for lib in libs {
-        if let Some(sym) = lib.elf.symbols.iter().find(|s| {
-            s.defined && (s.binding == 1 || s.binding == 2) && s.name == name
-        }) {
+        if let Some(sym) = lib
+            .elf
+            .symbols
+            .iter()
+            .find(|s| s.defined && (s.binding == 1 || s.binding == 2) && s.name == name)
+        {
             return lib.bias.checked_add(sym.value as usize);
         }
     }
@@ -1826,22 +2093,38 @@ fn relocation_value(
     match rela.typ {
         R_AARCH64_ABS64 => checked_signed_add(addr, rela.addend),
         R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
-            if rela.addend == 0 { Ok(addr as u64) } else { checked_signed_add(addr, rela.addend) }
+            if rela.addend == 0 {
+                Ok(addr as u64)
+            } else {
+                checked_signed_add(addr, rela.addend)
+            }
         }
         _ => Err(ProcessError::InvalidArgument),
     }
 }
 
-fn write_relocation_target(space: &AddressSpace, target: usize, value: u64) -> Result<(), ProcessError> {
+fn write_relocation_target(
+    space: &AddressSpace,
+    target: usize,
+    value: u64,
+) -> Result<(), ProcessError> {
     let page_off = target & (PAGE_SIZE - 1);
     if page_off > PAGE_SIZE - core::mem::size_of::<u64>() {
         return Err(ProcessError::InvalidArgument);
     }
-    let phys = match space.walk(target) {
-        crate::mm::table_walk::WalkOutcome::Page { phys, .. } => phys,
+    let (phys, desc) = match space.walk(target) {
+        crate::mm::table_walk::WalkOutcome::Page { phys, desc } => (phys, desc),
         _ => return Err(ProcessError::InvalidArgument),
     };
-    unsafe { core::ptr::write_unaligned((phys + page_off) as *mut u64, value); }
+    unsafe {
+        core::ptr::write_unaligned((phys + page_off) as *mut u64, value);
+    }
+    // Text relocations are unusual but legal in the loader's supported subset.
+    // If a relocation modified an executable leaf, republish that page before
+    // another PE can fetch it.
+    if desc & crate::mm::table_walk::DESC_UXN == 0 {
+        crate::arch::sync_instruction_cache(phys, PAGE_SIZE);
+    }
     Ok(())
 }
 
@@ -1864,22 +2147,38 @@ fn load_library_recursive(
     name: &str,
     libs: &mut Vec<LoadedLibrary>,
 ) -> Result<(), ProcessError> {
-    if libs.iter().any(|l| l.name == name) { return Ok(()); }
-    if libs.len() >= MAX_LOADED_LIBRARIES || name.is_empty() || name.contains('/') || name.contains("..") {
+    if libs.iter().any(|l| l.name == name) {
+        return Ok(());
+    }
+    if libs.len() >= MAX_LOADED_LIBRARIES
+        || name.is_empty()
+        || name.contains('/')
+        || name.contains("..")
+    {
         return Err(ProcessError::InvalidArgument);
     }
     let mut path = String::from("/System/Lib/");
     path.push_str(name);
     let bytes = rootfs::read_file(path.as_str()).ok_or(ProcessError::InvalidArgument)?;
     let elf = user_elf::parse_user_elf(bytes).map_err(ProcessError::ElfError)?;
-    if elf.kind != user_elf::UserElfKind::Dyn { return Err(ProcessError::InvalidArgument); }
+    if elf.kind != user_elf::UserElfKind::Dyn {
+        return Err(ProcessError::InvalidArgument);
+    }
     let deps = elf.needed.clone();
-    for dep in deps { load_library_recursive(space, dep.as_str(), libs)?; }
-    if libs.iter().any(|l| l.name == name) { return Ok(()); }
+    for dep in deps {
+        load_library_recursive(space, dep.as_str(), libs)?;
+    }
+    if libs.iter().any(|l| l.name == name) {
+        return Ok(());
+    }
     let bias = library_bias_for_index(libs.len(), &elf).ok_or(ProcessError::InvalidArgument)?;
     map_shared_library_segments(space, &elf, bytes, name, bias).map_err(ProcessError::MapError)?;
     crate::info!("shared library mapped: {} bias={:#x}", name, bias);
-    libs.push(LoadedLibrary { name: String::from(name), elf, bias });
+    libs.push(LoadedLibrary {
+        name: String::from(name),
+        elf,
+        bias,
+    });
     Ok(())
 }
 
@@ -1889,9 +2188,13 @@ fn load_dynamic_runtime(
     main_bias: usize,
 ) -> Result<Vec<LoadedLibrary>, ProcessError> {
     let mut libs = Vec::new();
-    for name in &main.needed { load_library_recursive(space, name.as_str(), &mut libs)?; }
+    for name in &main.needed {
+        load_library_recursive(space, name.as_str(), &mut libs)?;
+    }
     // All providers must be present before applying any symbolic relocation.
-    for lib in &libs { apply_image_relocations(space, &lib.elf, lib.bias, &libs)?; }
+    for lib in &libs {
+        apply_image_relocations(space, &lib.elf, lib.bias, &libs)?;
+    }
     apply_image_relocations(space, main, main_bias, &libs)?;
     Ok(libs)
 }
@@ -1979,6 +2282,9 @@ fn map_user_elf_segments_from_bytes(
                     );
                 }
             }
+            if executable {
+                crate::arch::sync_instruction_cache(phys, PAGE_SIZE);
+            }
             unsafe {
                 space.map_page_phys(page_va, phys, writable, executable)?;
             }
@@ -1995,14 +2301,22 @@ fn map_shared_library_segments(
     bias: usize,
 ) -> Result<(), MapError> {
     for seg in &elf.segments {
-        if seg.memsz == 0 { continue; }
-        let seg_start = bias.checked_add(seg.vaddr as usize).ok_or(MapError::KernelRegion)?;
-        let seg_end = seg_start.checked_add(seg.memsz as usize).ok_or(MapError::KernelRegion)?;
+        if seg.memsz == 0 {
+            continue;
+        }
+        let seg_start = bias
+            .checked_add(seg.vaddr as usize)
+            .ok_or(MapError::KernelRegion)?;
+        let seg_end = seg_start
+            .checked_add(seg.memsz as usize)
+            .ok_or(MapError::KernelRegion)?;
         let page_start = seg_start & !(PAGE_SIZE - 1);
         let page_end = align_up(seg_end, PAGE_SIZE);
         let mut writable = (seg.flags & PF_W) != 0;
         let executable = (seg.flags & PF_X) != 0;
-        if seg.memsz > seg.filesz { writable = true; }
+        if seg.memsz > seg.filesz {
+            writable = true;
+        }
         let data_len = seg.filesz as usize;
 
         for page_va in (page_start..page_end).step_by(PAGE_SIZE) {
@@ -2010,14 +2324,24 @@ fn map_shared_library_segments(
             let mut cached_mapping = false;
             let phys = if !writable {
                 let mut cache = SHARED_LIBRARY_PAGES.lock();
-                if let Some(hit) = cache.iter().find(|p| p.name == name && p.rel_page == rel_page) {
-                    crate::info!("shared library cache hit: {} rel_page={:#x} phys={:#x}", name, rel_page, hit.phys);
+                if let Some(hit) = cache
+                    .iter()
+                    .find(|p| p.name == name && p.rel_page == rel_page)
+                {
+                    crate::info!(
+                        "shared library cache hit: {} rel_page={:#x} phys={:#x}",
+                        name,
+                        rel_page,
+                        hit.phys
+                    );
                     phys::retain_page(hit.phys);
                     cached_mapping = true;
                     hit.phys
                 } else {
                     let page = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
-                    unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+                    unsafe {
+                        core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                    }
                     let copy_start = cmp::max(seg_start, page_va);
                     let copy_end = cmp::min(seg_start + data_len, page_va + PAGE_SIZE);
                     if copy_start < copy_end {
@@ -2032,14 +2356,20 @@ fn map_shared_library_segments(
                         }
                     }
                     // allocation ref belongs to cache; process mapping gets its own.
-                    cache.push(SharedLibraryPage { name: String::from(name), rel_page, phys: page });
+                    cache.push(SharedLibraryPage {
+                        name: String::from(name),
+                        rel_page,
+                        phys: page,
+                    });
                     phys::retain_page(page);
                     cached_mapping = true;
                     page
                 }
             } else {
                 let page = phys::alloc_page().ok_or(MapError::OutOfMemory)?;
-                unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+                unsafe {
+                    core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                }
                 let copy_start = cmp::max(seg_start, page_va);
                 let copy_end = cmp::min(seg_start + data_len, page_va + PAGE_SIZE);
                 if copy_start < copy_end {
@@ -2055,6 +2385,9 @@ fn map_shared_library_segments(
                 }
                 page
             };
+            if executable {
+                crate::arch::sync_instruction_cache(phys, PAGE_SIZE);
+            }
             if let Err(err) = unsafe { space.map_page_phys(page_va, phys, writable, executable) } {
                 // cached mappings own an extra process ref; private writable pages own
                 // their allocation ref. One free is correct in both cases.
@@ -2141,6 +2474,8 @@ pub fn fork(
             entry_point: parent_record.entry_point,
             user_stack_top: parent_record.user_stack_top,
             started: true,
+            block_intent: false,
+            wake_pending: false,
             pending_recv: None,
             // POSIX fork 语义：子进程不继承父的挂起信号 ⇒ 空位图起步。
             pending_signals: 0,
@@ -2239,6 +2574,8 @@ pub fn create_thread(
             entry_point: Some(entry),
             user_stack_top: Some(stack_top),
             started: true,
+            block_intent: false,
+            wake_pending: false,
             pending_recv: None,
             pending_signals: 0,
             parent: Some(parent_record.pid),
@@ -2445,7 +2782,9 @@ pub unsafe fn exec_load(
     //    半成品当场销毁，绝不留泄漏；错误逐级映射保持 spawn 路径同款语义。
     let elf = user_elf::build_user_elf(path).map_err(ProcessError::ElfError)?;
     let bias = choose_user_load_bias(&elf)?;
-    let runtime_entry = elf.runtime_entry(bias).ok_or(ProcessError::InvalidArgument)?;
+    let runtime_entry = elf
+        .runtime_entry(bias)
+        .ok_or(ProcessError::InvalidArgument)?;
     let mut space = AddressSpace::new();
     if let Err(err) = map_user_elf_segments(&mut space, &elf, path, bias) {
         space.destroy();
@@ -2469,8 +2808,7 @@ pub unsafe fn exec_load(
         };
 
     // —— CommitRebind：表锁内原子换入（此后不再有可失败步骤）。
-    let (old_space, committed) =
-        rebind_address_space(slot, space, runtime_entry, USER_STACK_TOP);
+    let (old_space, committed) = rebind_address_space(slot, space, runtime_entry, USER_STACK_TOP);
     if !committed {
         // AddressSpace 是 Copy，这里仍可触达新空间：防御性销毁防泄漏。
         space.destroy();
@@ -2846,6 +3184,8 @@ mod state_machine_tests {
             entry_point: None,
             user_stack_top: None,
             started: true,
+            block_intent: false,
+            wake_pending: false,
             pending_recv: None,
             pending_signals: 0,
             parent: parent.map(ProcessId::new),
@@ -3212,6 +3552,8 @@ mod thread_model_tests {
             entry_point: None,
             user_stack_top: None,
             started: true,
+            block_intent: false,
+            wake_pending: false,
             pending_recv: None,
             pending_signals: 0,
             parent: None,
@@ -3273,27 +3615,45 @@ mod thread_model_tests {
     }
 }
 
-
 #[cfg(test)]
 mod pie_loader_tests {
     use super::*;
     fn fake(span: u64) -> user_elf::UserElf {
         let mut segments = alloc::vec::Vec::new();
-        segments.push(user_elf::UserElfSegment { vaddr:0, offset:0, filesz:span, memsz:span, flags: crate::elf::PF_X });
-        user_elf::UserElf { kind:user_elf::UserElfKind::Dyn, entry:0, segments, relas:alloc::vec::Vec::new(), needed:alloc::vec::Vec::new(), symbols:alloc::vec::Vec::new() }
+        segments.push(user_elf::UserElfSegment {
+            vaddr: 0,
+            offset: 0,
+            filesz: span,
+            memsz: span,
+            flags: crate::elf::PF_X,
+        });
+        user_elf::UserElf {
+            kind: user_elf::UserElfKind::Dyn,
+            entry: 0,
+            segments,
+            relas: alloc::vec::Vec::new(),
+            needed: alloc::vec::Vec::new(),
+            symbols: alloc::vec::Vec::new(),
+        }
     }
     #[test]
     fn pie_bias_is_aligned_below_heap_and_entropy_varies_slot() {
-        let e=fake(0x4000);
-        let a=pie_bias_from_entropy(&e,1).unwrap(); let b=pie_bias_from_entropy(&e,2).unwrap();
-        assert_eq!(a & (USER_PIE_ALIGN-1),0); assert_eq!(b & (USER_PIE_ALIGN-1),0);
-        assert!(a>=USER_PIE_BASE_MIN && a<USER_HEAP_BASE); assert_ne!(a,b);
+        let e = fake(0x4000);
+        let a = pie_bias_from_entropy(&e, 1).unwrap();
+        let b = pie_bias_from_entropy(&e, 2).unwrap();
+        assert_eq!(a & (USER_PIE_ALIGN - 1), 0);
+        assert_eq!(b & (USER_PIE_ALIGN - 1), 0);
+        assert!(a >= USER_PIE_BASE_MIN && a < USER_HEAP_BASE);
+        assert_ne!(a, b);
     }
     #[test]
     fn library_slots_are_separate_from_heap_and_shm() {
-        let e=fake(0x4000);
-        assert_eq!(library_bias_for_index(0,&e),Some(USER_LIB_BASE));
-        assert_eq!(library_bias_for_index(1,&e),Some(USER_LIB_BASE+USER_LIB_SLOT));
+        let e = fake(0x4000);
+        assert_eq!(library_bias_for_index(0, &e), Some(USER_LIB_BASE));
+        assert_eq!(
+            library_bias_for_index(1, &e),
+            Some(USER_LIB_BASE + USER_LIB_SLOT)
+        );
         assert!(USER_LIB_BASE >= crate::shm::SHM_PUBLIC_END_FOR_TEST);
     }
 }

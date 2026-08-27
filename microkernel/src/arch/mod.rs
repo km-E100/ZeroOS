@@ -104,6 +104,17 @@ pub fn boot_secondaries() {
     }
 }
 
+pub fn power_control(action: u32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::power_control(action);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = action;
+    }
+}
+
 pub fn fpu_arm_full_access() {
     #[cfg(target_arch = "aarch64")]
     {
@@ -115,6 +126,19 @@ pub fn fpu_freeze_none() {
     #[cfg(target_arch = "aarch64")]
     {
         aarch64::fpu_freeze_none();
+    }
+}
+
+/// Make newly written executable memory visible to instruction fetch on all PEs.
+pub fn sync_instruction_cache(addr: usize, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::sync_instruction_cache(addr, len);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (addr, len);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -146,6 +170,67 @@ pub fn interrupt_number(raw: u32) -> u32 {
     {
         let _ = raw;
         0
+    }
+}
+
+pub fn reserve_pci_msi_affinity(
+    requester_id: u16,
+    event: u32,
+    cpu: usize,
+) -> Option<(u64, u32, u32)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::reserve_pci_msi_affinity(requester_id, event, cpu)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (requester_id, event, cpu);
+        None
+    }
+}
+
+pub fn reserve_pci_msi(requester_id: u16, event: u32) -> Option<(u64, u32, u32)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64::reserve_pci_msi(requester_id, event);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (requester_id, event);
+        None
+    }
+}
+
+pub fn allocate_pci_msi_affinity(
+    requester_id: u16,
+    event: u32,
+    cpu: usize,
+    handler: fn(u32),
+) -> Option<(u64, u32, u32)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::allocate_pci_msi_affinity(requester_id, event, cpu, handler)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (requester_id, event, cpu, handler);
+        None
+    }
+}
+
+pub fn allocate_pci_msi(
+    requester_id: u16,
+    event: u32,
+    handler: fn(u32),
+) -> Option<(u64, u32, u32)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64::allocate_pci_msi(requester_id, event, handler);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (requester_id, event, handler);
+        None
     }
 }
 
@@ -184,6 +269,37 @@ pub unsafe fn set_tpidr_el1(addr: usize) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = addr;
+    }
+}
+
+/// Switch to the per-CPU dedicated idle stack and never return to the caller's
+/// process/IRQ stack.
+pub unsafe fn enter_idle_stack(cpu: usize, entry: extern "C" fn(usize) -> !) -> ! {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::enter_idle_stack(cpu, entry)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        entry(cpu)
+    }
+}
+
+/// Abandon a process/IRQ stack and continue a scheduler handoff on the CPU's
+/// private scheduler stack.
+pub unsafe fn enter_scheduler_stack(
+    cpu: usize,
+    entry: extern "C" fn(usize, usize, usize) -> !,
+    arg1: usize,
+    arg2: usize,
+) -> ! {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::enter_scheduler_stack(cpu, entry, arg1, arg2)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        entry(cpu, arg1, arg2)
     }
 }
 

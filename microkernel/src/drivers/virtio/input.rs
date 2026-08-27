@@ -155,6 +155,11 @@ fn push_ring(s: &mut State, e: InputEvent) {
     s.ring[s.head] = e;
     s.head = next
 }
+/// Inject an already-normalized event from another transport (USB/xHCI).
+pub fn inject(event: InputEvent) {
+    push_ring(&mut STATE.lock(), event);
+}
+
 pub fn pop() -> Option<InputEvent> {
     let mut s = STATE.lock();
     if s.tail == s.head {

@@ -46,10 +46,14 @@ pub fn init(desc: &DriverDescriptor) {
             return;
         }
     }
-    let Some(q) = (unsafe { configure_queue::<QUEUE_SIZE>(base, 0) }) else {
+    let Some(mut q) = (unsafe { configure_queue::<QUEUE_SIZE>(base, 0) }) else {
         warn!("virtio-rng: queue unavailable");
         return;
     };
+    // RNG is deliberately polling-only: syscalls execute with IRQs masked and
+    // completion correctness cannot depend on an interrupt. Prevent the device
+    // from generating an otherwise-unhandled MSI-X/LPI for every entropy chunk.
+    q.suppress_interrupts();
     let buf = unsafe { alloc_zeroed(Layout::from_size_align(CHUNK, 64).unwrap()) };
     if buf.is_null() {
         warn!("virtio-rng: buffer OOM");

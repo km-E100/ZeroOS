@@ -1,5 +1,5 @@
 //! virtio-net 网络设备驱动（virtio-mmio legacy）。
-//! rx 队列 0（环形预填 RX 缓冲），tx 队列 1（单缓冲、非阻塞）。
+//! rx 队列 0（64 槽环形预填 RX 缓冲，吸收 TLS/TCP burst），tx 队列 1（单缓冲、非阻塞）。
 //!
 //! 与 blk 相同约束：EL1 屏蔽 IRQ，RX 完成依赖 EL0 窗口的 IRQ 处理，
 //! 因此 poll_receive/transmit 均为轮询/非阻塞接口，不做无界等待。
@@ -17,11 +17,13 @@ use super::{
     set_driver_ok, VirtQueue, VIRTQ_DESC_F_WRITE,
 };
 
-const RX_QUEUE_SIZE: usize = 8;
+const RX_QUEUE_SIZE: usize = 64;
 const TX_QUEUE_SIZE: usize = 8;
 const MAX_FRAME: usize = 1536;
-const NET_HDR_LEN: usize = 10;
-const BUFFER_LEN: usize = NET_HDR_LEN + MAX_FRAME;
+const LEGACY_NET_HDR_LEN: usize = 10;
+const MODERN_NET_HDR_LEN: usize = 12;
+const NET_HDR_MAX: usize = MODERN_NET_HDR_LEN;
+const BUFFER_LEN: usize = NET_HDR_MAX + MAX_FRAME;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const REG_CONFIG: usize = 0x100;
 const DEVICE_ID_NET: u32 = 1;
@@ -36,6 +38,7 @@ struct VirtioNetState {
     tx_buffer: *mut u8,
     tx_inflight: bool,
     mac: [u8; 6],
+    hdr_len: usize,
 }
 
 impl VirtioNetState {
@@ -50,6 +53,7 @@ impl VirtioNetState {
             tx_buffer: ptr::null_mut(),
             tx_inflight: false,
             mac: [0; 6],
+            hdr_len: LEGACY_NET_HDR_LEN,
         }
     }
 }
@@ -63,6 +67,11 @@ pub fn init(descriptor: &DriverDescriptor) {
     unsafe {
         let version = super::transport_version(base);
         crate::info!("virtio-net: transport version={}", version);
+        STATE.lock().hdr_len = if version >= 2 {
+            MODERN_NET_HDR_LEN
+        } else {
+            LEGACY_NET_HDR_LEN
+        };
         if mmio_read32(base, 0x008) == 0 {
             return;
         }
@@ -76,8 +85,17 @@ pub fn init(descriptor: &DriverDescriptor) {
         if features & VIRTIO_NET_F_MAC != 0 {
             let mut mac = [0u8; 6];
             for (i, b) in mac.iter_mut().enumerate() {
-                *b = core::ptr::read_volatile((base + REG_CONFIG + i) as *const u8);
+                *b = super::transport_read8(base, REG_CONFIG + i);
             }
+            crate::info!(
+                "virtio-net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            );
             STATE.lock().mac = mac;
         }
     }
@@ -202,15 +220,17 @@ pub fn transmit(frame: &[u8]) -> Result<(), NetError> {
         return Err(NetError::DeviceError);
     }
     unsafe {
-        ptr::write_bytes(tx_buffer, 0, NET_HDR_LEN);
-        ptr::copy_nonoverlapping(frame.as_ptr(), tx_buffer.add(NET_HDR_LEN), frame.len());
+        let hdr_len = state.hdr_len;
+        ptr::write_bytes(tx_buffer, 0, hdr_len);
+        ptr::copy_nonoverlapping(frame.as_ptr(), tx_buffer.add(hdr_len), frame.len());
     }
     {
+        let hdr_len = state.hdr_len;
         let queue = state.tx_queue.as_mut().ok_or(NetError::DeviceError)?;
         unsafe {
             let desc = queue.desc;
             (*desc).addr = tx_buffer as u64;
-            (*desc).len = (NET_HDR_LEN + frame.len()) as u32;
+            (*desc).len = (hdr_len + frame.len()) as u32;
             (*desc).flags = 0;
             (*desc).next = 0;
             // push 内部负责 dmb oshst + 通知。
@@ -240,19 +260,20 @@ pub fn poll_receive(buffer: &mut [u8]) -> Result<Option<usize>, NetError> {
         let len = state.rx_lengths[idx];
         if len != u16::MAX {
             let total = len as usize;
-            if total < NET_HDR_LEN {
+            let hdr_len = state.hdr_len;
+            if total < hdr_len {
                 state.rx_lengths[idx] = u16::MAX;
                 if let Some(queue) = state.rx_queue.as_mut() {
                     queue.push(idx as u16);
                 }
                 return Err(NetError::DeviceError);
             }
-            let len_usize = total - NET_HDR_LEN;
+            let len_usize = total - hdr_len;
             if buffer.len() < len_usize {
                 return Err(NetError::BufferTooSmall);
             }
             unsafe {
-                let src = state.rx_buffers.add(idx * BUFFER_LEN + NET_HDR_LEN);
+                let src = state.rx_buffers.add(idx * BUFFER_LEN + hdr_len);
                 ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), len_usize);
             }
             state.rx_lengths[idx] = u16::MAX;

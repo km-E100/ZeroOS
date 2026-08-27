@@ -82,7 +82,12 @@ static INITIALISED: AtomicBool = AtomicBool::new(false);
 /// 供诊断与未来配额使用。
 static PAGE_TABLE_PAGES: AtomicUsize = AtomicUsize::new(0);
 
-pub fn init_with_kernel_range(memory_bytes: usize, legacy_reserved_bytes: usize, kernel_start: usize, kernel_end: usize) {
+pub fn init_with_kernel_range(
+    memory_bytes: usize,
+    legacy_reserved_bytes: usize,
+    kernel_start: usize,
+    kernel_end: usize,
+) {
     if INITIALISED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -95,10 +100,17 @@ pub fn init_with_kernel_range(memory_bytes: usize, legacy_reserved_bytes: usize,
     let mut holes_reserved = 0usize; // 分支内必然赋值；初值仅为类型占位
                                      // ⚠ pstore 窗口 tripwire：内核镜像保留区一旦长过窗口基址，说明窗口
                                      // 落进了内核自身内存（BSS 别名），pstore 不再可用——串口大声报警。
-    if ranges_overlap(kernel_start, kernel_end, PSTORE_BASE as usize, PSTORE_BASE as usize + PSTORE_SIZE) {
+    if ranges_overlap(
+        kernel_start,
+        kernel_end,
+        PSTORE_BASE as usize,
+        PSTORE_BASE as usize + PSTORE_SIZE,
+    ) {
         crate::warn!(
             "phys: relocated kernel [{:#x},{:#x}) overlaps pstore window @0x{:x}",
-            kernel_start, kernel_end, PSTORE_BASE
+            kernel_start,
+            kernel_end,
+            PSTORE_BASE
         );
     }
     let mut mm = MM.lock();
@@ -155,15 +167,21 @@ fn ranges_overlap(a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
 }
 
 fn mark_absolute_range_busy(mm: &mut PhysBitmap, start: usize, end: usize) -> usize {
-    if end <= start || end <= RAM_BASE { return 0; }
+    if end <= start || end <= RAM_BASE {
+        return 0;
+    }
     let ram_end = RAM_BASE.saturating_add(mm.total_pages().saturating_mul(PAGE_SIZE));
     let s = start.max(RAM_BASE);
     let e = end.min(ram_end);
-    if e <= s { return 0; }
+    if e <= s {
+        return 0;
+    }
     let first = (s - RAM_BASE) / PAGE_SIZE;
     let last = (e - RAM_BASE).div_ceil(PAGE_SIZE);
-    let mut marked=0usize;
-    for page in first..last.min(mm.total_pages()) { marked += usize::from(mm.mark_busy(page)); }
+    let mut marked = 0usize;
+    for page in first..last.min(mm.total_pages()) {
+        marked += usize::from(mm.mark_busy(page));
+    }
     marked
 }
 
@@ -194,10 +212,20 @@ fn legacy_init(mm: &mut PhysBitmap, memory_bytes: usize, reserved_bytes: usize) 
 /// 区间覆盖**的页标忙（EFI 空洞/固件保留），最后把内核镜像保留区
 /// （天花板取页）标忙。
 fn init_from_regions(mm: &mut PhysBitmap, regions: &[(usize, usize)], reserved_bytes: usize) {
-    init_from_regions_exact(mm, regions, RAM_BASE, RAM_BASE.saturating_add(reserved_bytes));
+    init_from_regions_exact(
+        mm,
+        regions,
+        RAM_BASE,
+        RAM_BASE.saturating_add(reserved_bytes),
+    );
 }
 
-fn init_from_regions_exact(mm: &mut PhysBitmap, regions: &[(usize, usize)], kernel_start: usize, kernel_end: usize) {
+fn init_from_regions_exact(
+    mm: &mut PhysBitmap,
+    regions: &[(usize, usize)],
+    kernel_start: usize,
+    kernel_end: usize,
+) {
     // ⚠ 坐标纪律：regions 存**绝对物理地址**；页号一律相对 RAM_BASE。
     // 曾把绝对地址直接除以 PAGE_SIZE 当页号（0x40000000/4096=262144），
     // 导致"空洞扫描"把全部页标忙、free_pages=0（实机探针定位）。

@@ -60,47 +60,66 @@ impl<D: BlockDevice> Volume<D> {
             Err(err) => return Err(ZfsError::from(err)),
         };
         let fresh = superblock.is_none();
-        let superblock = superblock.unwrap_or_else(|| create_default_superblock(D::BLOCK_SIZE as u32));
+        let superblock =
+            superblock.unwrap_or_else(|| create_default_superblock(D::BLOCK_SIZE as u32));
         // `cluster_size` is allocation geometry, never capacity.
         let total_blocks = device
             .block_count()
             .filter(|n| *n > metadata::RESERVED_END)
             .unwrap_or_else(|| core::cmp::max(superblock.cluster_size as u64, 4096));
-        let block_size = if superblock.block_size == 0 { D::BLOCK_SIZE } else { superblock.block_size as usize };
+        let block_size = if superblock.block_size == 0 {
+            D::BLOCK_SIZE
+        } else {
+            superblock.block_size as usize
+        };
 
         // Block0 = superblock. Blocks 1..RESERVED_END are the crash-safe
         // metadata banks. The historical in-memory Journal no longer reserves
         // one disk block per entry; doing so wasted capacity without persistence.
         let mut reserved = options.reserved_blocks.clone();
-        if !reserved.contains(&0) { reserved.push(0); }
-        for block in 1..metadata::RESERVED_END { reserved.push(block); }
+        if !reserved.contains(&0) {
+            reserved.push(0);
+        }
+        for block in 1..metadata::RESERVED_END {
+            reserved.push(block);
+        }
         reserved.sort_unstable();
         reserved.dedup();
 
         let mut allocator = BlockAllocator::new(1, total_blocks.saturating_sub(1));
         for &block in &reserved {
             if allocator.in_range(block) {
-                allocator.mark_used_idempotent(block).map_err(|_| ZfsError::CorruptEntry)?;
+                allocator
+                    .mark_used_idempotent(block)
+                    .map_err(|_| ZfsError::CorruptEntry)?;
             }
         }
         options.reserved_blocks = reserved;
 
         let restored = metadata::load(&device)?;
-        let (directory, next_inode, logical_time, metadata_generation) = if let Some(state) = restored {
-            let mut directory = DirectoryIndex::new();
-            for (path, entry) in &state.entries {
-                for &block in &entry.blocks {
-                    if !allocator.in_range(block) || block < metadata::RESERVED_END {
-                        return Err(ZfsError::CorruptEntry);
+        let (directory, next_inode, logical_time, metadata_generation) =
+            if let Some(state) = restored {
+                let mut directory = DirectoryIndex::new();
+                for (path, entry) in &state.entries {
+                    for &block in &entry.blocks {
+                        if !allocator.in_range(block) || block < metadata::RESERVED_END {
+                            return Err(ZfsError::CorruptEntry);
+                        }
+                        allocator
+                            .mark_used_idempotent(block)
+                            .map_err(|_| ZfsError::CorruptEntry)?;
                     }
-                    allocator.mark_used_idempotent(block).map_err(|_| ZfsError::CorruptEntry)?;
+                    directory.insert(path.clone(), entry.clone());
                 }
-                directory.insert(path.clone(), entry.clone());
-            }
-            (directory, state.next_inode, state.logical_time, state.generation)
-        } else {
-            (DirectoryIndex::new(), 2, 1, 0)
-        };
+                (
+                    directory,
+                    state.next_inode,
+                    state.logical_time,
+                    state.generation,
+                )
+            } else {
+                (DirectoryIndex::new(), 2, 1, 0)
+            };
 
         let mut volume = Self {
             device,
@@ -185,25 +204,37 @@ impl<D: BlockDevice> Volume<D> {
     /// Read at most `out.len()` bytes starting at a file offset without first
     /// materialising the whole file. Only blocks intersecting the requested
     /// range are touched; this is the data path used by fsd file descriptors.
-    pub fn read_file_at(&self, path: &str, offset: usize, out: &mut [u8]) -> Result<usize, ZfsError> {
+    pub fn read_file_at(
+        &self,
+        path: &str,
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<usize, ZfsError> {
         let entry = self.directory.get(path).ok_or(ZfsError::NotFound)?;
-        if entry.kind() != InodeKind::File { return Err(ZfsError::Unsupported); }
+        if entry.kind() != InodeKind::File {
+            return Err(ZfsError::Unsupported);
+        }
         let size = usize::try_from(entry.size()).map_err(|_| ZfsError::InvalidArgument)?;
-        if offset >= size || out.is_empty() { return Ok(0); }
+        if offset >= size || out.is_empty() {
+            return Ok(0);
+        }
         let want = core::cmp::min(out.len(), size - offset);
         let first_block = offset / self.block_size;
         let last_block = (offset + want - 1) / self.block_size;
         let mut written = 0usize;
         let mut tmp = vec![0u8; self.block_size];
         for block_index in first_block..=last_block {
-            let block = *entry.blocks.get(block_index).ok_or(ZfsError::InvalidSuperblock)?;
+            let block = *entry
+                .blocks
+                .get(block_index)
+                .ok_or(ZfsError::InvalidSuperblock)?;
             self.device.read_block(block, &mut tmp)?;
             let block_file_start = block_index * self.block_size;
             let from = offset.saturating_sub(block_file_start);
             let file_end = offset + want;
             let to = core::cmp::min(self.block_size, file_end - block_file_start);
             let n = to.saturating_sub(from);
-            out[written..written+n].copy_from_slice(&tmp[from..to]);
+            out[written..written + n].copy_from_slice(&tmp[from..to]);
             written += n;
         }
         Ok(written)
@@ -211,7 +242,9 @@ impl<D: BlockDevice> Volume<D> {
 
     pub fn file_size(&self, path: &str) -> Result<usize, ZfsError> {
         let entry = self.directory.get(path).ok_or(ZfsError::NotFound)?;
-        if entry.kind() != InodeKind::File { return Err(ZfsError::Unsupported); }
+        if entry.kind() != InodeKind::File {
+            return Err(ZfsError::Unsupported);
+        }
         usize::try_from(entry.size()).map_err(|_| ZfsError::InvalidArgument)
     }
 
@@ -224,7 +257,9 @@ impl<D: BlockDevice> Volume<D> {
         let digest = crypto::sha256(data);
         if self.options.verify_signatures {
             if let Some(signature) = expected_signature {
-                if !constant_time_eq(signature, &digest) { return Err(ZfsError::SignatureMismatch); }
+                if !constant_time_eq(signature, &digest) {
+                    return Err(ZfsError::SignatureMismatch);
+                }
             }
         }
 
@@ -238,7 +273,9 @@ impl<D: BlockDevice> Volume<D> {
             match self.allocator.allocate() {
                 Ok(block) => blocks.push(block),
                 Err(_) => {
-                    for b in blocks { let _ = self.allocator.free(b); }
+                    for b in blocks {
+                        let _ = self.allocator.free(b);
+                    }
                     return Err(ZfsError::AllocationFailed);
                 }
             }
@@ -249,7 +286,9 @@ impl<D: BlockDevice> Volume<D> {
             let end = core::cmp::min(start + self.block_size, data.len());
             tmp[..end - start].copy_from_slice(&data[start..end]);
             if let Err(err) = self.device.write_block(block, &tmp) {
-                for &b in &blocks { let _ = self.allocator.free(b); }
+                for &b in &blocks {
+                    let _ = self.allocator.free(b);
+                }
                 return Err(err.into());
             }
         }
@@ -258,22 +297,42 @@ impl<D: BlockDevice> Volume<D> {
         let inode_id = InodeId(self.next_inode);
         self.next_inode = self.next_inode.saturating_add(1);
         let mut inode = Inode {
-            id: inode_id, kind: InodeKind::File, size: data.len() as u64,
-            mode: 0o644, uid: 0, gid: 0, links: 1, data: [0; 12], extent_root: 0,
-            ctime: self.logical_time, mtime: self.logical_time,
+            id: inode_id,
+            kind: InodeKind::File,
+            size: data.len() as u64,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            links: 1,
+            data: [0; 12],
+            extent_root: 0,
+            ctime: self.logical_time,
+            mtime: self.logical_time,
         };
-        for (slot, block) in blocks.iter().take(12).enumerate() { inode.data[slot] = *block; }
-        self.directory.insert(path, DirectoryEntry::new(inode, blocks.clone(), Some(digest)));
+        for (slot, block) in blocks.iter().take(12).enumerate() {
+            inode.data[slot] = *block;
+        }
+        self.directory.insert(
+            path,
+            DirectoryEntry::new(inode, blocks.clone(), Some(digest)),
+        );
 
         if let Err(err) = self.persist_metadata() {
             self.directory.remove(path);
-            if let Some(ref old_entry) = old { self.directory.insert(path, old_entry.clone()); }
-            for &b in &blocks { let _ = self.allocator.free(b); }
+            if let Some(ref old_entry) = old {
+                self.directory.insert(path, old_entry.clone());
+            }
+            for &b in &blocks {
+                let _ = self.allocator.free(b);
+            }
             self.next_inode = self.next_inode.saturating_sub(1).max(2);
             return Err(err);
         }
         let _ = self.journal.record(JournalEntry::Write {
-            path: String::from(path), blocks: blocks.clone(), size: data.len() as u64, checksum: digest,
+            path: String::from(path),
+            blocks: blocks.clone(),
+            size: data.len() as u64,
+            checksum: digest,
         });
         if let Some(old_entry) = old {
             for block in old_entry.blocks {
@@ -287,15 +346,23 @@ impl<D: BlockDevice> Volume<D> {
     }
 
     pub fn remove_file(&mut self, path: &str) -> Result<(), ZfsError> {
-        let entry = self.directory.get(path).cloned().ok_or(ZfsError::NotFound)?;
-        if entry.kind() != InodeKind::File { return Err(ZfsError::Unsupported); }
+        let entry = self
+            .directory
+            .get(path)
+            .cloned()
+            .ok_or(ZfsError::NotFound)?;
+        if entry.kind() != InodeKind::File {
+            return Err(ZfsError::Unsupported);
+        }
         let entry = self.directory.remove(path).ok_or(ZfsError::NotFound)?;
         if let Err(err) = self.persist_metadata() {
             self.directory.insert(path, entry);
             return Err(err);
         }
         for block in entry.blocks {
-            if self.snapshots.references(block) { continue; }
+            if self.snapshots.references(block) {
+                continue;
+            }
             let _ = self.allocator.free(block);
             let _ = self.journal.record(JournalEntry::Free { block });
         }
@@ -315,12 +382,21 @@ impl<D: BlockDevice> Volume<D> {
         }
         self.logical_time = self.logical_time.saturating_add(1);
         let inode = Inode {
-            id: InodeId(self.next_inode), kind: InodeKind::Directory, size: 0,
-            mode: 0o755, uid: 0, gid: 0, links: 1, data: [0; 12], extent_root: 0,
-            ctime: self.logical_time, mtime: self.logical_time,
+            id: InodeId(self.next_inode),
+            kind: InodeKind::Directory,
+            size: 0,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            links: 1,
+            data: [0; 12],
+            extent_root: 0,
+            ctime: self.logical_time,
+            mtime: self.logical_time,
         };
         self.next_inode = self.next_inode.saturating_add(1);
-        self.directory.insert(path, DirectoryEntry::new(inode, Vec::new(), None));
+        self.directory
+            .insert(path, DirectoryEntry::new(inode, Vec::new(), None));
         if let Err(err) = self.persist_metadata() {
             self.directory.remove(path);
             self.next_inode = self.next_inode.saturating_sub(1).max(2);
@@ -330,12 +406,27 @@ impl<D: BlockDevice> Volume<D> {
     }
 
     pub fn remove_dir(&mut self, path: &str) -> Result<(), ZfsError> {
-        let entry = self.directory.get(path).cloned().ok_or(ZfsError::NotFound)?;
-        if entry.kind() != InodeKind::Directory { return Err(ZfsError::Unsupported); }
-        let prefix = if path.ends_with('/') { String::from(path) } else {
-            let mut p = String::from(path); p.push('/'); p
+        let entry = self
+            .directory
+            .get(path)
+            .cloned()
+            .ok_or(ZfsError::NotFound)?;
+        if entry.kind() != InodeKind::Directory {
+            return Err(ZfsError::Unsupported);
+        }
+        let prefix = if path.ends_with('/') {
+            String::from(path)
+        } else {
+            let mut p = String::from(path);
+            p.push('/');
+            p
         };
-        if self.directory.snapshot().keys().any(|p| p.starts_with(&prefix)) {
+        if self
+            .directory
+            .snapshot()
+            .keys()
+            .any(|p| p.starts_with(&prefix))
+        {
             return Err(ZfsError::DirectoryConflict);
         }
         self.directory.remove(path);
@@ -353,36 +444,59 @@ impl<D: BlockDevice> Volume<D> {
         if old == new || new.is_empty() || !new.starts_with('/') || new.contains("..") {
             return Err(ZfsError::InvalidArgument);
         }
-        if self.directory.get(new).is_some() { return Err(ZfsError::DirectoryConflict); }
+        if self.directory.get(new).is_some() {
+            return Err(ZfsError::DirectoryConflict);
+        }
         let root = self.directory.get(old).cloned().ok_or(ZfsError::NotFound)?;
         if root.kind() != InodeKind::Directory {
             self.directory.remove(old);
             self.directory.insert(new, root.clone());
-            if let Err(err)=self.persist_metadata(){
-                self.directory.remove(new); self.directory.insert(old,root); return Err(err);
+            if let Err(err) = self.persist_metadata() {
+                self.directory.remove(new);
+                self.directory.insert(old, root);
+                return Err(err);
             }
             return Ok(());
         }
 
         // Directory rename is a single namespace transaction. Collect the
         // subtree first, rewrite all keys in RAM, then commit one metadata bank.
-        let prefix = { let mut p=String::from(old.trim_end_matches('/')); p.push('/'); p };
-        let new_prefix = { let mut p=String::from(new.trim_end_matches('/')); p.push('/'); p };
-        let snapshot=self.directory.snapshot();
-        let mut moves:Vec<(String,String,DirectoryEntry)>=Vec::new();
-        moves.push((String::from(old),String::from(new),root));
-        for (path,entry) in snapshot.iter(){
-            if path.starts_with(&prefix){
-                let mut dest=new_prefix.clone(); dest.push_str(&path[prefix.len()..]);
-                if snapshot.contains_key(&dest){return Err(ZfsError::DirectoryConflict);}
-                moves.push((path.clone(),dest,entry.clone()));
+        let prefix = {
+            let mut p = String::from(old.trim_end_matches('/'));
+            p.push('/');
+            p
+        };
+        let new_prefix = {
+            let mut p = String::from(new.trim_end_matches('/'));
+            p.push('/');
+            p
+        };
+        let snapshot = self.directory.snapshot();
+        let mut moves: Vec<(String, String, DirectoryEntry)> = Vec::new();
+        moves.push((String::from(old), String::from(new), root));
+        for (path, entry) in snapshot.iter() {
+            if path.starts_with(&prefix) {
+                let mut dest = new_prefix.clone();
+                dest.push_str(&path[prefix.len()..]);
+                if snapshot.contains_key(&dest) {
+                    return Err(ZfsError::DirectoryConflict);
+                }
+                moves.push((path.clone(), dest, entry.clone()));
             }
         }
-        for (src,_,_) in &moves { self.directory.remove(src); }
-        for (_,dst,e) in &moves { self.directory.insert(dst.clone(),e.clone()); }
-        if let Err(err)=self.persist_metadata(){
-            for (_,dst,_) in &moves { self.directory.remove(dst); }
-            for (src,_,e) in moves { self.directory.insert(src,e); }
+        for (src, _, _) in &moves {
+            self.directory.remove(src);
+        }
+        for (_, dst, e) in &moves {
+            self.directory.insert(dst.clone(), e.clone());
+        }
+        if let Err(err) = self.persist_metadata() {
+            for (_, dst, _) in &moves {
+                self.directory.remove(dst);
+            }
+            for (src, _, e) in moves {
+                self.directory.insert(src, e);
+            }
             return Err(err);
         }
         Ok(())
@@ -563,22 +677,33 @@ mod tests {
         let device = crate::device::MemoryBlockDevice::new(&MEMORY_D);
         {
             let mut volume = Volume::mount(device.clone(), MountOptions::default()).unwrap();
-            volume.write_file("/Applications/demo.app/bin", b"persistent-elf-bytes", None).unwrap();
+            volume
+                .write_file("/Applications/demo.app/bin", b"persistent-elf-bytes", None)
+                .unwrap();
         }
         {
             let mut volume = Volume::mount(device.clone(), MountOptions::default()).unwrap();
             let mut out = Vec::new();
-            volume.read_file("/Applications/demo.app/bin", &mut out).unwrap();
+            volume
+                .read_file("/Applications/demo.app/bin", &mut out)
+                .unwrap();
             assert_eq!(&out, b"persistent-elf-bytes");
             // Restored data blocks must be marked busy, so a new write cannot
             // silently reuse and corrupt the first file.
-            volume.write_file("/Applications/demo.app/manifest", b"v=1", None).unwrap();
+            volume
+                .write_file("/Applications/demo.app/manifest", b"v=1", None)
+                .unwrap();
             volume.remove_file("/Applications/demo.app/bin").unwrap();
         }
         let volume = Volume::mount(device, MountOptions::default()).unwrap();
         let mut out = Vec::new();
-        assert!(matches!(volume.read_file("/Applications/demo.app/bin", &mut out), Err(ZfsError::NotFound)));
-        volume.read_file("/Applications/demo.app/manifest", &mut out).unwrap();
+        assert!(matches!(
+            volume.read_file("/Applications/demo.app/bin", &mut out),
+            Err(ZfsError::NotFound)
+        ));
+        volume
+            .read_file("/Applications/demo.app/manifest", &mut out)
+            .unwrap();
         assert_eq!(&out, b"v=1");
     }
 
@@ -609,20 +734,27 @@ mod tests {
     #[test]
     fn directory_subtree_rename_is_persistent() {
         static MEMORY_E: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-        MEMORY_E.lock().clear(); MEMORY_E.lock().resize(4*1024*1024,0);
-        let dev=crate::device::MemoryBlockDevice::new(&MEMORY_E);
+        MEMORY_E.lock().clear();
+        MEMORY_E.lock().resize(4 * 1024 * 1024, 0);
+        let dev = crate::device::MemoryBlockDevice::new(&MEMORY_E);
         {
-            let mut v=Volume::mount(dev.clone(),MountOptions::default()).unwrap();
-            v.create_dir("/Applications").unwrap(); v.create_dir("/Applications/.tmp").unwrap();
-            v.write_file("/Applications/.tmp/main",b"elf",None).unwrap();
+            let mut v = Volume::mount(dev.clone(), MountOptions::default()).unwrap();
+            v.create_dir("/Applications").unwrap();
+            v.create_dir("/Applications/.tmp").unwrap();
+            v.write_file("/Applications/.tmp/main", b"elf", None)
+                .unwrap();
             v.create_dir("/Applications/.tmp/res").unwrap();
-            v.write_file("/Applications/.tmp/res/a",b"a",None).unwrap();
-            v.rename_path("/Applications/.tmp","/Applications/Demo.app").unwrap();
+            v.write_file("/Applications/.tmp/res/a", b"a", None)
+                .unwrap();
+            v.rename_path("/Applications/.tmp", "/Applications/Demo.app")
+                .unwrap();
         }
-        let mut v=Volume::mount(dev,MountOptions::default()).unwrap();
-        let mut out=Vec::new(); v.read_file("/Applications/Demo.app/main",&mut out).unwrap(); assert_eq!(&out,b"elf");
+        let mut v = Volume::mount(dev, MountOptions::default()).unwrap();
+        let mut out = Vec::new();
+        v.read_file("/Applications/Demo.app/main", &mut out)
+            .unwrap();
+        assert_eq!(&out, b"elf");
         assert!(v.entry_exists("/Applications/Demo.app/res"));
         assert!(!v.entry_exists("/Applications/.tmp/main"));
     }
-
 }

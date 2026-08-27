@@ -2,11 +2,14 @@
 extern crate alloc;
 
 use alloc::{vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 use zero_abi::channels::{INPUT_EVENT_BUS, WINDOW_REQ, WINDOW_RESP};
-use zero_abi::input::{InputEvent, KIND_BUTTON, KIND_REL};
+use zero_abi::input::{InputEvent, KIND_ABS, KIND_BUTTON, KIND_REL};
 use zero_abi::ipc::Message;
 use zero_abi::protocol::window as wp;
 use zero_abi::syscall::SysError;
+
+static ABS_POINTER_SEEN: AtomicBool = AtomicBool::new(false);
 
 pub const MAX_WINDOWS: usize = 32;
 
@@ -179,6 +182,20 @@ impl Compositor {
             }
         }
     }
+    pub fn pointer_absolute_axis(&mut self, axis: u16, raw: i32) {
+        let raw = raw.clamp(0, 0x7fff);
+        let target = if axis == 0 {
+            (raw as i64 * self.width.saturating_sub(1) as i64 / 0x7fff) as i32
+        } else {
+            (raw as i64 * self.height.saturating_sub(1) as i64 / 0x7fff) as i32
+        };
+        let (dx, dy) = if axis == 0 {
+            (target - self.pointer.0, 0)
+        } else {
+            (0, target - self.pointer.1)
+        };
+        self.pointer_motion(dx, dy);
+    }
     pub fn pointer_button(&mut self, pressed: bool) {
         if pressed {
             if let Some(id) = self.hit_test(self.pointer.0, self.pointer.1) {
@@ -337,6 +354,12 @@ fn handle_input(c: &mut Compositor, m: &Message) {
                 c.pointer_motion(ev.value, 0)
             } else if ev.code == 1 {
                 c.pointer_motion(0, ev.value)
+            }
+        }
+        KIND_ABS if ev.code <= 1 => {
+            c.pointer_absolute_axis(ev.code, ev.value);
+            if !ABS_POINTER_SEEN.swap(true, Ordering::SeqCst) {
+                let _ = userlib::console_write(b"WindowServer: USB absolute pointer PASS\r\n");
             }
         }
         KIND_BUTTON => c.pointer_button(ev.value != 0),

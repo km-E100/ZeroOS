@@ -9,6 +9,18 @@ extern "C" {
     static __bss_end: u8;
 }
 
+/// Whether `[addr, addr+len)` lies inside the relocated kernel image.
+/// Used by crash diagnostics before dereferencing a faulting ELR.
+pub fn kernel_runtime_contains(addr: usize, len: usize) -> bool {
+    let start = unsafe { &__kernel_start as *const u8 as usize };
+    let end = unsafe { &__bss_end as *const u8 as usize };
+    addr >= start
+        && addr
+            .checked_add(len)
+            .map(|range_end| range_end <= end)
+            .unwrap_or(false)
+}
+
 /// 默认回退内存大小：bootloader 未提供真实值时使用（QEMU 惯性配置 512MiB
 /// 是保守下限，即使真实机器大于此值，恒等映射 2GiB 仍是上限）。
 const FALLBACK_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -65,17 +77,25 @@ pub fn init_arch(boot_info: &BootInfo) {
     // runtime image. Only this exact interval is pinned. The 16 MiB legacy
     // prefix is retained solely for total-bytes-only old bootloaders; modern
     // UEFI memory-map boots do not waste the gap below a high random base.
-    let kernel_start=unsafe{&__kernel_start as *const u8 as usize};
-    let kernel_end=unsafe{&__bss_end as *const u8 as usize};
-    const LEGACY_LOW_RESERVE:usize=16*1024*1024;
-    crate::info!("boot::init_arch: kernel runtime range [0x{:x},0x{:x}) span=0x{:x}",kernel_start,kernel_end,kernel_end.saturating_sub(kernel_start));
-    mm::init_relocated(memory_bytes,LEGACY_LOW_RESERVE,kernel_start,kernel_end);
+    let kernel_start = unsafe { &__kernel_start as *const u8 as usize };
+    let kernel_end = unsafe { &__bss_end as *const u8 as usize };
+    const LEGACY_LOW_RESERVE: usize = 16 * 1024 * 1024;
+    crate::info!(
+        "boot::init_arch: kernel runtime range [0x{:x},0x{:x}) span=0x{:x}",
+        kernel_start,
+        kernel_end,
+        kernel_end.saturating_sub(kernel_start)
+    );
+    mm::init_relocated(memory_bytes, LEGACY_LOW_RESERVE, kernel_start, kernel_end);
     crate::info!("boot::init_arch: mm init done");
 
     // 固件表位于物理地址空间；等恒等映射/设备属性稳定后再解析，随后
     // 立刻让 GIC/timer/PSCI 消费结果。这样 ACPI 不再只是“打印出来”。
     crate::acpi::init();
     arch::init_platform();
+    // Knife35: enumerate PCIe from MCFG before user address spaces are cloned.
+    crate::pci::init();
+    crate::iommu::init();
     crate::display::init();
     crate::info!("boot::init_arch: ACPI + platform IRQ/display init done");
 }

@@ -181,7 +181,11 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
         .checked_add(ph.p_filesz as usize)
         .ok_or(ElfError::MalformedDynamic)?;
     let dyns = bytes.get(start..end).ok_or(ElfError::MalformedDynamic)?;
-    let mut di = DynamicInfo { rela_ent: RELA_ENT, syment: SYM_ENT, ..DynamicInfo::default() };
+    let mut di = DynamicInfo {
+        rela_ent: RELA_ENT,
+        syment: SYM_ENT,
+        ..DynamicInfo::default()
+    };
 
     for d in dyns.chunks_exact(16) {
         let tag = i64::from_le_bytes(d[0..8].try_into().unwrap());
@@ -189,7 +193,9 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
         match tag {
             DT_NULL => break,
             DT_NEEDED => {
-                if di.needed_offsets.len() >= MAX_NEEDED { return Err(ElfError::TooManyNeeded); }
+                if di.needed_offsets.len() >= MAX_NEEDED {
+                    return Err(ElfError::TooManyNeeded);
+                }
                 di.needed_offsets.push(val as usize)
             }
             DT_PLTRELSZ => di.pltrel_sz = val as usize,
@@ -210,7 +216,13 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
     let strtab = if di.strsz != 0 || !di.needed_offsets.is_empty() || di.symtab_va.is_some() {
         let str_va = di.strtab_va.ok_or(ElfError::MalformedDynamic)?;
         let str_off = va_to_file_offset(elf, str_va).ok_or(ElfError::MalformedDynamic)?;
-        bytes.get(str_off..str_off.checked_add(di.strsz).ok_or(ElfError::MalformedDynamic)?)
+        bytes
+            .get(
+                str_off
+                    ..str_off
+                        .checked_add(di.strsz)
+                        .ok_or(ElfError::MalformedDynamic)?,
+            )
             .ok_or(ElfError::MalformedDynamic)?
     } else {
         &[][..]
@@ -218,19 +230,33 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
 
     for off in di.needed_offsets {
         let name = string_at(strtab, off)?;
-        if name.len() > MAX_NEEDED_NAME { return Err(ElfError::TooManyNeeded); }
+        if name.len() > MAX_NEEDED_NAME {
+            return Err(ElfError::TooManyNeeded);
+        }
         elf.needed.push(String::from(name));
     }
 
     if let Some(sym_va) = di.symtab_va {
-        if di.syment != SYM_ENT { return Err(ElfError::MalformedDynamic); }
+        if di.syment != SYM_ENT {
+            return Err(ElfError::MalformedDynamic);
+        }
         let hash_va = di.hash_va.ok_or(ElfError::MalformedDynamic)?;
         let hash_off = va_to_file_offset(elf, hash_va).ok_or(ElfError::MalformedDynamic)?;
-        let h = bytes.get(hash_off..hash_off + 8).ok_or(ElfError::MalformedDynamic)?;
+        let h = bytes
+            .get(hash_off..hash_off + 8)
+            .ok_or(ElfError::MalformedDynamic)?;
         let nchain = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
-        if nchain > MAX_SYMBOLS { return Err(ElfError::MalformedDynamic); }
+        if nchain > MAX_SYMBOLS {
+            return Err(ElfError::MalformedDynamic);
+        }
         let sym_off = va_to_file_offset(elf, sym_va).ok_or(ElfError::MalformedDynamic)?;
-        let raw = bytes.get(sym_off..sym_off.checked_add(nchain * SYM_ENT).ok_or(ElfError::MalformedDynamic)?)
+        let raw = bytes
+            .get(
+                sym_off
+                    ..sym_off
+                        .checked_add(nchain * SYM_ENT)
+                        .ok_or(ElfError::MalformedDynamic)?,
+            )
             .ok_or(ElfError::MalformedDynamic)?;
         for s in raw.chunks_exact(SYM_ENT) {
             let name_off = u32::from_le_bytes(s[0..4].try_into().unwrap()) as usize;
@@ -238,7 +264,11 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
             let shndx = u16::from_le_bytes(s[6..8].try_into().unwrap());
             let value = u64::from_le_bytes(s[8..16].try_into().unwrap());
             let size = u64::from_le_bytes(s[16..24].try_into().unwrap());
-            let name = if name_off == 0 { "" } else { string_at(strtab, name_off)? };
+            let name = if name_off == 0 {
+                ""
+            } else {
+                string_at(strtab, name_off)?
+            };
             elf.symbols.push(UserDynSymbol {
                 name: String::from(name),
                 value,
@@ -253,14 +283,24 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
         if di.rela_ent != RELA_ENT || di.rela_sz % RELA_ENT != 0 {
             return Err(ElfError::MalformedDynamic);
         }
-        parse_rela_range(bytes, elf, di.rela_va.ok_or(ElfError::MalformedDynamic)?, di.rela_sz)?;
+        parse_rela_range(
+            bytes,
+            elf,
+            di.rela_va.ok_or(ElfError::MalformedDynamic)?,
+            di.rela_sz,
+        )?;
     }
     if di.pltrel_sz != 0 {
         // DT_PLTREL value is DT_RELA (7) for ELF64 AArch64.
         if di.plt_rel_kind != DT_RELA as u64 || di.pltrel_sz % RELA_ENT != 0 {
             return Err(ElfError::UnsupportedRelocation);
         }
-        parse_rela_range(bytes, elf, di.jmprel_va.ok_or(ElfError::MalformedDynamic)?, di.pltrel_sz)?;
+        parse_rela_range(
+            bytes,
+            elf,
+            di.jmprel_va.ok_or(ElfError::MalformedDynamic)?,
+            di.pltrel_sz,
+        )?;
     }
 
     for r in &elf.relas {
@@ -273,10 +313,13 @@ fn parse_dynamic(bytes: &[u8], ph: ElfProgramHeader, elf: &mut UserElf) -> Resul
 
 fn parse_rela_range(bytes: &[u8], elf: &mut UserElf, va: u64, size: usize) -> Result<(), ElfError> {
     let off = va_to_file_offset(elf, va).ok_or(ElfError::MalformedDynamic)?;
-    let raw = bytes.get(off..off.checked_add(size).ok_or(ElfError::MalformedDynamic)?)
+    let raw = bytes
+        .get(off..off.checked_add(size).ok_or(ElfError::MalformedDynamic)?)
         .ok_or(ElfError::MalformedDynamic)?;
     for r in raw.chunks_exact(RELA_ENT) {
-        if elf.relas.len() >= MAX_RELOCATIONS { return Err(ElfError::TooManyRelocations); }
+        if elf.relas.len() >= MAX_RELOCATIONS {
+            return Err(ElfError::TooManyRelocations);
+        }
         let offset = u64::from_le_bytes(r[0..8].try_into().unwrap());
         let info = u64::from_le_bytes(r[8..16].try_into().unwrap());
         let addend = i64::from_le_bytes(r[16..24].try_into().unwrap());
@@ -287,20 +330,30 @@ fn parse_rela_range(bytes: &[u8], elf: &mut UserElf, va: u64, size: usize) -> Re
             R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT if sym != 0 => {}
             _ => return Err(ElfError::UnsupportedRelocation),
         }
-        elf.relas.push(UserRela { offset, typ, sym, addend });
+        elf.relas.push(UserRela {
+            offset,
+            typ,
+            sym,
+            addend,
+        });
     }
     Ok(())
 }
 
 fn string_at(table: &[u8], off: usize) -> Result<&str, ElfError> {
     let tail = table.get(off..).ok_or(ElfError::MalformedDynamic)?;
-    let n = tail.iter().position(|&b| b == 0).ok_or(ElfError::MalformedDynamic)?;
+    let n = tail
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(ElfError::MalformedDynamic)?;
     core::str::from_utf8(&tail[..n]).map_err(|_| ElfError::MalformedDynamic)
 }
 
 fn va_to_file_offset(elf: &UserElf, va: u64) -> Option<usize> {
     let seg = elf.segments.iter().find(|s| {
-        s.vaddr.checked_add(s.filesz).map_or(false, |end| va >= s.vaddr && va < end)
+        s.vaddr
+            .checked_add(s.filesz)
+            .map_or(false, |end| va >= s.vaddr && va < end)
     })?;
     let delta = va.checked_sub(seg.vaddr)?;
     usize::try_from(seg.offset.checked_add(delta)?).ok()
@@ -322,11 +375,17 @@ impl UserElf {
 }
 
 fn validate_segment_bounds(ph: &ElfProgramHeader, len: usize) -> Result<(), ElfError> {
-    if ph.p_filesz > ph.p_memsz { return Err(ElfError::InvalidHeader); }
+    if ph.p_filesz > ph.p_memsz {
+        return Err(ElfError::InvalidHeader);
+    }
     let offset = ph.p_offset as usize;
     let filesz = ph.p_filesz as usize;
-    let end = offset.checked_add(filesz).ok_or(ElfError::ProgramHeaderOutOfBounds)?;
-    if end > len { return Err(ElfError::ProgramHeaderOutOfBounds); }
+    let end = offset
+        .checked_add(filesz)
+        .ok_or(ElfError::ProgramHeaderOutOfBounds)?;
+    if end > len {
+        return Err(ElfError::ProgramHeaderOutOfBounds);
+    }
     Ok(())
 }
 
@@ -353,30 +412,37 @@ mod tests {
         b[54..56].copy_from_slice(&56u16.to_le_bytes());
         b[56..58].copy_from_slice(&2u16.to_le_bytes());
         // Executable PT_LOAD covers [vaddr 0x1000,0x1200).
-        let p0=64usize;
-        b[p0..p0+4].copy_from_slice(&PT_LOAD.to_le_bytes());
-        b[p0+4..p0+8].copy_from_slice(&(crate::elf::PF_R|PF_X).to_le_bytes());
-        b[p0+16..p0+24].copy_from_slice(&0x1000u64.to_le_bytes());
-        b[p0+32..p0+40].copy_from_slice(&0x200u64.to_le_bytes());
-        b[p0+40..p0+48].copy_from_slice(&0x200u64.to_le_bytes());
-        b[p0+48..p0+56].copy_from_slice(&0x1000u64.to_le_bytes());
+        let p0 = 64usize;
+        b[p0..p0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        b[p0 + 4..p0 + 8].copy_from_slice(&(crate::elf::PF_R | PF_X).to_le_bytes());
+        b[p0 + 16..p0 + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[p0 + 32..p0 + 40].copy_from_slice(&0x200u64.to_le_bytes());
+        b[p0 + 40..p0 + 48].copy_from_slice(&0x200u64.to_le_bytes());
+        b[p0 + 48..p0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
         // PT_DYNAMIC is 16-byte DT_NULL plus 8 bytes of legal segment padding.
-        let p1=p0+56;
-        b[p1..p1+4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
-        b[p1+8..p1+16].copy_from_slice(&0x180u64.to_le_bytes());
-        b[p1+16..p1+24].copy_from_slice(&0x1180u64.to_le_bytes());
-        b[p1+32..p1+40].copy_from_slice(&24u64.to_le_bytes());
-        b[p1+40..p1+48].copy_from_slice(&24u64.to_le_bytes());
+        let p1 = p0 + 56;
+        b[p1..p1 + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
+        b[p1 + 8..p1 + 16].copy_from_slice(&0x180u64.to_le_bytes());
+        b[p1 + 16..p1 + 24].copy_from_slice(&0x1180u64.to_le_bytes());
+        b[p1 + 32..p1 + 40].copy_from_slice(&24u64.to_le_bytes());
+        b[p1 + 40..p1 + 48].copy_from_slice(&24u64.to_le_bytes());
         b[0x190..0x198].fill(0xa5); // ignored tail padding after DT_NULL
-        let elf=parse_user_elf(&b).expect("valid padded PT_DYNAMIC");
-        assert_eq!(elf.kind,UserElfKind::Dyn);
+        let elf = parse_user_elf(&b).expect("valid padded PT_DYNAMIC");
+        assert_eq!(elf.kind, UserElfKind::Dyn);
         assert!(elf.relas.is_empty());
         assert!(elf.needed.is_empty());
     }
 
     #[test]
     fn runtime_entry_adds_bias() {
-        let elf = UserElf { kind: UserElfKind::Dyn, entry: 0x1234, segments: Vec::new(), relas: Vec::new(), needed: Vec::new(), symbols: Vec::new() };
+        let elf = UserElf {
+            kind: UserElfKind::Dyn,
+            entry: 0x1234,
+            segments: Vec::new(),
+            relas: Vec::new(),
+            needed: Vec::new(),
+            symbols: Vec::new(),
+        };
         assert_eq!(elf.runtime_entry(0x4000000), Some(0x4001234));
     }
 }

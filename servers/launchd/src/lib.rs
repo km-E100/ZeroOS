@@ -104,8 +104,16 @@ const STATUS_NOT_INSTALLED: u8 = 4;
 /// 已规划服务清单。二进制就绪并由内核登记前以 [not-installed] 呈现，
 /// 让 `launchd list` 如实反映系统蓝图而非空白。
 const KNOWN_SERVICES: [&str; 10] = [
-    "blkdrv", "fsd", "securityd", "inputd", "windowserver",
-    "netd", "pkgd", "audiod", "service-controller", "ipcrouter",
+    "blkdrv",
+    "fsd",
+    "securityd",
+    "inputd",
+    "windowserver",
+    "netd",
+    "pkgd",
+    "audiod",
+    "service-controller",
+    "ipcrouter",
 ];
 
 /// 服务表：全部状态驻留在 `server_main` 栈帧，单线程无需锁。

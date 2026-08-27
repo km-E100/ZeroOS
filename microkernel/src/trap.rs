@@ -72,40 +72,54 @@ struct TrapContext {
 /// 已释放全部 MutexGuard —— 所有 lock() 均以语句级表达式使用，
 /// 不存在跨函数调用的 Guard（见 scheduler.rs 头部锁纪律注释）。
 #[no_mangle]
-pub extern "C" fn __zero_trap_handler(frame: *mut TrapFrame, kind: u64) -> ! {
+pub extern "C" fn __zero_trap_handler(
+    frame: *mut TrapFrame,
+    kind: u64,
+    esr_snapshot: u64,
+    far_snapshot: u64,
+) -> ! {
+    // The assembly entry used TPIDR_EL1 to save the interrupted context. From
+    // this point onward the CPU is executing kernel code: retarget any nested
+    // exception to a per-CPU scratch frame before touching locks/allocators or
+    // code that may ever unmask interrupts. This preserves the original user
+    // TrapFrame as an immutable continuation until restore_context/dispatch.
+    unsafe {
+        let cpu = crate::arch::smp::cpu_id();
+        crate::arch::set_tpidr_el1(crate::process::idle_trap_frame_for(cpu) as usize);
+    }
     match TrapKind::from(kind) {
-        TrapKind::Sync => handle_sync(frame),
+        TrapKind::Sync => handle_sync(frame, esr_snapshot, far_snapshot),
         TrapKind::Irq => handle_irq(frame),
     }
 }
 
-fn handle_sync(frame: *mut TrapFrame) -> ! {
-    let esr = read_esr_el1();
-    crate::debug!("trap: sync ESR_EL1=0x{:016x}", esr);
-    let decoded = decode_esr(esr);
+fn handle_sync(frame: *mut TrapFrame, esr: u64, far: u64) -> ! {
+    crate::debug!("trap: sync ESR_EL1(snapshot)=0x{:016x}", esr);
+    let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
+    let mut decoded = decode_esr(esr);
+    decoded.from_el0 = from_el0;
     match decoded.kind {
-        SyncExceptionKind::Svc => handle_svc(frame, esr),
+        SyncExceptionKind::Svc => handle_svc(frame, esr, far),
         SyncExceptionKind::FpuAccess => {
             // 第十一刀 FPU 惰性保存断链入口。EC=0x07 不区分来源 EL，
             // SPSR.M[3:0]==0b0000（EL0t）才是合法用户态首用陷阱。
-            let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
             if !from_el0 {
                 kernel_sync_fault(
                     "FP/SIMD access under FPEN=00 from kernel (kernel-fp ban violated)",
                     esr,
+                    far,
                     frame,
                 )
             }
             unsafe { crate::arch::fpu_trap_replay(frame) }
         }
         SyncExceptionKind::Brk => {
-            let ctx = capture_trap_context();
+            let ctx = capture_trap_context(frame, far);
             // 来源判定（第十刀集成修复）：EC=0x3C 与 SVC/FPU 同理不区分
             // 来源 EL，SPSR.M 才是权威字段。旧判据 `ctx.slot.is_some()`
             // 会把「内核在用户进程 syscall 路径中执行的 BRK」误判为
             // 用户 panic——无辜进程被 SIGTRAP 杀死，kernel_sync_fault
             // （pstore 持久化 + 复位）永不触达。实机 drill 抓获。
-            let from_el0 = unsafe { (*frame).spsr_el1 & 0x0f } == 0;
             if from_el0 {
                 crate::info!(
                     "[trap] EL0 breakpoint (panic/udf): elr=0x{:016x} pid={:?}",
@@ -114,11 +128,11 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 );
                 terminate_faulting_process(&ctx, zero_abi::signals::SIGTRAP)
             } else {
-                kernel_sync_fault("BRK issued from kernel", esr, frame)
+                kernel_sync_fault("BRK issued from kernel", esr, far, frame)
             }
         }
         SyncExceptionKind::DataAbort(_) | SyncExceptionKind::InstructionAbort(_) => {
-            let ctx = capture_trap_context();
+            let ctx = capture_trap_context(frame, far);
             let message = format_sync_exception(&decoded, &ctx);
             if decoded.from_el0 {
                 // ── 第十刀 COW：EL0 写权限故障优先走写时复制断链 ──
@@ -180,7 +194,7 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                 // 穷人版 exception table（对照 Linux __ex_table）：内核在
                 // 代用户拷贝（copy_slice_from/to_user）时踩到坏页 ⇒
                 // 视为 EFAULT 类用户错误：杀调用进程，而非重启整机。
-                let elr = read_elr_el1();
+                let elr = ctx.elr;
                 if ctx.slot.is_some() && fault_in_user_copy_path(elr) {
                     crate::error!(
                         "[trap] user-copy path fault; killing caller (ELR=0x{:016x})",
@@ -189,12 +203,33 @@ fn handle_sync(frame: *mut TrapFrame) -> ! {
                     terminate_faulting_process(&ctx, zero_abi::signals::SIGSEGV)
                 }
                 crate::error!("{}", message);
-                kernel_sync_fault(&message, esr, frame)
+                kernel_sync_fault(&message, esr, far, frame)
             }
         }
         SyncExceptionKind::Other => {
-            log_unknown_sync(esr);
-            kernel_sync_fault("unknown sync exception", esr, frame)
+            if decoded.from_el0 {
+                if let Some(svc_esr) = recover_lost_svc_esr(esr, frame) {
+                    let imm = (svc_esr & 0xffff) as u16;
+                    crate::warn!(
+                        "[trap] recovered lost SVC syndrome: raw_esr=0x{:016x} imm={} elr=0x{:016x}",
+                        esr,
+                        imm,
+                        unsafe { (*frame).elr_el1 }
+                    );
+                    handle_svc(frame, svc_esr, far)
+                }
+                let ctx = capture_trap_context(frame, far);
+                crate::warn!(
+                    "[trap] unknown sync from EL0: terminating pid={:?} slot={:?} elr=0x{:016x}",
+                    ctx.pid.map(|p| p.raw()),
+                    ctx.slot,
+                    ctx.elr
+                );
+                terminate_faulting_process(&ctx, zero_abi::signals::SIGSEGV)
+            } else {
+                log_unknown_sync(esr, far, frame);
+                kernel_sync_fault("unknown sync exception", esr, far, frame)
+            }
         }
     }
 }
@@ -246,7 +281,7 @@ fn handle_irq(frame: *mut TrapFrame) -> ! {
     }
 }
 
-fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
+fn handle_svc(frame: *mut TrapFrame, esr: u64, far: u64) -> ! {
     // ⛔ 仅允许 EL0t 发起 SVC：校验保存的 SPSR_EL1.M[3:0] 必须为 0b0000。
     // SVC 的 EC（0x15）无法区分来源 EL —— SPSR.M 才是权威字段；
     // EL1 内核态发 SVC 视为内核 bug，直接打印完整上下文并复位。
@@ -257,7 +292,7 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
             saved_m,
             esr
         );
-        kernel_sync_fault("SVC issued from EL1 (kernel bug)", esr, frame)
+        kernel_sync_fault("SVC issued from EL1 (kernel bug)", esr, far, frame)
     }
 
     let imm = (esr & 0xffff) as u16;
@@ -286,7 +321,7 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
                                 "syscall ENOSYS #{}: number={} elr=0x{:016x} pid={}",
                                 n,
                                 number,
-                                read_elr_el1(),
+                                (*frame).elr_el1,
                                 crate::process::pid_at_slot(crate::scheduler::current_slot())
                                     .map(|p| p.raw())
                                     .unwrap_or(0),
@@ -304,7 +339,7 @@ fn handle_svc(frame: *mut TrapFrame, esr: u64) -> ! {
                 crate::warn!(
                     "unknown svc immediate {} at elr=0x{:016x}",
                     imm,
-                    read_elr_el1()
+                    (*frame).elr_el1
                 );
                 (*frame).regs[0] = encode_result(Err(SysError::NotFound));
                 crate::arch::restore_frame(frame)
@@ -503,18 +538,53 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
             user_buffer: regs[1] as usize,
             len: regs[2] as usize,
         }),
-        59 => Some(Syscall::AudioInfo { user_info: regs[1] as usize }),
-        60 => Some(Syscall::AudioPlay { user_buffer: regs[1] as usize, len: regs[2] as usize }),
+        59 => Some(Syscall::AudioInfo {
+            user_info: regs[1] as usize,
+        }),
+        60 => Some(Syscall::AudioPlay {
+            user_buffer: regs[1] as usize,
+            len: regs[2] as usize,
+        }),
         61 => Some(Syscall::AudioStop),
-        62 => Some(Syscall::Gpu3dInfo { user_info: regs[1] as usize }),
-        63 => Some(Syscall::Gpu3dContextCreate { capset_id: regs[1] as u32 }),
-        64 => Some(Syscall::Gpu3dContextDestroy { ctx_id: regs[1] as u32 }),
-        65 => Some(Syscall::Gpu3dResourceCreate { user_desc: regs[1] as usize }),
-        66 => Some(Syscall::Gpu3dResourceDestroy { resource_id: regs[1] as u32 }),
-        67 => Some(Syscall::Gpu3dContextAttach { ctx_id: regs[1] as u32, resource_id: regs[2] as u32 }),
-        68 => Some(Syscall::Gpu3dSubmit { ctx_id: regs[1] as u32, user_buffer: regs[2] as usize, len: regs[3] as usize }),
-        69 => Some(Syscall::Gpu3dReadback { resource_id: regs[1] as u32, user_buffer: regs[2] as usize, len: regs[3] as usize }),
-        70 => Some(Syscall::Gpu3dGetCapset { capset_id: regs[1] as u32, version: regs[2] as u32, user_buffer: regs[3] as usize, len: regs[4] as usize }),
+        62 => Some(Syscall::Gpu3dInfo {
+            user_info: regs[1] as usize,
+        }),
+        63 => Some(Syscall::Gpu3dContextCreate {
+            capset_id: regs[1] as u32,
+        }),
+        64 => Some(Syscall::Gpu3dContextDestroy {
+            ctx_id: regs[1] as u32,
+        }),
+        65 => Some(Syscall::Gpu3dResourceCreate {
+            user_desc: regs[1] as usize,
+        }),
+        66 => Some(Syscall::Gpu3dResourceDestroy {
+            resource_id: regs[1] as u32,
+        }),
+        67 => Some(Syscall::Gpu3dContextAttach {
+            ctx_id: regs[1] as u32,
+            resource_id: regs[2] as u32,
+        }),
+        68 => Some(Syscall::Gpu3dSubmit {
+            ctx_id: regs[1] as u32,
+            user_buffer: regs[2] as usize,
+            len: regs[3] as usize,
+        }),
+        69 => Some(Syscall::Gpu3dReadback {
+            resource_id: regs[1] as u32,
+            user_buffer: regs[2] as usize,
+            len: regs[3] as usize,
+        }),
+        70 => Some(Syscall::Gpu3dGetCapset {
+            capset_id: regs[1] as u32,
+            version: regs[2] as u32,
+            user_buffer: regs[3] as usize,
+            len: regs[4] as usize,
+        }),
+        71 => Some(Syscall::BlockBackend),
+        72 => Some(Syscall::PowerControl {
+            action: regs[1] as u32,
+        }),
         _ => None,
     }
 }
@@ -538,24 +608,75 @@ pub fn encode_result(result: Result<u64, SysError>) -> u64 {
     }
 }
 
-fn log_unknown_sync(esr: u64) {
-    let ctx = capture_trap_context();
+fn fault_arch_state() -> (u64, u64, u64, u64, u64) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        let sctlr: u64;
+        let tcr: u64;
+        let ttbr0: u64;
+        let current_el: u64;
+        let cpacr: u64;
+        core::arch::asm!("mrs {0}, sctlr_el1", out(reg) sctlr, options(nostack));
+        core::arch::asm!("mrs {0}, tcr_el1", out(reg) tcr, options(nostack));
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nostack));
+        core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nostack));
+        core::arch::asm!("mrs {0}, cpacr_el1", out(reg) cpacr, options(nostack));
+        (sctlr, tcr, ttbr0, current_el, cpacr)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        (0, 0, 0, 0, 0)
+    }
+}
+
+fn log_unknown_sync(esr: u64, far: u64, frame: *mut TrapFrame) {
+    let ctx = capture_trap_context(frame, far);
     let ec = (esr >> 26) & 0x3f;
     let iss = esr & 0x01ff_ffff;
     let slot = ctx.slot.unwrap_or(usize::MAX);
     let pid_raw = ctx.pid.map(|p| p.raw()).unwrap_or(0);
-    // 符号化回溯（对标 Linux oops）：ELR 归到最近符号；无表则维持裸地址。
+    // 符号化回溯（对标 Linux oops）：ELR 归到最近符号；无表时同时保留
+    // 最关键的保存寄存器，避免后续 fault-report 锁竞争把第一现场吞掉。
     let sym = crate::debug::symbol_note(ctx.elr);
+    let (x20, x21, x29, x30, sp0, sp1, spsr) = unsafe {
+        if frame.is_null() {
+            (0, 0, 0, 0, 0, 0, 0)
+        } else {
+            let f = &*frame;
+            (
+                f.regs[20], f.regs[21], f.regs[29], f.regs[30], f.sp_el0, f.sp_el1, f.spsr_el1,
+            )
+        }
+    };
+    let (insn, pte) = if crate::boot::kernel_runtime_contains(ctx.elr as usize, 4) {
+        (
+            unsafe { core::ptr::read_volatile(ctx.elr as *const u32) },
+            0,
+        )
+    } else if let Some(slot) = ctx.slot {
+        if let Some(space) = crate::process::address_space(slot) {
+            match space.walk(ctx.elr as usize) {
+                crate::mm::table_walk::WalkOutcome::Page { desc, phys } => {
+                    let off = (ctx.elr as usize) & (crate::mm::table_walk::PAGE_SIZE - 1);
+                    (
+                        unsafe { core::ptr::read_volatile((phys + off) as *const u32) },
+                        desc,
+                    )
+                }
+                crate::mm::table_walk::WalkOutcome::Block { desc, .. } => (0, desc),
+                crate::mm::table_walk::WalkOutcome::Unmapped => (0, 0),
+            }
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let cpu = crate::arch::smp::cpu_id();
+    let (sctlr, tcr, ttbr0, current_el, cpacr) = fault_arch_state();
     crate::error!(
-        "trap: unknown sync ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x}{} far=0x{:016x} slot={} pid={}",
-        ec,
-        iss,
-        esr,
-        ctx.elr,
-        sym,
-        ctx.far,
-        slot,
-        pid_raw
+        "trap: unknown sync cpu={} ec=0x{:x} iss=0x{:08x} esr=0x{:016x} elr=0x{:016x}{} insn=0x{:08x} pte=0x{:016x} far=0x{:016x} slot={} pid={} spsr=0x{:016x} x20=0x{:016x} x21=0x{:016x} fp=0x{:016x} lr=0x{:016x} sp0=0x{:016x} sp1=0x{:016x} sctlr=0x{:016x} tcr=0x{:016x} ttbr0=0x{:016x} currentel=0x{:x} cpacr=0x{:016x}",
+        cpu, ec, iss, esr, ctx.elr, sym, insn, pte, ctx.far, slot, pid_raw, spsr, x20, x21, x29, x30, sp0, sp1, sctlr, tcr, ttbr0, current_el, cpacr
     );
 }
 
@@ -576,14 +697,13 @@ fn fault_in_user_copy_path(pc: u64) -> bool {
     }
 }
 
-fn kernel_sync_fault(reason: &str, esr: u64, frame: *mut TrapFrame) -> ! {
+fn kernel_sync_fault(reason: &str, esr: u64, far: u64, frame: *mut TrapFrame) -> ! {
     let slot = crate::scheduler::current_slot_opt();
     let pid = slot
         .and_then(|s| process::pid_at_slot(s).map(|p| p.raw()))
         .unwrap_or(0);
     let slot = slot.unwrap_or(usize::MAX);
-    let elr = read_elr_el1();
-    let far = read_far_el1();
+    let elr = unsafe { (*frame).elr_el1 };
     let spsr = unsafe { (*frame).spsr_el1 };
     let sp = unsafe { (*frame).sp_el1 };
     // 符号化回溯（对标 Linux oops 的 func+0xoff）：bootloader 灌表后
@@ -690,30 +810,6 @@ fn reset_or_halt() -> ! {
     }
 }
 
-fn read_esr_el1() -> u64 {
-    let value: u64;
-    unsafe {
-        asm!("mrs {0}, esr_el1", out(reg) value);
-    }
-    value
-}
-
-fn read_elr_el1() -> u64 {
-    let value: u64;
-    unsafe {
-        asm!("mrs {0}, elr_el1", out(reg) value);
-    }
-    value
-}
-
-fn read_far_el1() -> u64 {
-    let value: u64;
-    unsafe {
-        asm!("mrs {0}, far_el1", out(reg) value);
-    }
-    value
-}
-
 /// 对用户态故障地址做软件走表，打印叶子描述符原始位。
 /// 权限类 bug（AP 编码错、UXN 误置、AF 缺失）一眼可判，不必再猜。
 fn dump_user_pte(far: u64) {
@@ -745,13 +841,15 @@ fn dump_user_pte(far: u64) {
     }
 }
 
-fn capture_trap_context() -> TrapContext {
-    // 非 panic 版本：异常可能在任何时刻到来（包括尚无当前进程的窗口）。
+fn capture_trap_context(frame: *mut TrapFrame, far: u64) -> TrapContext {
+    // ELR/SPSR were captured by the assembly entry; FAR is the x3 entry snapshot.
+    // Never combine a saved TrapFrame with later live EL1 syndrome registers:
+    // nested exceptions may overwrite the latter.
     let slot = crate::scheduler::current_slot_opt();
     let pid = slot.and_then(|slot| process::pid_at_slot(slot));
     TrapContext {
-        elr: read_elr_el1(),
-        far: read_far_el1(),
+        elr: unsafe { (*frame).elr_el1 },
+        far,
         slot,
         pid,
     }
@@ -787,6 +885,49 @@ fn terminate_faulting_process(ctx: &TrapContext, sig: u8) -> ! {
             crate::scheduler::exit_current()
         }
     }
+}
+
+/// QEMU/firmware compatibility recovery for a rare syndrome-loss case seen
+/// under SMP4: the EL0 SVC advances ELR correctly, but ESR_EL1 arrives with
+/// EC=0 and only IL=1 preserved (0x0200_0000). We recover *only* when the
+/// instruction immediately before saved ELR is verifiably an AArch64 SVC.
+/// This keeps genuine Uncategorized exceptions fail-closed.
+fn decode_aarch64_svc(insn: u32) -> Option<u16> {
+    // SVC #imm16 encoding: 11010100 000 imm16 00001.
+    if insn & 0xffe0_001f != 0xd400_0001 {
+        return None;
+    }
+    Some(((insn >> 5) & 0xffff) as u16)
+}
+
+fn user_instruction_at(slot: usize, va: usize) -> Option<u32> {
+    if va & 3 != 0 {
+        return None;
+    }
+    let space = crate::process::address_space(slot)?;
+    match space.walk(va) {
+        crate::mm::table_walk::WalkOutcome::Page { phys, .. } => {
+            let off = va & (crate::mm::table_walk::PAGE_SIZE - 1);
+            Some(unsafe { core::ptr::read_volatile((phys + off) as *const u32) })
+        }
+        _ => None,
+    }
+}
+
+fn recover_lost_svc_esr(esr: u64, frame: *mut TrapFrame) -> Option<u64> {
+    // Require Uncategorized + AArch64 instruction length bit.
+    if (esr >> 26) & 0x3f != 0 || esr & (1 << 25) == 0 || frame.is_null() {
+        return None;
+    }
+    let f = unsafe { &*frame };
+    if f.spsr_el1 & 0x1f != 0 || f.elr_el1 < 4 {
+        return None;
+    }
+    let slot = crate::scheduler::current_slot_opt()?;
+    let svc_pc = (f.elr_el1 as usize).checked_sub(4)?;
+    let imm = decode_aarch64_svc(user_instruction_at(slot, svc_pc)?)?;
+    // EC=0x15 (SVC AArch64), IL=1, ISS[15:0]=immediate.
+    Some((0x15u64 << 26) | (1u64 << 25) | imm as u64)
 }
 
 fn decode_esr(esr: u64) -> DecodedEsr {
@@ -1127,14 +1268,57 @@ mod tests {
                 len: 64
             })
         ));
-        assert!(matches!(decode_syscall(&regs(59, [0x8000_0000,0,0,0])), Some(Syscall::AudioInfo { .. })));
-        assert!(matches!(decode_syscall(&regs(60, [0x8000_0000,2048,0,0])), Some(Syscall::AudioPlay { len: 2048, .. })));
-        assert!(matches!(decode_syscall(&regs(61, [0,0,0,0])), Some(Syscall::AudioStop)));
-        assert!(matches!(decode_syscall(&regs(62, [0x8000_0000,0,0,0])), Some(Syscall::Gpu3dInfo { .. })));
-        assert!(matches!(decode_syscall(&regs(63, [2,0,0,0])), Some(Syscall::Gpu3dContextCreate { capset_id: 2 })));
-        assert!(matches!(decode_syscall(&regs(68, [7,0x8000_0000,64,0])), Some(Syscall::Gpu3dSubmit { ctx_id: 7, len: 64, .. })));
-        assert!(matches!(decode_syscall(&regs(70, [2,1,0x8000_0000,512])), Some(Syscall::Gpu3dGetCapset { capset_id: 2, version: 1, len: 512, .. })));
+        assert!(matches!(
+            decode_syscall(&regs(59, [0x8000_0000, 0, 0, 0])),
+            Some(Syscall::AudioInfo { .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(60, [0x8000_0000, 2048, 0, 0])),
+            Some(Syscall::AudioPlay { len: 2048, .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(61, [0, 0, 0, 0])),
+            Some(Syscall::AudioStop)
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(62, [0x8000_0000, 0, 0, 0])),
+            Some(Syscall::Gpu3dInfo { .. })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(63, [2, 0, 0, 0])),
+            Some(Syscall::Gpu3dContextCreate { capset_id: 2 })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(68, [7, 0x8000_0000, 64, 0])),
+            Some(Syscall::Gpu3dSubmit {
+                ctx_id: 7,
+                len: 64,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(70, [2, 1, 0x8000_0000, 512])),
+            Some(Syscall::Gpu3dGetCapset {
+                capset_id: 2,
+                version: 1,
+                len: 512,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_syscall(&regs(71, [0, 0, 0, 0])),
+            Some(Syscall::BlockBackend)
+        ));
         assert!(decode_syscall(&regs(999, [0, 0, 0, 0])).is_none());
+    }
+
+    #[test]
+    fn svc_encoding_recovery_is_fail_closed() {
+        assert_eq!(decode_aarch64_svc(0xd400_0001), Some(0));
+        assert_eq!(decode_aarch64_svc(0xd400_0021), Some(1));
+        assert_eq!(decode_aarch64_svc(0xd400_2461), Some(0x123));
+        assert_eq!(decode_aarch64_svc(0xd65f_03c0), None); // RET
+        assert_eq!(decode_aarch64_svc(0x17ff_ffee), None); // B
     }
 
     #[test]

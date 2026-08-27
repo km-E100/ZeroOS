@@ -18,11 +18,13 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use zero_abi::driver::{DriverDescriptor, DriverKind, DriverTable};
 
-use crate::{debug, info, warn};
+use crate::{debug, warn};
 
 pub mod irq;
+pub mod nvme;
 pub mod pl011;
 pub mod virtio;
+pub mod xhci;
 
 pub use irq::{handle_irq, register_irq_handler, unregister_irq_handler};
 
@@ -77,9 +79,70 @@ pub fn init(table_ptr: *const DriverTable) {
                 warn!("driver: 暂不支持 virtio kind {}", descriptor.kind as u32)
             }
             DriverKind::Nvme => {
-                info!("driver: NVMe 设备 '{}' 交由用户态处理", name)
+                debug!(
+                    "driver: boot descriptor NVMe '{}' deferred to PCI discovery",
+                    name
+                )
+            }
+            DriverKind::UsbXhci | DriverKind::PciGeneric => {
+                debug!(
+                    "driver: dynamic PCI resource '{}' is not a boot transport",
+                    name
+                )
             }
         }
+    }
+    // Knife37: modern VirtIO PCI devices discovered from the Knife35 PCI registry.
+    virtio::pci_transport::discover_and_init();
+    nvme::init();
+    xhci::init();
+}
+
+/// Active kernel-owned block backend. VirtIO keeps priority when both are
+/// present so an auxiliary NVMe device cannot silently replace the boot disk.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockBackendKind {
+    Virtio,
+    Nvme,
+}
+
+pub fn block_backend_kind() -> Option<BlockBackendKind> {
+    if virtio::blk::is_ready() {
+        Some(BlockBackendKind::Virtio)
+    } else if nvme::is_ready() {
+        Some(BlockBackendKind::Nvme)
+    } else {
+        None
+    }
+}
+
+pub fn block_capacity_sectors() -> Option<u64> {
+    match block_backend_kind()? {
+        BlockBackendKind::Virtio => virtio::blk::capacity_sectors(),
+        BlockBackendKind::Nvme => nvme::capacity_sectors(),
+    }
+}
+
+pub fn block_read(lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+    match block_backend_kind().ok_or(BlockError::NotReady)? {
+        BlockBackendKind::Virtio => virtio::blk::read_blocks(lba, buffer),
+        BlockBackendKind::Nvme => nvme::read_blocks(lba, buffer),
+    }
+}
+
+pub fn block_write(lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+    match block_backend_kind().ok_or(BlockError::NotReady)? {
+        BlockBackendKind::Virtio => virtio::blk::write_blocks(lba, buffer),
+        BlockBackendKind::Nvme => nvme::write_blocks(lba, buffer),
+    }
+}
+
+pub fn block_flush() -> Result<(), BlockError> {
+    match block_backend_kind().ok_or(BlockError::NotReady)? {
+        // VirtIO blk currently has no explicit FLUSH feature; synchronous used-ring
+        // completion is the strongest contract exposed by that legacy backend.
+        BlockBackendKind::Virtio => Ok(()),
+        BlockBackendKind::Nvme => nvme::flush(),
     }
 }
 

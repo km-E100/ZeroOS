@@ -11,6 +11,8 @@ pub extern "C" fn _start() -> ! {
 }
 #[cfg(target_os = "none")]
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! { userlib::exit(98) }
+fn panic(_: &PanicInfo) -> ! {
+    userlib::exit(98)
+}
 #[cfg(not(target_os = "none"))]
 fn main() {}

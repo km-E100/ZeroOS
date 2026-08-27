@@ -37,6 +37,7 @@ static RUNQUEUE: Mutex<Mlfq> = Mutex::new(Mlfq::new());
 /// clear_current_slot_if 清除）。
 static CURRENT_SLOT: [Mutex<Option<usize>>; crate::arch::smp::MAX_CPUS] =
     [const { Mutex::new(None) }; crate::arch::smp::MAX_CPUS];
+
 /// 每核 idle 标志：wake() 据此决定是否向该核广播 RESCHED SGI。
 static CPU_IDLE: [core::sync::atomic::AtomicBool; crate::arch::smp::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::arch::smp::MAX_CPUS];
@@ -187,30 +188,27 @@ fn schedule_loop() -> ! {
 }
 
 fn dispatch(pid: ProcessId) -> ! {
-    let next_slot = process::slot_for_pid(pid).expect("scheduler: unknown pid");
-    process::set_state(pid, ProcessState::Running);
+    // Atomic Runnable->Running claim makes stale/duplicate queue entries benign.
+    let cpu = my_cpu() as u8;
+    let Some(next_slot) = process::claim_runnable(pid, cpu) else {
+        crate::debug!("scheduler: stale runqueue entry pid={}", pid.raw());
+        reschedule()
+    };
+    debug_assert_eq!(process::owner_cpu(next_slot), Some(cpu));
     // 新调度周期：时间片清零（SLICE_TICKS 内不被强制抢占）。
     SLICE_USED[next_slot].store(0, core::sync::atomic::Ordering::Relaxed);
 
-    // 持锁窗口：读出上一个 current 并写入新的，单语句块结束即释放。
-    let previous_slot = {
+    // CPU ownership hand-off is completed by yield/block/exit *before* a pid
+    // becomes runnable elsewhere. dispatch only claims the incoming slot; it must
+    // never mutate the previous slot's global state because that process may
+    // already be Running on another CPU.
+    {
         let mut current = CURRENT_SLOT[my_cpu()].lock();
-        let previous = *current;
         *current = Some(next_slot);
-        previous
-    };
+    }
     CPU_IDLE[my_cpu()].store(false, core::sync::atomic::Ordering::Relaxed);
 
     // crate::arch::fpu_set_lazy_gate(); ← 二分排查：暂缓切换点降门
-
-    if let Some(slot) = previous_slot {
-        // 仅 Running → Runnable。Blocked（阻塞等 IPC）/ Dying 的进程
-        // 绝不能被 dispatch 的换出逻辑"复活"——否则状态声称可运行却
-        // 不在就绪队列，造成永久饥饿。
-        if process::state_slot(slot) == Some(ProcessState::Running) {
-            process::set_state_slot(slot, ProcessState::Runnable);
-        }
-    }
 
     unsafe {
         // 地址空间激活（不进用户态，此处允许持库调用；
@@ -253,34 +251,43 @@ fn dispatch(pid: ProcessId) -> ! {
 
 fn idle() -> ! {
     let cpu = my_cpu();
-    // ⚠ 第十一刀关键修复：空转前把异常保存目标切到 idle scratch 帧。
-    // 否则 TPIDR_EL1 仍指向最后那个 Blocked 进程的帧——idle 窗口的
-    // 每个定时器中断都会用 idle 的 EL1 现场覆盖它的保存区，进程被
-    // 唤醒后恢复出垃圾上下文（sleepdemo 实机抓获）。
+    // Publish "no process owned by this PE" before abandoning its process stack.
+    // IRQs are masked here, so no local exception can observe an intermediate
+    // state.  Any future exception will target the per-CPU idle scratch frame.
+    *CURRENT_SLOT[cpu].lock() = None;
     unsafe {
         crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize);
     }
     CPU_IDLE[cpu].store(true, core::sync::atomic::Ordering::Release);
-    // 无可运行进程：WFI 休眠等待中断（对照 Linux do_idle 的 default_idle）。
-    // 唤醒源：已由 init/上一轮 timer IRQ 预先 arm 的周期 tick；idle 绝不改写 deadline。
-    //
-    // ⚠ 此处运行于 EL1、IRQ 屏蔽状态 —— WFI 在 IRQ 屏蔽时不休眠！
-    // 因此先解除 IRQ 屏蔽再 WFI，唤醒后立即重新屏蔽（与内核全程屏蔽
-    // IRQ 的锁纪律兼容：屏蔽恢复后才可能触碰任何共享结构）。
+
+    // Critical SMP invariant: never WFI on KERNEL_STACKS[last_process].  That
+    // process can migrate immediately and reuse the same stack on another PE.
+    // Reset SP to a CPU-private 64KiB stack and branch (not call) into idle.
+    unsafe { crate::arch::enter_idle_stack(cpu, __zero_scheduler_idle_loop) }
+}
+
+/// Runs exclusively on the per-CPU idle stack.  It is an extern-C branch target
+/// so `arch::enter_idle_stack` can replace SP and discard any nested IRQ/Rust
+/// frames accumulated before the CPU became idle.
+extern "C" fn __zero_scheduler_idle_loop(cpu: usize) -> ! {
+    debug_assert_eq!(cpu, my_cpu());
+    unsafe {
+        crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize);
+    }
+    CPU_IDLE[cpu].store(true, core::sync::atomic::Ordering::Release);
+
     loop {
         unsafe {
-            // Timer was armed by init/previous timer IRQ. Do not move the
-            // deadline forward merely because the CPU entered idle.
+            // Timer/SGI is the wake source.  Kernel shared-state manipulation
+            // remains IRQ-masked; only the WFI window is interruptible.
             core::arch::asm!(
-                "msr daifclr, #2", // 解除 IRQ 屏蔽（bit1 = I）
+                "msr daifclr, #2",
                 "wfi",
-                "msr daifset, #2", // 立即重新屏蔽，之后才安全触碰共享态
+                "msr daifset, #2",
                 options(nostack)
             );
         }
-        // 唤醒源已消费：本核不再视为 idle（RESCHED SGI 不必再来）。
         CPU_IDLE[cpu].store(false, core::sync::atomic::Ordering::Relaxed);
-        // 被唤醒：可能有进程入队。重新调度。
         let next = { RUNQUEUE.lock().pop() };
         if let Some(pid) = next {
             dispatch(pid)
@@ -410,6 +417,24 @@ pub fn clear_current_slot_if(slot: usize) {
     }
 }
 
+/// Release this CPU's claim on `slot` before making that process visible to
+/// another CPU. IRQs are masked throughout kernel scheduling paths, so once the
+/// local CURRENT_SLOT is cleared no local timer/SGI can mistake a process that
+/// has migrated elsewhere for the process executing on this PE.
+pub(crate) fn detach_current(slot: usize) {
+    let cpu = my_cpu();
+    let mut current = CURRENT_SLOT[cpu].lock();
+    assert_eq!(
+        *current,
+        Some(slot),
+        "scheduler: detach_current slot mismatch cpu={} expected={} current={:?}",
+        cpu,
+        slot,
+        *current
+    );
+    *current = None;
+}
+
 pub fn reschedule() -> ! {
     // ⚠ 不能用 `if let Some(pid) = RUNQUEUE.lock().pop() { ... }`：
     // MutexGuard 临时量的生命周期会延续到整个 if-let 语句块结束，
@@ -424,10 +449,18 @@ pub fn reschedule() -> ! {
 
 pub fn yield_current() -> ! {
     let slot = current_slot();
-    if let Some(pid) = process::pid_at_slot(slot) {
-        process::set_state_slot(slot, ProcessState::Runnable);
-        // Voluntary yield is runnable-not-blocked: demote one level so a
-        // poll loop cannot permanently outrank lower-level runnable work.
+    let cpu = my_cpu();
+    // Keep ProcessState=Running and FRAME_OWNER=cpu until *after* SP leaves the
+    // process kernel stack. Otherwise another PE may claim the same process and
+    // enter a syscall on KERNEL_STACKS[slot] while this PE still runs reschedule.
+    unsafe { crate::arch::enter_scheduler_stack(cpu, __zero_yield_handoff, slot, 0) }
+}
+
+extern "C" fn __zero_yield_handoff(cpu: usize, slot: usize, _unused: usize) -> ! {
+    debug_assert_eq!(cpu, my_cpu());
+    unsafe { crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize) };
+    detach_current(slot);
+    if let Some(pid) = process::release_running(slot, cpu as u8) {
         let level = next_level_after_yield(proc_level(slot));
         PROC_LEVEL[slot].store(level as u8, core::sync::atomic::Ordering::Relaxed);
         SLICE_USED[slot].store(0, core::sync::atomic::Ordering::Relaxed);
@@ -438,6 +471,15 @@ pub fn yield_current() -> ! {
 
 pub fn exit_current() -> ! {
     let slot = current_slot();
+    let cpu = my_cpu();
+    unsafe { crate::arch::enter_scheduler_stack(cpu, __zero_exit_handoff, slot, 0) }
+}
+
+extern "C" fn __zero_exit_handoff(cpu: usize, slot: usize, _unused: usize) -> ! {
+    debug_assert_eq!(cpu, my_cpu());
+    unsafe { crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize) };
+    detach_current(slot);
+    process::release_owner_for_exit(slot, cpu as u8);
     process::remove_slot(slot);
     reschedule()
 }
@@ -472,12 +514,8 @@ pub fn on_tick_consume() -> bool {
         due
     };
     for (pid, _elapsed) in expired {
-        if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
-        }
-        if process::state(pid) == Some(ProcessState::Blocked) {
-            process::set_state(pid, ProcessState::Runnable);
-            enqueue(pid); // 唤醒即最高级：交互/定时器路径的延迟最优
-        }
+        if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {}
+        wake(pid); // atomic Blocked->Runnable or latched register->block wake
     }
 
     // ── 防饥饿 boost：所有 Runnable 槽位级别归零（Running 不动——它
@@ -549,8 +587,7 @@ pub fn sleep_current(ticks: u64) -> ! {
     let start = tick_now();
     let pid = process::pid_at_slot(current_slot())
         .expect("scheduler: sleep_current without live process");
-    if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
-    }
+    if SLEEP_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {}
     {
         let mut q = SLEEP_QUEUE.lock();
         assert!(
@@ -574,19 +611,42 @@ pub fn sleep_current(ticks: u64) -> ! {
 
 pub fn block_current() -> ! {
     let slot = current_slot();
-    process::set_state_slot(slot, ProcessState::Blocked);
-    reschedule()
+    let cpu = my_cpu();
+    assert!(
+        process::begin_block(slot, cpu as u8),
+        "block_current: current process not Running"
+    );
+    // Wakeups in the register->block window latch wake_pending while the record
+    // stays Running. Publish Blocked/Runnable only after the CPU-private stack
+    // handoff, so no PE can reuse this process stack early.
+    unsafe { crate::arch::enter_scheduler_stack(cpu, __zero_block_handoff, slot, 0) }
+}
+
+extern "C" fn __zero_block_handoff(cpu: usize, slot: usize, _unused: usize) -> ! {
+    debug_assert_eq!(cpu, my_cpu());
+    unsafe { crate::arch::set_tpidr_el1(process::idle_trap_frame_for(cpu) as usize) };
+    detach_current(slot);
+    match process::finish_block(slot, cpu as u8) {
+        process::BlockFinish::Blocked => reschedule(),
+        process::BlockFinish::Requeue(pid) => {
+            enqueue(pid);
+            reschedule()
+        }
+        process::BlockFinish::Invalid => panic!("block_current: invalid block handoff"),
+    }
 }
 
 /// 唤醒一个阻塞进程：Blocked → Runnable 并入队。非 Blocked 状态
 /// （已可运行/已退出）为幂等 no-op，防止重复入队破坏状态机不变量。
 pub fn wake(pid: ProcessId) {
-    if process::state(pid) != Some(ProcessState::Blocked) {
-        return;
+    match process::request_wake(pid) {
+        process::WakeTransition::Enqueue { pid, slot } => {
+            PROC_LEVEL[slot].store(0, core::sync::atomic::Ordering::Relaxed);
+            RUNQUEUE.lock().push_at(pid, 0);
+            kick_idle_cores();
+        }
+        process::WakeTransition::Pending | process::WakeTransition::Ignore => {}
     }
-    process::set_state(pid, ProcessState::Runnable);
-    enqueue(pid); // 唤醒即最高级：交互/定时器路径的延迟最优
-    kick_idle_cores();
 }
 
 /// 广播 RESCHED SGI 给"其他在线且正 idle 的核"（第十四刀阶段 2）：

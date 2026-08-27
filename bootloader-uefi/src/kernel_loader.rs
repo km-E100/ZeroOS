@@ -66,8 +66,10 @@ const KASLR_END: u64 = 0x5800_0000;
 const KASLR_ALIGN: u64 = 2 * 1024 * 1024;
 
 fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30; x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27; x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
 }
 
@@ -81,7 +83,8 @@ fn boot_entropy(st: &SystemTable<Boot>) -> (u64, bool) {
             }
         }
     }
-    let mut seed = (st as *const _ as usize as u64) ^ (bs as *const _ as usize as u64).rotate_left(17);
+    let mut seed =
+        (st as *const _ as usize as u64) ^ (bs as *const _ as usize as u64).rotate_left(17);
     if let Ok(t) = st.runtime_services().get_time() {
         seed ^= (t.year() as u64) << 48;
         seed ^= (t.month() as u64) << 40;
@@ -101,7 +104,10 @@ fn load_pie_with_kaslr(
 ) -> Result<(), Status> {
     let span = elf.image_span().ok_or(Status::INVALID_PARAMETER)?;
     let span = (span + KASLR_ALIGN - 1) & !(KASLR_ALIGN - 1);
-    if KASLR_START.checked_add(span).map_or(true, |v| v > KASLR_END) {
+    if KASLR_START
+        .checked_add(span)
+        .map_or(true, |v| v > KASLR_END)
+    {
         log_error!("PIE kernel span 0x{:x} does not fit KASLR window", span);
         return Err(Status::OUT_OF_RESOURCES);
     }
@@ -119,7 +125,13 @@ fn load_pie_with_kaslr(
         elf.set_load_bias(bias)?;
         match elf::load_segments(st.boot_services(), elf, bytes) {
             Ok(()) => {
-                log_info!("KASLR kernel base=0x{:016x} span=0x{:x} slot={}/{}", bias, span, idx, slots);
+                log_info!(
+                    "KASLR kernel base=0x{:016x} span=0x{:x} slot={}/{}",
+                    bias,
+                    span,
+                    idx,
+                    slots
+                );
                 return Ok(());
             }
             Err(_) => continue,

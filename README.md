@@ -1,10 +1,11 @@
 # Zero OS
 
 Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统：QEMU virt
-上四核 SMP 稳定运行，具备进程/线程双模型、能力安全模型、块设备文件系统
-与包管理格式。Rust 实现，`#![no_std]`，microkernel 主机回归 179+，基础实机验收矩阵 15 项，并有网络/TLS/包/PIE/音频/VirGL 专项实机回归。
+上四核 SMP 稳定运行，具备进程/线程双模型、能力安全模型、ZFS/包管理、
+PCIe/IOMMU/NVMe/USB xHCI、图形/网络/音频与固件电源链。Rust 实现，`#![no_std]`；
+当前 microkernel 主机回归 203 项，基础实机 15/15、硬件专项 45/45、第41～44刀生产硬化 36/36。
 
-## 能力一览（截至第34刀）
+## 能力一览（截至第44刀）
 
 | 域 | 能力 |
 | --- | --- |
@@ -20,6 +21,10 @@ Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统
 | **网络/Web** | netd（ARP/IPv4/ICMP/UDP/TCP/DHCP）、DNS、TLS 1.3、HTTP/1.1、SHM bulk I/O |
 | **音频** | VirtIO Sound PCM + audiod；48kHz S16 stereo playback 实机/文件捕获验收 |
 | **ACPI** | RSDP/XSDT/MADT/GTDT/FADT/MCFG；SMP/GIC/timer/PSCI/ECAM 真消费；AML 按真机需求再做 |
+| **PCIe / IOMMU** | MCFG/high-ECAM、bridge/root-port window、32/64-bit BAR、MSI/MSI-X、GICv3 ITS/LPI affinity、IORT/SMMUv3 domain/IOVA/fault |
+| **存储硬件** | VirtIO Blk + NVMe；多 namespace、4KiB native LBA RMW、per-CPU I/O queue、MDTS、Abort/reset/FLR recovery |
+| **USB** | PCI xHCI、scratchpad、USB2 hub/Route String/TT、keyboard/mouse/tablet、root/hub hotplug、controller recovery |
+| **电源/固件** | admin 动态 CAP_POWER、PSCI shutdown/reboot、FADT ResetReg fallback、持久化 flush/shutdown |
 
 > 当前 COW 已默认开启。2026-08-25 收口时定位到历史回归根因：
 > AArch64 `TLBI VAAE1IS` 的寄存器操作数误传完整 byte VA，正确编码应为
@@ -27,11 +32,12 @@ Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统
 > 同轮还修复 free-list “不足最小块的尾巴未并入分配”造成的幽灵 gap。
 > 详见 `docs/mm_heap_corruption_investigation.md`。
 
-> 当前第20～34刀已全部落地；仍刻意不做的是通用 AML。下一阶段主要是
-> 真机 PCIe/IOMMU/USB/电源管理，而不是继续补 QEMU 基础功能。
+> 当前第20～44刀已全部落地并封板。通用 AML 仍刻意按需：只有出现明确真机需求时再单独立项，
+> 不作为当前未完成项。STATUS 目前没有登记中的下一刀。
 
-> 最终收口验收（2026-08-26）：`tools/check.sh` 57/57；基础 QEMU 验收 15/15；
-> `-smp 4` 压力 3 轮 × 6/6；VirGL 真后端完成 CLEAR→DMA readback。
+> 最终收口验收（2026-08-27）：`tools/check.sh` **57/57**；基础 QEMU **15/15**；
+> 第35～40刀硬件专项 **45/45**；第41～44刀 hardening **36/36**；`-smp 4` 压力 **3轮×6/6 + zero fault**。
+> 最终 ISO SHA-256 `8cc3ced62264c6bf80d4f7250734d3ec6dbaa799e2ab3a44194db7c4e37f344f`。
 > `tools/testkeys` 中私钥/签名 seed 仅留本机测试，不入 Git；仓库只携带公开证书/公钥。
 
 ## 快速开始
@@ -39,8 +45,10 @@ Zero OS 是一款基于 **ARM64（AArch64）** 的实验性微内核操作系统
 ```bash
 cargo run -p xtask -- build-iso     # 构建镜像（超 3GB 自动拒绝，purge 自救）
 ./run-qemu.sh                       # 单核交互串口
-scripts/acceptance.sh --no-build    # 实机验收矩阵（15 项，exit 0 = ALL PASS）
-scripts/stress-loop.sh 3            # -smp4 四核压力循环
+scripts/acceptance.sh --no-build    # 基础验收矩阵（15/15）
+scripts/hardware-acceptance.sh --no-build # 第35~40刀硬件专项（45/45）
+scripts/hardening-acceptance.sh --no-build # 第41~44刀生产硬化专项（36/36）
+scripts/stress-loop.sh 3            # -smp4 三轮 6/6 + no-fault 压力
 scripts/perf-baseline.sh            # 性能基线采集
 ```
 
@@ -54,7 +62,7 @@ scripts/perf-baseline.sh            # 性能基线采集
 - `libs/`：`zero-abi`（系统调用契约）/ `zfs-core` 等
 - `bootloader-uefi/`：UEFI 引导（ET_DYN kernel KASLR/RELA、bootfs handoff、pstore、ACPI/GOP）
 - `docs/`：设计/历史调查文档（KASLR/ZeroPkg/ACPI/COW/堆等；已实施状态以 STATUS 为准）
-- `scripts/`：acceptance / stress-loop / perf-baseline
+- `scripts/`：基础 acceptance / hardware-acceptance / hardening-acceptance / stress-loop / perf-baseline
 
 ## 设计文档索引
 

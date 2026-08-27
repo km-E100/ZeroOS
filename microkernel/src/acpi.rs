@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+#[cfg(all(target_os = "none", not(test)))]
 extern "C" {
     /// bootloader 在 ExitBootServices 前从 UEFI config table 捕获并补丁。
     static __zero_rsdp_phys: u64;
@@ -38,6 +39,28 @@ pub struct EcamSegment {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SmmuV3Info {
+    pub base: u64,
+    pub event_irq: u32,
+    pub pri_irq: u32,
+    pub gerr_irq: u32,
+    pub sync_irq: u32,
+    /// PCI requester-ID range routed through this SMMU by the IORT root complex.
+    pub rid_start: u32,
+    pub rid_count: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResetRegister {
+    pub address_space: u8,
+    pub bit_width: u8,
+    pub bit_offset: u8,
+    pub access_size: u8,
+    pub address: u64,
+    pub value: u8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PsciConduit {
     /// FADT 没有有效 ARM boot flags，保留 Zero OS 历史/QEMU 默认 HVC。
     LegacyHvc = 0,
@@ -51,20 +74,26 @@ struct ParsedTables {
     gicd: u64,
     gicc: u64,
     gicr: u64,
+    its: u64,
     timer_irq: u32,
     timer_flags: u32,
     psci_conduit: u8,
+    reset: Option<ResetRegister>,
     ecam: Vec<EcamSegment>,
+    smmus: Vec<SmmuV3Info>,
 }
 
 static CPUS: spin::Mutex<Vec<MadtCpu>> = spin::Mutex::new(Vec::new());
 static ECAM: spin::Mutex<Vec<EcamSegment>> = spin::Mutex::new(Vec::new());
+static SMMUS: spin::Mutex<Vec<SmmuV3Info>> = spin::Mutex::new(Vec::new());
 static GICD_BASE: AtomicU64 = AtomicU64::new(0);
 static GICC_BASE: AtomicU64 = AtomicU64::new(0);
 static GICR_BASE: AtomicU64 = AtomicU64::new(0);
+static ITS_BASE: AtomicU64 = AtomicU64::new(0);
 static TIMER_IRQ: AtomicU32 = AtomicU32::new(0);
 static TIMER_FLAGS: AtomicU32 = AtomicU32::new(0);
 static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PsciConduit::LegacyHvc as u8);
+static RESET_REGISTER: spin::Mutex<Option<ResetRegister>> = spin::Mutex::new(None);
 static PARSED: AtomicBool = AtomicBool::new(false);
 
 #[inline]
@@ -141,10 +170,14 @@ fn le64(bytes: &[u8], off: usize) -> Option<u64> {
 }
 
 /// MADT ARM Generic Interrupt entries（types 11/12/14）。
-fn parse_madt_entries(bytes: &[u8], body_off: usize) -> (Vec<MadtCpu>, Option<u64>, Option<u64>) {
+fn parse_madt_entries(
+    bytes: &[u8],
+    body_off: usize,
+) -> (Vec<MadtCpu>, Option<u64>, Option<u64>, Option<u64>) {
     let mut cpus = Vec::new();
     let mut gicd = None;
     let mut redistributor = None;
+    let mut its = None;
     let mut off = body_off;
     while off + 2 <= bytes.len() {
         let etype = bytes[off];
@@ -177,6 +210,10 @@ fn parse_madt_entries(bytes: &[u8], body_off: usize) -> (Vec<MadtCpu>, Option<u6
             14 if elen >= 16 => {
                 redistributor.get_or_insert(le64(bytes, off + 4).unwrap_or(0));
             }
+            // GIC Interrupt Translation Service (ITS).
+            15 if elen >= 20 => {
+                its.get_or_insert(le64(bytes, off + 8).unwrap_or(0));
+            }
             _ => {}
         }
         off += elen;
@@ -185,6 +222,7 @@ fn parse_madt_entries(bytes: &[u8], body_off: usize) -> (Vec<MadtCpu>, Option<u6
         cpus,
         gicd.filter(|v| *v != 0),
         redistributor.filter(|v| *v != 0),
+        its.filter(|v| *v != 0),
     )
 }
 
@@ -214,6 +252,36 @@ fn parse_fadt_psci(bytes: &[u8]) -> PsciConduit {
     }
 }
 
+/// FADT Reset Register: Flags.RESET_REG_SUP(bit10), GAS @116, ResetValue @128.
+/// Zero OS consumes SystemMemory GAS on AArch64; SystemIO is retained as metadata
+/// but cannot be issued without an architecture-specific I/O-port mechanism.
+fn parse_fadt_reset(bytes: &[u8]) -> Option<ResetRegister> {
+    if bytes.len() < 129 {
+        return None;
+    }
+    let flags = le32(bytes, 112)?;
+    if flags & (1 << 10) == 0 {
+        return None;
+    }
+    let address_space = bytes[116];
+    let bit_width = bytes[117];
+    let bit_offset = bytes[118];
+    let access_size = bytes[119];
+    let address = le64(bytes, 120)?;
+    let value = bytes[128];
+    if address == 0 || bit_width == 0 || bit_width > 64 || bit_offset >= 64 {
+        return None;
+    }
+    Some(ResetRegister {
+        address_space,
+        bit_width,
+        bit_offset,
+        access_size,
+        address,
+        value,
+    })
+}
+
 /// MCFG: header(36) + reserved(8), then 16-byte allocation structures.
 fn parse_mcfg(bytes: &[u8]) -> Vec<EcamSegment> {
     let mut out = Vec::new();
@@ -241,16 +309,99 @@ fn parse_mcfg(bytes: &[u8]) -> Vec<EcamSegment> {
     out
 }
 
+/// IORT parser for the subset required by Knife38: SMMUv3 nodes and
+/// Root-Complex requester-ID mappings. Node offsets and ID-map output
+/// references are relative to the beginning of the IORT table.
+fn parse_iort(bytes: &[u8]) -> Vec<SmmuV3Info> {
+    if bytes.len() < 48 {
+        return Vec::new();
+    }
+    let count = le32(bytes, 36).unwrap_or(0) as usize;
+    let first = le32(bytes, 40).unwrap_or(0) as usize;
+    if count == 0 || first < 48 || first >= bytes.len() {
+        return Vec::new();
+    }
+    let mut nodes: Vec<(usize, u8, usize)> = Vec::new();
+    let mut off = first;
+    for _ in 0..count {
+        if off + 16 > bytes.len() {
+            break;
+        }
+        let ty = bytes[off];
+        let len = le16(bytes, off + 1).unwrap_or(0) as usize;
+        if len < 16 || off.checked_add(len).filter(|e| *e <= bytes.len()).is_none() {
+            break;
+        }
+        nodes.push((off, ty, len));
+        off += len;
+    }
+    let mut out = Vec::new();
+    for &(node_off, ty, len) in &nodes {
+        if ty != 4 || len < 68 {
+            continue;
+        }
+        let base = le64(bytes, node_off + 16).unwrap_or(0);
+        if base == 0 {
+            continue;
+        }
+        out.push(SmmuV3Info {
+            base,
+            event_irq: le32(bytes, node_off + 44).unwrap_or(0),
+            pri_irq: le32(bytes, node_off + 48).unwrap_or(0),
+            gerr_irq: le32(bytes, node_off + 52).unwrap_or(0),
+            sync_irq: le32(bytes, node_off + 56).unwrap_or(0),
+            rid_start: 0,
+            rid_count: 0,
+        });
+    }
+    // Root Complex (type 2) ID mappings point at SMMUv3 node offsets.
+    for &(node_off, ty, len) in &nodes {
+        if ty != 2 || len < 36 {
+            continue;
+        }
+        let maps = le32(bytes, node_off + 8).unwrap_or(0) as usize;
+        let map_off = le32(bytes, node_off + 12).unwrap_or(0) as usize;
+        let start = node_off.saturating_add(map_off);
+        for i in 0..maps {
+            let m = start.saturating_add(i * 20);
+            if m + 20 > node_off + len || m + 20 > bytes.len() {
+                break;
+            }
+            let input = le32(bytes, m).unwrap_or(0);
+            let count_minus_1 = le32(bytes, m + 4).unwrap_or(0);
+            let output_ref = le32(bytes, m + 12).unwrap_or(u32::MAX) as usize;
+            if let Some((idx, _)) = nodes
+                .iter()
+                .enumerate()
+                .find(|(_, n)| n.0 == output_ref && n.1 == 4)
+            {
+                if let Some(smmu) = out.get_mut(
+                    idx.saturating_sub(nodes.iter().take(idx).filter(|n| n.1 != 4).count()),
+                ) {
+                    if smmu.rid_count == 0 {
+                        smmu.rid_start = input;
+                        smmu.rid_count = count_minus_1.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn parse_table_bytes(sig: [u8; 4], bytes: &[u8], parsed: &mut ParsedTables) {
     match &sig {
         b"APIC" if bytes.len() >= 44 => {
-            let (cpus, gicd, gicr) = parse_madt_entries(bytes, 44);
+            let (cpus, gicd, gicr, its) = parse_madt_entries(bytes, 44);
             parsed.cpus.extend(cpus);
             if parsed.gicd == 0 {
                 parsed.gicd = gicd.unwrap_or(0);
             }
             if parsed.gicr == 0 {
                 parsed.gicr = gicr.unwrap_or(0);
+            }
+            if parsed.its == 0 {
+                parsed.its = its.unwrap_or(0);
             }
             if parsed.gicc == 0 {
                 parsed.gicc = parsed
@@ -273,8 +424,12 @@ fn parse_table_bytes(sig: [u8; 4], bytes: &[u8], parsed: &mut ParsedTables) {
                 parsed.timer_flags = flags;
             }
         }
-        b"FACP" => parsed.psci_conduit = parse_fadt_psci(bytes) as u8,
+        b"FACP" => {
+            parsed.psci_conduit = parse_fadt_psci(bytes) as u8;
+            parsed.reset = parse_fadt_reset(bytes);
+        }
         b"MCFG" => parsed.ecam.extend(parse_mcfg(bytes)),
+        b"IORT" => parsed.smmus.extend(parse_iort(bytes)),
         _ => {}
     }
 }
@@ -284,6 +439,13 @@ pub fn init() {
     if PARSED.swap(true, Ordering::SeqCst) {
         return;
     }
+    #[cfg(any(test, not(target_os = "none")))]
+    let rsdp = 0u64;
+    #[cfg(any(test, not(target_os = "none")))]
+    {
+        return;
+    }
+    #[cfg(all(target_os = "none", not(test)))]
     let rsdp = unsafe { core::ptr::addr_of!(__zero_rsdp_phys).read_volatile() };
     if rsdp == 0 || !rsdp_valid(rsdp) {
         crate::info!("acpi: RSDP absent/invalid; legacy platform defaults stay");
@@ -319,21 +481,27 @@ pub fn init() {
     let ecam_count = parsed.ecam.len();
     *CPUS.lock() = parsed.cpus;
     *ECAM.lock() = parsed.ecam;
+    *SMMUS.lock() = parsed.smmus;
     GICD_BASE.store(parsed.gicd, Ordering::SeqCst);
     GICC_BASE.store(parsed.gicc, Ordering::SeqCst);
     GICR_BASE.store(parsed.gicr, Ordering::SeqCst);
+    ITS_BASE.store(parsed.its, Ordering::SeqCst);
     TIMER_IRQ.store(parsed.timer_irq, Ordering::SeqCst);
     TIMER_FLAGS.store(parsed.timer_flags, Ordering::SeqCst);
     PSCI_CONDUIT.store(parsed.psci_conduit, Ordering::SeqCst);
+    *RESET_REGISTER.lock() = parsed.reset;
     crate::info!(
-        "acpi: cpus={} gicd={:#x} gicc={:#x} gicr={:#x} timer_irq={} psci={:?} ecam_segments={}",
+        "acpi: cpus={} gicd={:#x} gicc={:#x} gicr={:#x} its={:#x} timer_irq={} psci={:?} reset_reg={} ecam_segments={} smmu_v3={}",
         cpu_count,
         parsed.gicd,
         parsed.gicc,
         parsed.gicr,
+        parsed.its,
         parsed.timer_irq,
         psci_conduit(),
-        ecam_count
+        RESET_REGISTER.lock().is_some(),
+        ecam_count,
+        SMMUS.lock().len()
     );
 }
 
@@ -370,6 +538,14 @@ pub fn gicr_base() -> Option<u64> {
     }
 }
 
+pub fn its_base() -> Option<u64> {
+    init();
+    match ITS_BASE.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
 pub fn timer_irq() -> Option<u32> {
     init();
     match TIMER_IRQ.load(Ordering::SeqCst) {
@@ -392,9 +568,41 @@ pub fn psci_conduit() -> PsciConduit {
     }
 }
 
+pub fn reset_register() -> Option<ResetRegister> {
+    init();
+    *RESET_REGISTER.lock()
+}
+
+/// Best-effort FADT reset write. A successful reset never returns; `true` only
+/// means the SystemMemory GAS write was issued and the caller may wait briefly.
+pub fn try_fadt_reset() -> bool {
+    let Some(r) = reset_register() else {
+        return false;
+    };
+    if r.address_space != 0 || r.bit_offset != 0 || r.bit_width > 8 {
+        crate::warn!(
+            "acpi: FADT reset GAS unsupported space={} width={} offset={}",
+            r.address_space,
+            r.bit_width,
+            r.bit_offset
+        );
+        return false;
+    }
+    let Some(v) = crate::mm::paging::ioremap_device(r.address as usize, 1) else {
+        return false;
+    };
+    unsafe { core::ptr::write_volatile(v as *mut u8, r.value) };
+    true
+}
+
 pub fn ecam_segments() -> Vec<EcamSegment> {
     init();
     ECAM.lock().clone()
+}
+
+pub fn smmu_v3_units() -> Vec<SmmuV3Info> {
+    init();
+    SMMUS.lock().clone()
 }
 
 #[cfg(test)]
@@ -425,9 +633,10 @@ mod tests {
         put(&mut b, redist, &[14, 16]);
         put(&mut b, redist + 4, &0x080b_0000u64.to_le_bytes());
         b.resize(redist + 16, 0);
-        let (cpus, dist, red) = parse_madt_entries(&b, 44);
+        let (cpus, dist, red, its) = parse_madt_entries(&b, 44);
         assert_eq!(dist, Some(0x0800_0000));
         assert_eq!(red, Some(0x080b_0000));
+        assert_eq!(its, None);
         assert_eq!(
             cpus,
             vec![MadtCpu {
@@ -445,10 +654,11 @@ mod tests {
         let mut b = vec![0u8; 46];
         b[44] = 11;
         b[45] = 80;
-        let (cpus, gicd, gicr) = parse_madt_entries(&b, 44);
+        let (cpus, gicd, gicr, its) = parse_madt_entries(&b, 44);
         assert!(cpus.is_empty());
         assert_eq!(gicd, None);
         assert_eq!(gicr, None);
+        assert_eq!(its, None);
     }
 
     #[test]
@@ -472,6 +682,31 @@ mod tests {
     }
 
     #[test]
+    fn fadt_reset_register_is_parsed_only_when_supported() {
+        let mut b = vec![0u8; 136];
+        put(&mut b, 112, &(1u32 << 10).to_le_bytes());
+        b[116] = 0;
+        b[117] = 8;
+        b[118] = 0;
+        b[119] = 1;
+        put(&mut b, 120, &0x0902_0000u64.to_le_bytes());
+        b[128] = 0x5a;
+        assert_eq!(
+            parse_fadt_reset(&b),
+            Some(ResetRegister {
+                address_space: 0,
+                bit_width: 8,
+                bit_offset: 0,
+                access_size: 1,
+                address: 0x0902_0000,
+                value: 0x5a
+            })
+        );
+        put(&mut b, 112, &0u32.to_le_bytes());
+        assert_eq!(parse_fadt_reset(&b), None);
+    }
+
+    #[test]
     fn mcfg_filters_invalid_ranges() {
         let mut b = vec![0u8; 44];
         put(&mut b, 44, &0x4010_0000u64.to_le_bytes());
@@ -492,6 +727,34 @@ mod tests {
                 end_bus: 0x2f
             }]
         );
+    }
+
+    #[test]
+    fn iort_parses_smmuv3_and_root_rid_mapping() {
+        let mut b = vec![0u8; 48];
+        put(&mut b, 36, &2u32.to_le_bytes());
+        put(&mut b, 40, &48u32.to_le_bytes());
+        let smmu = 48usize;
+        b.resize(smmu + 68, 0);
+        b[smmu] = 4;
+        put(&mut b, smmu + 1, &68u16.to_le_bytes());
+        put(&mut b, smmu + 16, &0x0905_0000u64.to_le_bytes());
+        put(&mut b, smmu + 44, &106u32.to_le_bytes());
+        let rc = smmu + 68;
+        b.resize(rc + 56, 0);
+        b[rc] = 2;
+        put(&mut b, rc + 1, &56u16.to_le_bytes());
+        put(&mut b, rc + 8, &1u32.to_le_bytes());
+        put(&mut b, rc + 12, &36u32.to_le_bytes());
+        let m = rc + 36;
+        put(&mut b, m, &0u32.to_le_bytes());
+        put(&mut b, m + 4, &255u32.to_le_bytes());
+        put(&mut b, m + 12, &(smmu as u32).to_le_bytes());
+        let got = parse_iort(&b);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].base, 0x0905_0000);
+        assert_eq!(got[0].event_irq, 106);
+        assert_eq!((got[0].rid_start, got[0].rid_count), (0, 256));
     }
 
     #[test]

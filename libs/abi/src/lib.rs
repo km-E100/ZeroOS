@@ -233,7 +233,7 @@ pub mod driver {
     /// 语义约定：`DriverInfo.kind` 直接取 `DriverKind as u32`，
     /// 用户态按此值分发设备操作路径。
     #[repr(u32)]
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum DriverKind {
         /// ARM PrimeCell PL011 串口（console 设备）。
         Pl011 = 1,
@@ -253,6 +253,10 @@ pub mod driver {
         VirtIOInput = 8,
         /// VirtIO sound。
         VirtIOSound = 9,
+        /// PCI xHCI USB host controller。
+        UsbXhci = 10,
+        /// Generic PCI memory BAR resource (class-specific user driver may bind).
+        PciGeneric = 11,
     }
 
     /// 单条驱动描述符（`DriverInfo` 系统调用回填用户缓冲区的**源格式**；
@@ -427,7 +431,6 @@ pub mod input {
 
     const _: () = assert!(core::mem::size_of::<InputEvent>() == 24);
 }
-
 
 /// Stable userspace audio format exposed by audiod/kernel. Knife33 deliberately
 /// freezes one first-generation PCM contract instead of leaking VirtIO enums.
@@ -1093,6 +1096,9 @@ pub mod cap {
     /// Send commands to audiod. Raw VirtIO sound access remains CAP_AUDIO_DEV
     /// and is held only by audiod.
     pub const CAP_AUDIO_CLIENT: u32 = 1 << 13;
+    /// Platform power transition (syscall 72): shutdown/reboot. Never part of
+    /// legacy CAP_ALL; interactive callers obtain it dynamically after admin auth.
+    pub const CAP_POWER: u32 = 1 << 14;
     /// 全部已定义能力的组合（引导期 privileged 服务的缺省位图）。
     ///
     /// 【第十三刀边界】动态管理位（CHANNEL_CREATE/SECURE_IPC/ISSUER/
@@ -1128,7 +1134,14 @@ pub mod cap {
                 CAP_SECURE_IPC,
                 CAP_ISSUER,
                 CAP_SESSION,
-                CAP_INPUT_DEV, CAP_DISPLAY, CAP_NET_DEV, CAP_AUDIO_DEV, CAP_SPAWN_APP, CAP_PKG_CLIENT, CAP_AUDIO_CLIENT,
+                CAP_INPUT_DEV,
+                CAP_DISPLAY,
+                CAP_NET_DEV,
+                CAP_AUDIO_DEV,
+                CAP_SPAWN_APP,
+                CAP_PKG_CLIENT,
+                CAP_AUDIO_CLIENT,
+                CAP_POWER,
             ];
             for (i, a) in all.iter().enumerate() {
                 for (j, b) in all.iter().enumerate() {
@@ -1602,30 +1615,72 @@ pub mod syscall {
             len: usize,
         },
         /// (59) audiod-only: copy stable [`crate::audio::AudioInfo`] to EL0.
-        AudioInfo { user_info: usize },
+        AudioInfo {
+            user_info: usize,
+        },
         /// (60) audiod-only: submit one S16LE/48kHz/stereo PCM period.
-        AudioPlay { user_buffer: usize, len: usize },
+        AudioPlay {
+            user_buffer: usize,
+            len: usize,
+        },
         /// (61) audiod-only: stop/release the active PCM stream.
         AudioStop,
         /// (62) CAP_DISPLAY: query negotiated VirtIO-GPU 3D/capset contract.
-        Gpu3dInfo { user_info: usize },
+        Gpu3dInfo {
+            user_info: usize,
+        },
         /// (63) CAP_DISPLAY: create one VirGL context for a negotiated capset.
-        Gpu3dContextCreate { capset_id: u32 },
+        Gpu3dContextCreate {
+            capset_id: u32,
+        },
         /// (64) CAP_DISPLAY: destroy an empty VirGL context.
-        Gpu3dContextDestroy { ctx_id: u32 },
+        Gpu3dContextDestroy {
+            ctx_id: u32,
+        },
         /// (65) CAP_DISPLAY: create a 3D resource from [`crate::gpu::Gpu3dResourceDesc`].
-        Gpu3dResourceCreate { user_desc: usize },
+        Gpu3dResourceCreate {
+            user_desc: usize,
+        },
         /// (66) CAP_DISPLAY: detach/unref a 3D resource.
-        Gpu3dResourceDestroy { resource_id: u32 },
+        Gpu3dResourceDestroy {
+            resource_id: u32,
+        },
         /// (67) CAP_DISPLAY: attach a resource to a context.
-        Gpu3dContextAttach { ctx_id: u32, resource_id: u32 },
+        Gpu3dContextAttach {
+            ctx_id: u32,
+            resource_id: u32,
+        },
         /// (68) CAP_DISPLAY: submit an opaque VirGL dword stream (len multiple of 4).
-        Gpu3dSubmit { ctx_id: u32, user_buffer: usize, len: usize },
+        Gpu3dSubmit {
+            ctx_id: u32,
+            user_buffer: usize,
+            len: usize,
+        },
         /// (69) CAP_DISPLAY: transfer rendered B8G8R8X8 resource data back to EL0.
-        Gpu3dReadback { resource_id: u32, user_buffer: usize, len: usize },
+        Gpu3dReadback {
+            resource_id: u32,
+            user_buffer: usize,
+            len: usize,
+        },
         /// (70) CAP_DISPLAY: copy negotiated capset bytes to EL0.
-        Gpu3dGetCapset { capset_id: u32, version: u32, user_buffer: usize, len: usize },
+        Gpu3dGetCapset {
+            capset_id: u32,
+            version: u32,
+            user_buffer: usize,
+            len: usize,
+        },
+        /// (71) kernel-owned block backend type (`protocol::blk::DEVICE_TYPE_*`).
+        /// Used by blkdrv to report whether syscall 7/8 are backed by VirtIO or NVMe.
+        BlockBackend,
+        /// (72) Platform power transition. x1=0 shutdown, x1=1 reboot.
+        /// Requires [`crate::cap::CAP_POWER`]; success does not return.
+        PowerControl {
+            action: u32,
+        },
     }
+
+    pub const POWER_OFF: u32 = 0;
+    pub const POWER_REBOOT: u32 = 1;
 
     /// [`Syscall::WaitPid`] 的 `x3` flags 位定义（第七刀冻结）。
     ///

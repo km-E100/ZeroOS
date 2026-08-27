@@ -30,9 +30,11 @@ use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Mutex;
-use userlib::{self, block_capacity_sectors, block_read, block_write, driver_count, driver_info, yield_now};
+use userlib::{
+    self, block_backend_type, block_capacity_sectors, block_read, block_write, driver_count,
+    driver_info, mmio_map, mmio_unmap, yield_now,
+};
 use zero_abi::channels;
-use zero_abi::driver::DriverKind;
 use zero_abi::ipc::Message;
 use zero_abi::protocol::blk as blk_proto;
 use zero_abi::protocol::blk::passthrough as pt_proto;
@@ -61,12 +63,18 @@ pub extern "C" fn server_main() -> ! {
     let ready = probe_backend();
     BACKEND_READY.store(ready, Ordering::SeqCst);
     if ready {
-        print_line("blkdrv: passthrough backend ready (virtio-blk via kernel svc 7/8)");
+        let kind = block_backend_type().unwrap_or(0);
+        if kind == blk_proto::DEVICE_TYPE_NVME {
+            print_line("blkdrv: passthrough backend ready (NVMe via kernel svc 7/8)");
+        } else {
+            print_line("blkdrv: passthrough backend ready (VirtIO blk via kernel svc 7/8)");
+        }
     } else {
         print_line(
             "blkdrv: WARNING no block device in kernel table; IO fails with STATUS_NODEVICE",
         );
     }
+    pci_mmio_lease_self_test();
 
     loop {
         let mut message = Message::empty();
@@ -83,19 +91,45 @@ pub extern "C" fn server_main() -> ! {
     }
 }
 
-/// 扫描内核驱动描述符表，确认存在可直通的块设备（当前仅认
-/// 内核自驱动的 VirtIOBlk）。
-fn probe_backend() -> bool {
-    let count = driver_count().unwrap_or(0);
-    for index in 0..count {
+/// Knife35 hardware acceptance hook. Only runs when a generic PCI test device
+/// is present, so normal boots pay only a DriverCount/DriverInfo scan. The
+/// volatile EL0 read proves MmioMap installed a real user Device mapping rather
+/// than merely returning a physical address token.
+fn pci_mmio_lease_self_test() {
+    let Ok(count) = driver_count() else { return };
+    for index in 0..count.min(256) {
         let Ok(info) = driver_info(index as u32) else {
             continue;
         };
-        if info.kind == DriverKind::VirtIOBlk as u32 {
-            return true;
+        if info.kind != zero_abi::driver::DriverKind::PciGeneric as u32 || info.mmio_len < 4 {
+            continue;
         }
+        let Ok(region) = mmio_map(index as u32) else {
+            print_line("blkdrv: PCI MMIO LEASE SELFTEST FAIL map");
+            return;
+        };
+        // A lease is a user VA, never the PCI physical BAR address.
+        if region.base == info.mmio_base || region.len < 4 {
+            let _ = mmio_unmap(index as u32);
+            print_line("blkdrv: PCI MMIO LEASE SELFTEST FAIL geometry");
+            return;
+        }
+        unsafe {
+            core::ptr::read_volatile(region.base as *const u32);
+        }
+        if mmio_unmap(index as u32).is_err() {
+            print_line("blkdrv: PCI MMIO LEASE SELFTEST FAIL unmap");
+            return;
+        }
+        print_line("blkdrv: PCI MMIO LEASE SELFTEST PASS");
+        return;
     }
-    false
+}
+
+/// Query the live kernel backend. Static boot descriptors are not authoritative
+/// once PCI-discovered VirtIO/NVMe controllers are supported.
+fn probe_backend() -> bool {
+    block_capacity_sectors().map(|v| v > 0).unwrap_or(false)
 }
 
 fn dispatch(request: &Message) {
@@ -130,7 +164,7 @@ fn cmd_info() {
     }
     let mut payload = [0u8; 20];
     payload[0] = PASSTHROUGH_DEVICE;
-    payload[1] = blk_proto::DEVICE_TYPE_VIRTIO;
+    payload[1] = block_backend_type().unwrap_or(blk_proto::DEVICE_TYPE_VIRTIO);
     payload[4..12].copy_from_slice(&(SECTOR_SIZE as u64).to_le_bytes());
     let capacity = block_capacity_sectors().unwrap_or(0);
     payload[12..20].copy_from_slice(&capacity.to_le_bytes());

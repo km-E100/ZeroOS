@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use core::ptr;
 use spin::Mutex;
 use zero_abi::cap::{
-    CAP_AUDIO_DEV, CAP_BLOCK_DEV, CAP_CHANNEL_CREATE, CAP_DISPLAY, CAP_INPUT_DEV, CAP_ISSUER, CAP_MMIO,
-    CAP_NET_DEV, CAP_SPAWN_APP, CAP_SPAWN_SVC,
+    CAP_AUDIO_DEV, CAP_BLOCK_DEV, CAP_CHANNEL_CREATE, CAP_DISPLAY, CAP_INPUT_DEV, CAP_ISSUER,
+    CAP_MMIO, CAP_NET_DEV, CAP_POWER, CAP_SPAWN_APP, CAP_SPAWN_SVC,
 };
 use zero_abi::ipc::{ChannelDesc, Message};
 use zero_abi::syscall::{SysError, Syscall, SyscallResult};
@@ -16,11 +16,24 @@ use crate::mm::table_walk::{WalkOutcome, PAGE_SIZE};
 use crate::process::TrapFrame;
 use crate::runtime::serial;
 
+#[derive(Clone, Copy, Debug)]
+struct DriverResource {
+    kind: zero_abi::driver::DriverKind,
+    mmio_base: u64,
+    mmio_len: u64,
+    irq: u32,
+}
+
 #[derive(Clone, Copy)]
 struct MmioLease {
-    slot: usize,
+    /// Address-space identity, not a transient process-table slot. Threads in
+    /// one group share the same TTBR0 and therefore the same hardware mapping.
+    space_key: u64,
     index: u32,
     refs: u32,
+    map_base: usize,
+    user_base: usize,
+    map_len: usize,
 }
 
 static MMIO_LEASES: Mutex<Vec<MmioLease>> = Mutex::new(Vec::new());
@@ -34,10 +47,16 @@ const KERNEL_REGION_START: usize = 0x4000_0000; // 1 GiB
 const KERNEL_REGION_END: usize = 0x8000_0000; // 2 GiB
 const USER_VA_MAX: usize = 0x0000_FFFF_F000; // 用户栈顶（4GiB - 4KiB）
 
-/// QEMU virt 外设空间（MMIO 设备区）：GIC/PL011/virtio-mmio 都在
-/// [0x0800_0000, 0x1000_0000)。mmio lease 的 phys 必须落在此区间。
+/// Legacy platform MMIO window. PCI BARs may live above 4GiB and are validated
+/// against the PCI registry instead of this fixed range.
 const DEVICE_MMIO_LO: usize = 0x0800_0000;
 const DEVICE_MMIO_HI: usize = 0x1000_0000;
+
+/// EL0 virtual window reserved for capability-gated device mappings. It sits
+/// above the 64MiB brk window (ends at 0x1400_0000) and below secure SHM
+/// (starts at 0x2000_0000). Fork deliberately does not inherit these leaves.
+const USER_MMIO_BASE: usize = 0x1800_0000;
+const USER_MMIO_END: usize = 0x2000_0000;
 
 /// 单次块 IO 的长度上限（1 MiB = 2048 扇区）：BlockRead/BlockWrite 在
 /// 内核侧以 `vec![0u8; len]` 中转，无上限时用户可用一次系统调用触发
@@ -115,18 +134,20 @@ fn page_walk_accepts(outcome: WalkOutcome) -> bool {
     matches!(outcome, WalkOutcome::Page { .. })
 }
 
-/// mmio lease 校验：phys 必须落在 QEMU virt 设备区且长度不越界。
+/// Validate a physical device range. Legacy platform devices are accepted from
+/// the architectural QEMU-virt window; PCI memory BARs are accepted only when
+/// the enumerated BAR registry proves the entire interval belongs to a device.
 fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
-    let base = base as usize;
-    let len = len as usize;
-    if len == 0 || base < DEVICE_MMIO_LO {
+    if len == 0 {
         return Err(SysError::InvalidArgument);
     }
     let end = base.checked_add(len).ok_or(SysError::InvalidArgument)?;
-    if end > DEVICE_MMIO_HI {
-        return Err(SysError::InvalidArgument);
+    let legacy = base >= DEVICE_MMIO_LO as u64 && end <= DEVICE_MMIO_HI as u64;
+    if legacy || crate::pci::contains_mmio_range(base, len) {
+        Ok(())
+    } else {
+        Err(SysError::InvalidArgument)
     }
-    Ok(())
 }
 
 /// 阻塞接收的收尾（由 scheduler::dispatch 在重入用户态前调用）。
@@ -135,8 +156,8 @@ pub fn complete_receive(slot: usize, chan: u32) {
     let pid = crate::process::pid_at_slot(slot).expect("pending recv: no pid");
     let frame = unsafe { crate::process::trap_frame(slot) };
     loop {
-        match crate::ipc::receive(pid, chan) {
-            Ok((sender, message)) => {
+        match crate::ipc::receive_or_register_waiter(pid, chan) {
+            Ok(Some((sender, message))) => {
                 unsafe {
                     let user_buffer = (*frame).regs[2] as usize;
                     let result = copy_message_to_user(user_buffer, &message);
@@ -144,10 +165,15 @@ pub fn complete_receive(slot: usize, chan: u32) {
                 }
                 return;
             }
-            Err(_) => {
-                let _ = crate::ipc::register_waiter(pid, chan);
+            Ok(None) => {
                 crate::process::set_pending_recv(slot, chan);
                 crate::scheduler::block_current();
+            }
+            Err(err) => {
+                unsafe {
+                    (*frame).regs[0] = crate::trap::encode_result(Err(map_ipc_error(err)));
+                }
+                return;
             }
         }
     }
@@ -176,19 +202,17 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             let caller_slot = crate::scheduler::current_slot();
             let caller_pid =
                 crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
-            match crate::ipc::receive(caller_pid, channel) {
-                Ok((sender, message)) => {
+            match crate::ipc::receive_or_register_waiter(caller_pid, channel) {
+                Ok(Some((sender, message))) => {
                     unsafe {
                         copy_message_to_user(user_buffer, &message)?;
                     }
                     Ok(sender.raw())
                 }
-                Err(crate::ipc::IpcError::Empty) => {
-                    // 阻塞语义（对照 Mach mach_msg）：队列空 → 登记等待者
-                    // 并挂起进程。单核 + EL1 关中断 ⇒ 登记→置 Blocked→切换
-                    // 原子，无丢失唤醒窗口。被 send 唤醒后由 dispatch 调
-                    // complete_receive 完成收尾（continuation）。
-                    crate::ipc::register_waiter(caller_pid, channel).map_err(map_ipc_error)?;
+                Ok(None) => {
+                    // SMP-safe blocking receive: queue check + waiter registration
+                    // happened atomically under CHANNEL_TABLE. A sender racing from
+                    // here to block_current is latched by wake_pending.
                     crate::process::set_pending_recv(caller_slot, channel);
                     crate::scheduler::block_current()
                 }
@@ -260,7 +284,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             }
             check_block_io_len(len)?;
             let mut buffer = vec![0u8; len];
-            crate::drivers::virtio::blk::read_blocks(lba, &mut buffer).map_err(map_block_error)?;
+            crate::drivers::block_read(lba, &mut buffer).map_err(map_block_error)?;
             unsafe {
                 copy_slice_to_user(user_buffer, &buffer)?;
             }
@@ -282,7 +306,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             unsafe {
                 copy_slice_from_user(user_buffer, &mut buffer)?;
             }
-            crate::drivers::virtio::blk::write_blocks(lba, &buffer).map_err(map_block_error)?;
+            crate::drivers::block_write(lba, &buffer).map_err(map_block_error)?;
             Ok(len as u64)
         }
         // ═══ 安全 SHM（第25刀）：opaque handle + 真用户页映射 ═══
@@ -325,16 +349,11 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 .map(|_| 0)
                 .map_err(map_shm_error)
         }
-        Syscall::DriverCount => {
-            let count = crate::drivers::descriptors()
-                .map(|table| table.len())
-                .unwrap_or(0);
-            Ok(count as u64)
-        }
+        Syscall::DriverCount => Ok(driver_resource_count() as u64),
         Syscall::DriverInfo { index, user_buffer } => {
-            let descriptor = descriptor_for_index(index)?;
+            let resource = resource_for_index(index)?;
             unsafe {
-                write_driver_info(user_buffer, descriptor)?;
+                write_driver_info(user_buffer, resource)?;
             }
             Ok(0)
         }
@@ -343,14 +362,13 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         Syscall::MmioMap { index, user_buffer } => {
             let caller_slot = crate::scheduler::current_slot();
             ensure_capability(caller_slot, CAP_MMIO)?;
-            let descriptor = descriptor_for_index(index)?;
-            // 校验 lease 的 phys（mmio_base）落在设备区，防驱动表被污染。
-            validate_mmio_region(descriptor.mmio_base, descriptor.mmio_len)?;
-            acquire_mmio(caller_slot, index)?;
+            let resource = resource_for_index(index)?;
+            validate_mmio_region(resource.mmio_base, resource.mmio_len)?;
+            let (user_base, len) = acquire_mmio(caller_slot, index, resource)?;
             unsafe {
-                write_mmio_info(user_buffer, descriptor.mmio_base, descriptor.mmio_len)?;
+                write_mmio_info(user_buffer, user_base as u64, len as u64)?;
             }
-            Ok(descriptor.mmio_base)
+            Ok(user_base as u64)
         }
         Syscall::MmioUnmap { index } => {
             let caller_slot = crate::scheduler::current_slot();
@@ -595,6 +613,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         Syscall::InputRead { user_event } => {
             let slot = crate::scheduler::current_slot();
             ensure_effective_capability(slot, CAP_INPUT_DEV)?;
+            crate::drivers::xhci::poll();
             let event = crate::drivers::virtio::input::pop().ok_or(SysError::WouldBlock)?;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -730,111 +749,218 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
         // 时不挂起、立即 Ok(0)；等待目标保持未登记（见 process.rs
         // WaitAction::PollMiss 注释）。
         Syscall::BlockCapacity => {
-            crate::drivers::virtio::blk::capacity_sectors().ok_or(SysError::NotFound)
+            crate::drivers::block_capacity_sectors().ok_or(SysError::NotFound)
+        }
+        Syscall::BlockBackend => {
+            use crate::drivers::BlockBackendKind;
+            match crate::drivers::block_backend_kind().ok_or(SysError::NotFound)? {
+                BlockBackendKind::Virtio => Ok(zero_abi::protocol::blk::DEVICE_TYPE_VIRTIO as u64),
+                BlockBackendKind::Nvme => Ok(zero_abi::protocol::blk::DEVICE_TYPE_NVME as u64),
+            }
+        }
+        Syscall::PowerControl { action } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_POWER)?;
+            if action != zero_abi::syscall::POWER_OFF && action != zero_abi::syscall::POWER_REBOOT {
+                return Err(SysError::InvalidArgument);
+            }
+            // Best-effort persistence barrier before firmware tears hardware down.
+            let _ = crate::drivers::block_flush();
+            if crate::drivers::nvme::is_ready() {
+                crate::drivers::nvme::shutdown();
+            }
+            crate::arch::power_control(action);
+            Err(SysError::NotSupported)
         }
         Syscall::SpawnImage { user_buffer, len } => {
             let caller_slot = crate::scheduler::current_slot();
             ensure_effective_capability(caller_slot, CAP_SPAWN_APP)?;
-            if len < 64 || len > 16 * 1024 * 1024 { return Err(SysError::InvalidArgument); }
-            let caller_pid = crate::process::pid_at_slot(caller_slot)
-                .ok_or(SysError::PermissionDenied)?;
+            if len < 64 || len > 16 * 1024 * 1024 {
+                return Err(SysError::InvalidArgument);
+            }
+            let caller_pid =
+                crate::process::pid_at_slot(caller_slot).ok_or(SysError::PermissionDenied)?;
             let mut image = vec![0u8; len];
-            unsafe { copy_slice_from_user(user_buffer, &mut image)?; }
+            unsafe {
+                copy_slice_from_user(user_buffer, &mut image)?;
+            }
             let pid = crate::process::spawn_user_from_image(&image, "app", Some(caller_pid))
                 .map_err(map_process_error)?;
             let sid = crate::process::session_of_slot(caller_slot);
-            if sid != 0 { crate::process::set_session(pid, sid); }
+            if sid != 0 {
+                crate::process::set_session(pid, sid);
+            }
             crate::scheduler::enqueue(pid);
             Ok(pid.raw())
         }
         Syscall::AudioInfo { user_info } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
-            if !crate::drivers::virtio::sound::active(){return Err(SysError::NotFound);}
-            let info=zero_abi::audio::AudioInfo{
-                sample_rate:crate::drivers::virtio::sound::SAMPLE_RATE as u32,
-                channels:crate::drivers::virtio::sound::CHANNELS as u16,
-                sample_bits:(crate::drivers::virtio::sound::SAMPLE_BYTES*8) as u16,
-                period_bytes:crate::drivers::virtio::sound::PERIOD_BYTES as u32,
-                buffer_bytes:crate::drivers::virtio::sound::BUFFER_BYTES as u32,
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_AUDIO_DEV)?;
+            if !crate::drivers::virtio::sound::active() {
+                return Err(SysError::NotFound);
+            }
+            let info = zero_abi::audio::AudioInfo {
+                sample_rate: crate::drivers::virtio::sound::SAMPLE_RATE as u32,
+                channels: crate::drivers::virtio::sound::CHANNELS as u16,
+                sample_bits: (crate::drivers::virtio::sound::SAMPLE_BYTES * 8) as u16,
+                period_bytes: crate::drivers::virtio::sound::PERIOD_BYTES as u32,
+                buffer_bytes: crate::drivers::virtio::sound::BUFFER_BYTES as u32,
             };
-            let bytes=unsafe{core::slice::from_raw_parts((&info as *const zero_abi::audio::AudioInfo).cast::<u8>(),core::mem::size_of::<zero_abi::audio::AudioInfo>())};
-            unsafe{copy_slice_to_user(user_info,bytes)?;}
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const zero_abi::audio::AudioInfo).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::audio::AudioInfo>(),
+                )
+            };
+            unsafe {
+                copy_slice_to_user(user_info, bytes)?;
+            }
             Ok(0)
         }
         Syscall::AudioPlay { user_buffer, len } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
-            if len==0||len>crate::drivers::virtio::sound::PERIOD_BYTES||len%crate::drivers::virtio::sound::FRAME_BYTES!=0{return Err(SysError::InvalidArgument);}
-            let mut pcm=vec![0u8;len];
-            unsafe{copy_slice_from_user(user_buffer,&mut pcm)?;}
-            if crate::drivers::virtio::sound::play_period(&pcm){Ok(len as u64)}else{Err(SysError::DeviceError)}
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_AUDIO_DEV)?;
+            if len == 0
+                || len > crate::drivers::virtio::sound::PERIOD_BYTES
+                || len % crate::drivers::virtio::sound::FRAME_BYTES != 0
+            {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut pcm = vec![0u8; len];
+            unsafe {
+                copy_slice_from_user(user_buffer, &mut pcm)?;
+            }
+            if crate::drivers::virtio::sound::play_period(&pcm) {
+                Ok(len as u64)
+            } else {
+                Err(SysError::DeviceError)
+            }
         }
         Syscall::AudioStop => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_AUDIO_DEV)?;
-            if crate::drivers::virtio::sound::stop(){Ok(0)}else{Err(SysError::DeviceError)}
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_AUDIO_DEV)?;
+            if crate::drivers::virtio::sound::stop() {
+                Ok(0)
+            } else {
+                Err(SysError::DeviceError)
+            }
         }
         Syscall::Gpu3dInfo { user_info } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            let info=crate::drivers::virtio::gpu::three_d_info().map_err(map_gpu3d_error)?;
-            let bytes=unsafe{core::slice::from_raw_parts((&info as *const zero_abi::gpu::Gpu3dInfo).cast::<u8>(),core::mem::size_of::<zero_abi::gpu::Gpu3dInfo>())};
-            unsafe{copy_slice_to_user(user_info,bytes)?;}
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            let info = crate::drivers::virtio::gpu::three_d_info().map_err(map_gpu3d_error)?;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const zero_abi::gpu::Gpu3dInfo).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::gpu::Gpu3dInfo>(),
+                )
+            };
+            unsafe {
+                copy_slice_to_user(user_info, bytes)?;
+            }
             Ok(0)
         }
         Syscall::Gpu3dContextCreate { capset_id } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            crate::drivers::virtio::gpu::create_context(capset_id).map(|v|v as u64).map_err(map_gpu3d_error)
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::create_context(capset_id)
+                .map(|v| v as u64)
+                .map_err(map_gpu3d_error)
         }
         Syscall::Gpu3dContextDestroy { ctx_id } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            crate::drivers::virtio::gpu::destroy_context(ctx_id).map(|_|0).map_err(map_gpu3d_error)
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::destroy_context(ctx_id)
+                .map(|_| 0)
+                .map_err(map_gpu3d_error)
         }
         Syscall::Gpu3dResourceCreate { user_desc } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            let mut desc=zero_abi::gpu::Gpu3dResourceDesc::default();
-            let bytes=unsafe{core::slice::from_raw_parts_mut((&mut desc as *mut zero_abi::gpu::Gpu3dResourceDesc).cast::<u8>(),core::mem::size_of::<zero_abi::gpu::Gpu3dResourceDesc>())};
-            unsafe{copy_slice_from_user(user_desc,bytes)?;}
-            crate::drivers::virtio::gpu::create_resource(desc).map(|v|v as u64).map_err(map_gpu3d_error)
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            let mut desc = zero_abi::gpu::Gpu3dResourceDesc::default();
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (&mut desc as *mut zero_abi::gpu::Gpu3dResourceDesc).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::gpu::Gpu3dResourceDesc>(),
+                )
+            };
+            unsafe {
+                copy_slice_from_user(user_desc, bytes)?;
+            }
+            crate::drivers::virtio::gpu::create_resource(desc)
+                .map(|v| v as u64)
+                .map_err(map_gpu3d_error)
         }
         Syscall::Gpu3dResourceDestroy { resource_id } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            crate::drivers::virtio::gpu::destroy_resource(resource_id).map(|_|0).map_err(map_gpu3d_error)
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::destroy_resource(resource_id)
+                .map(|_| 0)
+                .map_err(map_gpu3d_error)
         }
-        Syscall::Gpu3dContextAttach { ctx_id, resource_id } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            crate::drivers::virtio::gpu::attach_resource(ctx_id,resource_id).map(|_|0).map_err(map_gpu3d_error)
+        Syscall::Gpu3dContextAttach {
+            ctx_id,
+            resource_id,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            crate::drivers::virtio::gpu::attach_resource(ctx_id, resource_id)
+                .map(|_| 0)
+                .map_err(map_gpu3d_error)
         }
-        Syscall::Gpu3dSubmit { ctx_id, user_buffer, len } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            if len==0||len>1024*1024||len&3!=0{return Err(SysError::InvalidArgument);}
-            let mut stream=vec![0u8;len];
-            unsafe{copy_slice_from_user(user_buffer,&mut stream)?;}
-            crate::drivers::virtio::gpu::submit_3d(ctx_id,&stream).map(|_|len as u64).map_err(map_gpu3d_error)
+        Syscall::Gpu3dSubmit {
+            ctx_id,
+            user_buffer,
+            len,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            if len == 0 || len > 1024 * 1024 || len & 3 != 0 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut stream = vec![0u8; len];
+            unsafe {
+                copy_slice_from_user(user_buffer, &mut stream)?;
+            }
+            crate::drivers::virtio::gpu::submit_3d(ctx_id, &stream)
+                .map(|_| len as u64)
+                .map_err(map_gpu3d_error)
         }
-        Syscall::Gpu3dReadback { resource_id, user_buffer, len } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            if len==0||len>64*1024*1024{return Err(SysError::InvalidArgument);}
-            let mut out=vec![0u8;len];
-            let n=crate::drivers::virtio::gpu::readback_3d(resource_id,&mut out).map_err(map_gpu3d_error)?;
-            unsafe{copy_slice_to_user(user_buffer,&out[..n])?;}
+        Syscall::Gpu3dReadback {
+            resource_id,
+            user_buffer,
+            len,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            if len == 0 || len > 64 * 1024 * 1024 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut out = vec![0u8; len];
+            let n = crate::drivers::virtio::gpu::readback_3d(resource_id, &mut out)
+                .map_err(map_gpu3d_error)?;
+            unsafe {
+                copy_slice_to_user(user_buffer, &out[..n])?;
+            }
             Ok(n as u64)
         }
-        Syscall::Gpu3dGetCapset { capset_id, version, user_buffer, len } => {
-            let slot=crate::scheduler::current_slot();
-            ensure_effective_capability(slot,CAP_DISPLAY)?;
-            if len==0||len>1024*1024{return Err(SysError::InvalidArgument);}
-            let mut out=vec![0u8;len];
-            let n=crate::drivers::virtio::gpu::get_capset(capset_id,version,&mut out).map_err(map_gpu3d_error)?;
-            unsafe{copy_slice_to_user(user_buffer,&out[..n])?;}
+        Syscall::Gpu3dGetCapset {
+            capset_id,
+            version,
+            user_buffer,
+            len,
+        } => {
+            let slot = crate::scheduler::current_slot();
+            ensure_effective_capability(slot, CAP_DISPLAY)?;
+            if len == 0 || len > 1024 * 1024 {
+                return Err(SysError::InvalidArgument);
+            }
+            let mut out = vec![0u8; len];
+            let n = crate::drivers::virtio::gpu::get_capset(capset_id, version, &mut out)
+                .map_err(map_gpu3d_error)?;
+            unsafe {
+                copy_slice_to_user(user_buffer, &out[..n])?;
+            }
             Ok(n as u64)
         }
         Syscall::WaitPid { pid } => {
@@ -1060,45 +1186,148 @@ fn check_block_io_len(len: usize) -> Result<(), SysError> {
     Ok(())
 }
 
-fn descriptor_for_index(
-    index: u32,
-) -> Result<&'static zero_abi::driver::DriverDescriptor, SysError> {
-    let descriptors = crate::drivers::descriptors().ok_or(SysError::NotFound)?;
-    descriptors.get(index as usize).ok_or(SysError::NotFound)
+fn driver_resource_count() -> usize {
+    let boot = crate::drivers::descriptors().map_or(0, |d| d.len());
+    boot.saturating_add(crate::pci::mmio_resources().len())
 }
 
-fn acquire_mmio(slot: usize, index: u32) -> Result<(), SysError> {
+fn resource_for_index(index: u32) -> Result<DriverResource, SysError> {
+    let i = index as usize;
+    let boot = crate::drivers::descriptors().unwrap_or(&[]);
+    if let Some(d) = boot.get(i) {
+        return Ok(DriverResource {
+            kind: d.kind,
+            mmio_base: d.mmio_base,
+            mmio_len: d.mmio_len,
+            irq: d.irq,
+        });
+    }
+    let pci = crate::pci::mmio_resources();
+    let r = pci
+        .get(i.saturating_sub(boot.len()))
+        .ok_or(SysError::NotFound)?;
+    Ok(DriverResource {
+        kind: r.kind,
+        mmio_base: r.base,
+        mmio_len: r.len,
+        irq: r.irq,
+    })
+}
+
+fn aligned_mmio_geometry(resource: DriverResource) -> Result<(usize, usize, usize), SysError> {
+    let phys = usize::try_from(resource.mmio_base).map_err(|_| SysError::InvalidArgument)?;
+    let len = usize::try_from(resource.mmio_len).map_err(|_| SysError::InvalidArgument)?;
+    if len == 0 {
+        return Err(SysError::InvalidArgument);
+    }
+    let map_phys = phys & !(PAGE_SIZE - 1);
+    let offset = phys - map_phys;
+    let needed = offset.checked_add(len).ok_or(SysError::InvalidArgument)?;
+    let map_len = needed
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(SysError::InvalidArgument)?
+        & !(PAGE_SIZE - 1);
+    Ok((map_phys, offset, map_len))
+}
+
+fn choose_mmio_va(leases: &[MmioLease], space_key: u64, len: usize) -> Option<usize> {
+    let mut candidate = USER_MMIO_BASE;
+    loop {
+        let end = candidate.checked_add(len)?;
+        if end > USER_MMIO_END {
+            return None;
+        }
+        let mut collision_end = None;
+        for l in leases.iter().filter(|l| l.space_key == space_key) {
+            let le = l.map_base.checked_add(l.map_len)?;
+            if candidate < le && end > l.map_base {
+                collision_end = Some(le);
+                break;
+            }
+        }
+        match collision_end {
+            Some(next) => candidate = (next + PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
+            None => return Some(candidate),
+        }
+    }
+}
+
+fn acquire_mmio(
+    slot: usize,
+    index: u32,
+    resource: DriverResource,
+) -> Result<(usize, usize), SysError> {
+    let mut space = crate::process::address_space(slot).ok_or(SysError::PermissionDenied)?;
+    let space_key = space.ttbr0_phys();
     let mut leases = MMIO_LEASES.lock();
     if let Some(entry) = leases
         .iter_mut()
-        .find(|entry| entry.slot == slot && entry.index == index)
+        .find(|e| e.space_key == space_key && e.index == index)
     {
         entry.refs = entry.refs.checked_add(1).ok_or(SysError::NoMemory)?;
-        return Ok(());
+        return Ok((entry.user_base, resource.mmio_len as usize));
     }
+    let (map_phys, offset, map_len) = aligned_mmio_geometry(resource)?;
+    let map_base = choose_mmio_va(&leases, space_key, map_len).ok_or(SysError::NoMemory)?;
+    let mut mapped = 0usize;
+    while mapped < map_len {
+        let result = unsafe { space.map_device_page(map_base + mapped, map_phys + mapped) };
+        if result.is_err() {
+            if mapped != 0 {
+                unsafe {
+                    space.unmap_device_region(map_base, map_base + mapped);
+                }
+            }
+            return Err(SysError::NoMemory);
+        }
+        mapped += PAGE_SIZE;
+    }
+    let user_base = map_base + offset;
     leases.push(MmioLease {
-        slot,
+        space_key,
         index,
         refs: 1,
+        map_base,
+        user_base,
+        map_len,
     });
-    Ok(())
+    crate::info!(
+        "mmio: lease idx={} TTBR0={:#x} phys={:#x}+{:#x} -> user={:#x}",
+        index,
+        space_key,
+        resource.mmio_base,
+        resource.mmio_len,
+        user_base
+    );
+    Ok((user_base, resource.mmio_len as usize))
 }
 
 fn release_mmio(slot: usize, index: u32) -> Result<(), SysError> {
-    let mut leases = MMIO_LEASES.lock();
-    if let Some(pos) = leases
-        .iter()
-        .position(|entry| entry.slot == slot && entry.index == index)
-    {
+    let space = crate::process::address_space(slot).ok_or(SysError::PermissionDenied)?;
+    let space_key = space.ttbr0_phys();
+    let removed = {
+        let mut leases = MMIO_LEASES.lock();
+        let pos = leases
+            .iter()
+            .position(|e| e.space_key == space_key && e.index == index)
+            .ok_or(SysError::InvalidArgument)?;
         if leases[pos].refs > 1 {
             leases[pos].refs -= 1;
-        } else {
-            leases.swap_remove(pos);
+            return Ok(());
         }
-        Ok(())
-    } else {
-        Err(SysError::InvalidArgument)
+        leases.swap_remove(pos)
+    };
+    unsafe {
+        space.unmap_device_region(removed.map_base, removed.map_base + removed.map_len);
     }
+    Ok(())
+}
+
+/// AddressSpace::destroy calls this before tearing down page tables. Whole-space
+/// destruction already drops the device PTEs, so only the lease bookkeeping must
+/// be removed here (and the software device marker prevents freeing BAR PAs).
+pub(crate) fn on_address_space_destroy(space_key: u64) {
+    MMIO_LEASES.lock().retain(|e| e.space_key != space_key);
 }
 
 unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
@@ -1178,10 +1407,7 @@ fn copy_string_from_user(ptr: usize, len: usize) -> Result<String, SysError> {
     Ok(String::from(text))
 }
 
-unsafe fn write_driver_info(
-    addr: usize,
-    descriptor: &zero_abi::driver::DriverDescriptor,
-) -> Result<(), SysError> {
+unsafe fn write_driver_info(addr: usize, resource: DriverResource) -> Result<(), SysError> {
     #[repr(C)]
     struct DriverInfoRecord {
         kind: u32,
@@ -1190,10 +1416,10 @@ unsafe fn write_driver_info(
         irq: u32,
     }
     let record = DriverInfoRecord {
-        kind: descriptor.kind as u32,
-        mmio_base: descriptor.mmio_base,
-        mmio_len: descriptor.mmio_len,
-        irq: descriptor.irq,
+        kind: resource.kind as u32,
+        mmio_base: resource.mmio_base,
+        mmio_len: resource.mmio_len,
+        irq: resource.irq,
     };
     let bytes = core::slice::from_raw_parts(
         (&record as *const DriverInfoRecord).cast::<u8>(),

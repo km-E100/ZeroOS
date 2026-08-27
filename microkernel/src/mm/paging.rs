@@ -1,12 +1,14 @@
+use alloc::vec::Vec;
 use core::ptr;
+use spin::Mutex;
 
 use super::phys;
 use super::table_walk::{
     self, classify_leaf, cow_break_leaf, cow_share_leaf, descriptor_to_table, is_cow_leaf,
     is_table, is_valid, make_leaf_descriptor, make_table_descriptor, page_table_indices, walk,
-    LeafShareClass, AP_EL1_RW_EL0_NONE, DESC_AF, DESC_ATTRIDX_NORMAL, DESC_SH_INNER,
-    DESC_TYPE_TABLE, DESC_UXN, DESC_VALID, KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1, PHYS_ADDR_MASK,
-    USER_AP_RW, USER_AP_RX,
+    LeafShareClass, AP_EL1_RW_EL0_NONE, DESC_AF, DESC_ATTRIDX_DEVICE_NGNRE, DESC_ATTRIDX_NORMAL,
+    DESC_PXN, DESC_SH_INNER, DESC_SW_BORROWED, DESC_SW_DEVICE, DESC_TYPE_TABLE, DESC_UXN,
+    DESC_VALID, KERNEL_SHARED_L1 as TW_KERNEL_SHARED_L1, PHYS_ADDR_MASK, USER_AP_RW, USER_AP_RX,
 };
 
 // 本文件所用常量与 table_walk.rs 保持一致（语义相同，直接复用）。
@@ -17,6 +19,21 @@ pub const USER_STACK_TOP: usize = 0x0000_FFFF_F000;
 pub const USER_STACK_LEN: usize = 0x0000_0000_0002_0000; // 128 KiB user stack
 static mut ID_MAP_BASE: u64 = 0;
 static mut ID_MAP_SIZE: u64 = 0;
+
+/// Shared kernel-only virtual window for high PCI ECAM/BAR MMIO.
+/// L1 entry 510 is inside L0[0] but far above the user ABI (<4GiB).
+pub const KERNEL_IOREMAP_L1: usize = 510;
+pub const KERNEL_IOREMAP_BASE: usize = KERNEL_IOREMAP_L1 << 30;
+const KERNEL_IOREMAP_SIZE: usize = 1usize << 30;
+
+#[derive(Copy, Clone)]
+struct IoremapRange {
+    phys: usize,
+    len: usize,
+    virt: usize,
+}
+static IOREMAP_NEXT: Mutex<usize> = Mutex::new(0);
+static IOREMAP_RANGES: Mutex<Vec<IoremapRange>> = Mutex::new(Vec::new());
 
 pub fn configure_identity_map(base: u64, size: u64) {
     unsafe {
@@ -75,10 +92,14 @@ pub unsafe fn init_kernel_page_table() {
         (&raw const crate::mm::kernel_l2::__zero_kernel_l2_1 as *const PageTable) as *mut PageTable;
     (*l2_0).0.fill(0);
     (*l2_1).0.fill(0);
+    let l2_ioremap = (&raw const crate::mm::kernel_l2::__zero_kernel_l2_ioremap as *const PageTable)
+        as *mut PageTable;
+    (*l2_ioremap).0.fill(0);
 
-    // L1[0] 和 L1[1] 指向两个 L2 表。
+    // L1[0]/[1] cover identity RAM/MMIO; L1[510] is a shared kernel-only ioremap window.
     (*l1).0[0] = make_table_descriptor(l2_0 as usize as u64);
     (*l1).0[1] = make_table_descriptor(l2_1 as usize as u64);
+    (*l1).0[KERNEL_IOREMAP_L1] = make_table_descriptor(l2_ioremap as usize as u64);
 
     let base = unsafe { ID_MAP_BASE };
     let size = unsafe { ID_MAP_SIZE };
@@ -232,6 +253,87 @@ pub unsafe fn map_kernel_page(virt: usize, phys: usize, flags: u64) -> Result<()
     Ok(())
 }
 
+/// Map arbitrary physical device MMIO into the shared kernel-only ioremap window.
+/// The returned VA is stable for the lifetime of the kernel. Existing covering
+/// mappings are reused, so PCI capability/BAR users do not create alias storms.
+pub fn ioremap_device(phys: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let offset = phys & (PAGE_SIZE - 1);
+    let pbase = phys & !(PAGE_SIZE - 1);
+    let total = align_up(offset.checked_add(len)?, PAGE_SIZE);
+    {
+        let maps = IOREMAP_RANGES.lock();
+        let end = pbase.checked_add(total)?;
+        if let Some(m) = maps
+            .iter()
+            .find(|m| pbase >= m.phys && end <= m.phys + m.len)
+        {
+            return Some(m.virt + (phys - m.phys));
+        }
+    }
+    let mut next = IOREMAP_NEXT.lock();
+    let rel = align_up(*next, PAGE_SIZE);
+    let end_rel = rel.checked_add(total)?;
+    if end_rel > KERNEL_IOREMAP_SIZE {
+        return None;
+    }
+    let vbase = KERNEL_IOREMAP_BASE.checked_add(rel)?;
+    let flags = DESC_AF
+        | DESC_SH_INNER
+        | DESC_ATTRIDX_DEVICE_NGNRE
+        | DESC_UXN
+        | DESC_PXN
+        | (AP_EL1_RW_EL0_NONE << 6);
+    for off in (0..total).step_by(PAGE_SIZE) {
+        unsafe {
+            map_ioremap_page(vbase + off, pbase + off, flags).ok()?;
+        }
+    }
+    *next = end_rel;
+    IOREMAP_RANGES.lock().push(IoremapRange {
+        phys: pbase,
+        len: total,
+        virt: vbase,
+    });
+    Some(vbase + offset)
+}
+
+unsafe fn map_ioremap_page(virt: usize, phys: usize, flags: u64) -> Result<(), MapError> {
+    let [i0, i1, i2, i3] = page_table_indices(virt);
+    if i0 != 0 || i1 != KERNEL_IOREMAP_L1 {
+        return Err(MapError::KernelRegion);
+    }
+    let l2 = &raw const crate::mm::kernel_l2::__zero_kernel_l2_ioremap as *const PageTable
+        as *mut PageTable;
+    let e2 = (*l2).0[i2];
+    let l3 = if is_valid(e2) {
+        if !is_table(e2) {
+            return Err(MapError::AlreadyMapped);
+        }
+        descriptor_to_table(e2) as *mut PageTable
+    } else {
+        let t = alloc_page_table_fallible()?;
+        (*l2).0[i2] = make_table_descriptor(t as usize as u64);
+        kbbm_barrier(virt);
+        t
+    };
+    let desc = (phys as u64 & PHYS_ADDR_MASK) | flags | DESC_VALID | DESC_TYPE_TABLE;
+    if is_valid((*l3).0[i3]) {
+        let old = (*l3).0[i3];
+        if old & PHYS_ADDR_MASK == desc & PHYS_ADDR_MASK {
+            return Ok(());
+        }
+        let mut b = |va: usize| kbbm_barrier(va);
+        table_walk::bbm_update_page((*l3).0.as_mut_ptr(), i3, virt, desc, &mut b);
+    } else {
+        (*l3).0[i3] = desc;
+        kbbm_barrier(virt);
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone)]
 pub struct AddressSpace {
     /// Virtual pointer to the L0 root table backing this address space.
@@ -310,6 +412,52 @@ fn kernel_l2_0() -> *const PageTable {
 /// 任何用户映射都不得写入该区间——`map_physical_page` 入口有护栏。
 /// 与 table_walk::KERNEL_SHARED_L1 同值（克隆/回收逻辑共用）。
 const KERNEL_SHARED_L1: usize = TW_KERNEL_SHARED_L1;
+#[inline]
+fn is_kernel_shared_l1(index: usize) -> bool {
+    index == KERNEL_SHARED_L1 || index == KERNEL_IOREMAP_L1
+}
+
+/// Deep-copy the kernel low-1GiB L2 snapshot for one user address space.
+/// Any kernel L3 leaf copied into the process is a borrowed EL1 mapping: the
+/// process neither owns nor refcounts its output PA. This keeps legacy fixed
+/// MMIO visible to EL1 while making the page-table pages themselves private.
+unsafe fn clone_kernel_l2_0_snapshot() -> Result<*mut PageTable, MapError> {
+    let dst = alloc_page_table_fallible()?;
+    let src = kernel_l2_0();
+    for i in 0..512usize {
+        let e2 = (*src).0[i];
+        if is_valid(e2) && is_table(e2) {
+            let src_l3 = descriptor_to_table(e2) as *const PageTable;
+            let dst_l3 = match alloc_page_table_fallible() {
+                Ok(t) => t,
+                Err(err) => {
+                    // Every table descriptor already installed in dst was
+                    // allocated by this function, so rollback may free them.
+                    for j in 0..i {
+                        let d = (*dst).0[j];
+                        if is_valid(d) && is_table(d) {
+                            phys::free_page_table(descriptor_to_table(d) as usize);
+                        }
+                    }
+                    phys::free_page_table(dst as usize);
+                    return Err(err);
+                }
+            };
+            for slot in 0..512usize {
+                let leaf = (*src_l3).0[slot];
+                (*dst_l3).0[slot] = if is_valid(leaf) {
+                    leaf | DESC_SW_BORROWED
+                } else {
+                    0
+                };
+            }
+            (*dst).0[i] = make_table_descriptor(dst_l3 as usize as u64);
+        } else {
+            (*dst).0[i] = e2;
+        }
+    }
+    Ok(dst)
+}
 
 #[allow(static_mut_refs)]
 unsafe fn create_user_address_space_fallible() -> Result<AddressSpace, MapError> {
@@ -325,9 +473,15 @@ unsafe fn create_user_address_space_fallible() -> Result<AddressSpace, MapError>
 
     // L1[1]：复制内核 L1 的共享表描述符；该表本体不归用户空间所有。
     (*l1).0[KERNEL_SHARED_L1] = (*kernel_l1()).0[KERNEL_SHARED_L1];
+    (*l1).0[KERNEL_IOREMAP_L1] = (*kernel_l1()).0[KERNEL_IOREMAP_L1];
 
-    // L1[0]：私有 L2 快照。失败时把此前分配的表页全部回滚。
-    let l2_0 = match alloc_page_table_fallible() {
+    // L1[0]：私有低地址快照。不能只 memcpy L2 描述符：内核若因
+    // PCI/ECAM 等把某个 2MiB block 拆成 L3 table，浅拷贝会让进程直接
+    // 指向内核 L3 本体。随后用户映射可改坏内核表，destroy 还会把其中
+    // 的 MMIO output PA 当用户 RAM 回收。这里做二级深拷贝：
+    // - block 描述符按值复制（destroy 本来就不 free block output）；
+    // - L3 table 分配进程私有副本，所有继承 leaf 标 DESC_SW_BORROWED。
+    let l2_0 = match clone_kernel_l2_0_snapshot() {
         Ok(table) => table,
         Err(err) => {
             phys::free_page_table(l1 as usize);
@@ -335,7 +489,6 @@ unsafe fn create_user_address_space_fallible() -> Result<AddressSpace, MapError>
             return Err(err);
         }
     };
-    ptr::copy_nonoverlapping(kernel_l2_0() as *const u64, l2_0 as *mut u64, 512);
     install_table_descriptor(l1, 0, l2_0);
 
     Ok(AddressSpace {
@@ -459,7 +612,7 @@ unsafe fn install_leaf_descriptor(
     // ⛔ 安全闩：L1[KERNEL_SHARED_L1] 是内核 L2_1 表本体，用户映射一旦写
     // 进去会全局摧毁内核恒等映射（代码/堆/向量表/内核栈）。任何 VA 落在
     // [1GiB,2GiB) 的映射都直接拒绝。
-    if l0_idx == 0 && l1_idx == KERNEL_SHARED_L1 {
+    if l0_idx == 0 && is_kernel_shared_l1(l1_idx) {
         return Err(MapError::KernelRegion);
     }
     let l0 = space.root_table;
@@ -469,8 +622,17 @@ unsafe fn install_leaf_descriptor(
     // 进程私有表——共享的 L2_1 已在入口被拒，到不了这一步。
     let l3 = ensure_user_leaf_table(l2, l2_idx)?;
     let table = &mut *l3;
-    if table.0[l3_idx] & DESC_VALID != 0 {
-        return Err(MapError::AlreadyMapped);
+    let old = table.0[l3_idx];
+    if old & DESC_VALID != 0 {
+        if old & DESC_SW_BORROWED == 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+        // Private snapshot filler may be replaced by an explicit user-owned
+        // page/MMIO lease. Use BBM because this helper is also used by runtime
+        // brk/SHM paths after the address space can already be active.
+        let mut b = |va: usize| kbbm_barrier(va);
+        table_walk::bbm_update_page(table.0.as_mut_ptr(), l3_idx, virt, desc, &mut b);
+        return Ok(());
     }
     table.0[l3_idx] = desc;
     Ok(())
@@ -565,8 +727,8 @@ pub unsafe fn destroy_user_address_space(space: &AddressSpace) {
     let l1 = descriptor_to_table(e0) as *mut PageTable;
 
     for l1_idx in 0..512 {
-        if l1_idx == KERNEL_SHARED_L1 {
-            continue; // ⛔ 内核 L2_1 表本体，绝不动
+        if is_kernel_shared_l1(l1_idx) {
+            continue; // ⛔ shared kernel table, never own/free
         }
         let e1 = (*l1).0[l1_idx];
         if !is_valid(e1) || !is_table(e1) {
@@ -582,8 +744,9 @@ pub unsafe fn destroy_user_address_space(space: &AddressSpace) {
                 let l3 = descriptor_to_table(e2) as *mut PageTable;
                 for l3_idx in 0..512 {
                     let pte = (*l3).0[l3_idx];
-                    if is_valid(pte) {
-                        // 用户数据/栈/bootfs 页：归还物理分配器
+                    if is_valid(pte) && pte & (DESC_SW_DEVICE | DESC_SW_BORROWED) == 0 {
+                        // 用户数据/栈/bootfs 页：归还物理分配器。Device leaf
+                        // 与 block-split borrowed filler 均非 allocator-owned。
                         let pa = (pte & PHYS_ADDR_MASK) as usize;
                         phys::free_page(pa);
                     }
@@ -603,7 +766,7 @@ pub unsafe fn destroy_user_address_space(space: &AddressSpace) {
     );
 }
 
-fn kernel_l0_phys() -> u64 {
+pub(crate) fn kernel_l0_phys() -> u64 {
     &raw const crate::mm::kernel_l0::__zero_kernel_l0 as *const PageTable as usize as u64
 }
 
@@ -616,6 +779,29 @@ pub unsafe fn map_user_phys_page(
 ) -> Result<(), MapError> {
     let ap = if writable { USER_AP_RW } else { USER_AP_RX };
     map_physical_page(space, virt, phys, ap, executable)
+}
+
+/// Map one MMIO page into EL0 as Device-nGnRE, RW, non-executable. The
+/// DESC_SW_DEVICE marker records that the output PA is not allocator-owned RAM.
+pub unsafe fn map_user_device_page(
+    space: &mut AddressSpace,
+    virt: usize,
+    phys: usize,
+) -> Result<(), MapError> {
+    if virt & (PAGE_SIZE - 1) != 0 || phys & (PAGE_SIZE - 1) != 0 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let desc = (phys as u64 & PHYS_ADDR_MASK)
+        | DESC_VALID
+        | DESC_TYPE_TABLE
+        | DESC_AF
+        | DESC_SH_INNER
+        | DESC_ATTRIDX_DEVICE_NGNRE
+        | (USER_AP_RW << 6)
+        | DESC_UXN
+        | DESC_PXN
+        | DESC_SW_DEVICE;
+    install_leaf_descriptor(space, virt, desc)
 }
 
 /// 软件走表诊断/单测：返回 VA 在地址空间 `space` 中的解析结果（只读）。
@@ -686,8 +872,8 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
     let mut copied = 0usize;
 
     for l1_idx in 0..512 {
-        if l1_idx == KERNEL_SHARED_L1 {
-            continue; // ⛔ 共享表绝不遍历
+        if is_kernel_shared_l1(l1_idx) {
+            continue; // ⛔ shared kernel tables are never cloned
         }
         let e1 = (*pl1).0[l1_idx];
         if !is_valid(e1) || !is_table(e1) {
@@ -709,7 +895,7 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                     continue;
                 }
                 // 拒绝内核共享区（防御：parent 里本就不该有）
-                if l1_idx == KERNEL_SHARED_L1 {
+                if is_kernel_shared_l1(l1_idx) {
                     destroy_user_address_space(&child);
                     return Err(MapError::KernelRegion);
                 }
@@ -717,6 +903,14 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                 let va = (l1_idx << 30) | (l2_idx << 21) | (l3_idx << 12);
                 let executable = pte & DESC_UXN == 0;
                 match classify_leaf(pte) {
+                    LeafShareClass::BorrowedDirect => {
+                        // Kernel/device-owned filler from a split identity block:
+                        // clone descriptor verbatim, never retain/refcount it.
+                        if let Err(err) = install_leaf_descriptor(&mut child, va, pte) {
+                            destroy_user_address_space(&child);
+                            return Err(err);
+                        }
+                    }
                     LeafShareClass::CowShare => {
                         // 父子共享同一物理页；双侧只读 + 软件 COW 位。
                         phys::retain_page(src);
@@ -754,6 +948,10 @@ pub unsafe fn clone_user_address_space(parent: &AddressSpace) -> Result<AddressS
                             return Err(err);
                         }
                         ro_shared += 1;
+                    }
+                    LeafShareClass::SkipDevice => {
+                        // Capability leases are process-local; fork never inherits
+                        // a raw hardware mapping. Child can request its own lease.
                     }
                     LeafShareClass::EagerCopy => {
                         // 兜底（异常 AP 编码）：维持旧全量复制语义。
@@ -843,7 +1041,7 @@ unsafe fn clear_user_leaf_range(
     let mut va = start;
     while va < end {
         let [i0, i1, i2, i3] = page_table_indices(va);
-        if i1 != KERNEL_SHARED_L1 {
+        if !is_kernel_shared_l1(i1) {
             let e0 = (*root).0[i0];
             if is_valid(e0) && is_table(e0) {
                 let l1 = descriptor_to_table(e0) as *mut PageTable;
@@ -1020,6 +1218,13 @@ mod unmap_tests {
     // 由 clear_user_leaf_range 入口 assert! 兜底（内核编程错误响亮失败）。
 }
 
+/// Remove user device mappings without returning their physical output addresses
+/// to the RAM allocator. Used when the last MMIO lease reference is released.
+pub unsafe fn unmap_user_device_range(space: &AddressSpace, start: usize, end: usize) -> usize {
+    let mut b = |va: usize| kbbm_barrier(va);
+    clear_user_leaf_range(space.root_table, start, end, &mut b, |_| {})
+}
+
 /// COW 缺页断链（trap.rs Permission fault 路径调用）。
 ///
 /// 前置：far 处 PTE 带 DESC_SW_COW（clone 时双侧标记）。语义：
@@ -1035,7 +1240,7 @@ mod unmap_tests {
 /// space 必须是当前正在故障的地址空间（单核同步 fault，无并发修改）。
 pub unsafe fn handle_cow_fault(space: &AddressSpace, va: usize) -> bool {
     let [l0_idx, l1_idx, l2_idx, l3_idx] = page_table_indices(va);
-    if l0_idx != 0 || l1_idx == KERNEL_SHARED_L1 {
+    if l0_idx != 0 || is_kernel_shared_l1(l1_idx) {
         return false; // 内核区永远没有 COW 页
     }
     // walk 已验证链路有效，这里可直达各级表指针。
