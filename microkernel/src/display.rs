@@ -29,6 +29,10 @@ const BG: Rgb = Rgb {
     b: 0x1b,
 };
 const MARGIN: usize = 8;
+const CELL_ADVANCE: usize = 9;
+const CELL_CLEAR_WIDTH: usize = 16;
+const CSI_MAX_PARAMS: usize = 4;
+const MAX_CONSOLE_CELLS: usize = 8192;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Rgb {
@@ -162,15 +166,33 @@ impl Framebuffer {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Default)]
+struct ConsoleCell {
+    x: u16,
+    y: u16,
+    codepoint: u32,
+    width: u8,
+}
+
 struct Console {
     fb: Framebuffer,
     x: usize,
     y: usize,
     dirty: Option<Rect>,
+    /// Sparse terminal cells used to replay Console glyphs after a userland
+    /// compositor presents a new surface into the same framebuffer.
+    console_cells: Option<alloc::boxed::Box<[ConsoleCell]>>,
     /// Incremental decoder for raw userland ConsoleWrite byte streams. Kernel
     /// logger strings bypass this field because fmt::Arguments are already UTF-8.
     decoder: Utf8Decoder,
+    /// Small ANSI/VT input state. The Console deliberately implements only the
+    /// cursor/erase subset emitted by the built-in shell.
+    escape: u8,
+    csi_params: [u16; CSI_MAX_PARAMS],
+    csi_len: u8,
+    csi_current: u16,
+    csi_has_current: bool,
+    last_advance: usize,
 }
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
@@ -188,7 +210,14 @@ fn boot_console() -> Option<Console> {
         x: MARGIN,
         y: MARGIN,
         dirty: None,
+        console_cells: None,
         decoder: Utf8Decoder::new(),
+        escape: 0,
+        csi_params: [0; CSI_MAX_PARAMS],
+        csi_len: 0,
+        csi_current: 0,
+        csi_has_current: false,
+        last_advance: 0,
     };
     c.fill_rect(
         Rect {
@@ -277,7 +306,17 @@ pub fn install_virtio_gpu_framebuffer(
         x: MARGIN,
         y: MARGIN,
         dirty: None,
+        console_cells: Some(
+            alloc::vec![ConsoleCell::default(); console_cell_capacity(width, height)]
+                .into_boxed_slice(),
+        ),
         decoder: Utf8Decoder::new(),
+        escape: 0,
+        csi_params: [0; CSI_MAX_PARAMS],
+        csi_len: 0,
+        csi_current: 0,
+        csi_has_current: false,
+        last_advance: 0,
     };
     c.fill_rect(
         Rect {
@@ -292,7 +331,7 @@ pub fn install_virtio_gpu_framebuffer(
 }
 
 pub fn clear(color: Rgb) {
-    if let Some(c) = CONSOLE.lock().as_mut() {
+    let changed = if let Some(c) = CONSOLE.lock().as_mut() {
         c.fill_rect(
             Rect {
                 x: 0,
@@ -302,8 +341,21 @@ pub fn clear(color: Rgb) {
             },
             color,
         );
+        c.remove_cells_in_rect(Rect {
+            x: 0,
+            y: 0,
+            w: c.fb.width,
+            h: c.fb.height,
+        });
         c.x = MARGIN;
         c.y = MARGIN;
+        true
+    } else {
+        false
+    };
+    if changed {
+        repaint_console();
+        crate::drivers::virtio::gpu::flush_all();
     }
 }
 
@@ -380,7 +432,7 @@ pub fn present_xrgb(data: &[u8], width: usize, height: usize, stride: usize) -> 
                 );
             }
         }
-        c.mark_dirty(Rect { x: 0, y: 0, w, h });
+        c.render_console_region(Rect { x: 0, y: 0, w, h });
     }
     crate::drivers::virtio::gpu::flush_all();
     true
@@ -399,10 +451,11 @@ pub fn write_bytes(bytes: &[u8]) {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return };
     for &b in bytes {
-        if let Some(ch) = c.decoder.push(b) {
-            c.draw_char(ch);
-        }
+        c.feed_byte(b);
     }
+    c.repaint_dirty();
+    drop(guard);
+    crate::drivers::virtio::gpu::flush_all();
 }
 
 /// 把一条已经格式化的内核日志镜像到 framebuffer。fmt 的每个 `&str`
@@ -418,16 +471,376 @@ pub fn write_fmt_line(args: fmt::Arguments<'_>) {
         let Some(c) = guard.as_mut() else { return };
         let _ = c.write_fmt(args);
         c.newline();
+        c.repaint_dirty();
     }
     // Kernel logging must never synchronously submit GPU commands. On SMP,
     // several CPUs can log while secondaries are coming online; coupling every
     // log line to TRANSFER+FLUSH serialises boot on the VirtIO control queue and
     // can deadlock/stall against device IRQ/queue activity. GOP remains directly
-    // visible, while a VirtIO-GPU console is flushed by explicit presentation
-    // paths (WindowServer/present_xrgb). Serial is the authoritative log sink.
+    // visible; ConsoleWrite and present_xrgb flush the VirtIO-GPU path. Serial
+    // is the authoritative log sink.
+}
+
+#[cfg(test)]
+fn pack_bgrx(c: Rgb) -> u32 {
+    u32::from_le_bytes([c.b, c.g, c.r, 0])
+}
+
+fn console_cell_capacity(width: usize, height: usize) -> usize {
+    let columns = width
+        .saturating_sub(MARGIN * 2)
+        .checked_div(CELL_ADVANCE)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let rows = height
+        .saturating_sub(MARGIN + GLYPH_HEIGHT)
+        .checked_div(GLYPH_HEIGHT + 2)
+        .unwrap_or(0)
+        .saturating_add(1);
+    columns.saturating_mul(rows).clamp(1, MAX_CONSOLE_CELLS)
+}
+
+fn repaint_console() {
+    let mut guard = CONSOLE.lock();
+    if let Some(c) = guard.as_mut() {
+        c.repaint_dirty();
+    }
 }
 
 impl Console {
+    fn repaint_dirty(&mut self) {
+        let Some(rect) = self.dirty.take() else {
+            return;
+        };
+        if self.console_cells.is_none() {
+            return;
+        }
+        self.render_console_region(rect);
+    }
+
+    fn render_console_region(&self, rect: Rect) {
+        let Some(cells) = self.console_cells.as_ref() else {
+            return;
+        };
+        let fb = self.fb;
+        let x1 = rect.x.min(fb.width);
+        let y1 = rect.y.min(fb.height);
+        let x2 = rect.x.saturating_add(rect.w).min(fb.width);
+        let y2 = rect.y.saturating_add(rect.h).min(fb.height);
+        for cell in cells.iter().filter(|cell| cell.codepoint != 0) {
+            let x = cell.x as usize;
+            let y = cell.y as usize;
+            let width = cell.width as usize;
+            if x < x2
+                && x.saturating_add(width) > x1
+                && y < y2
+                && y.saturating_add(GLYPH_HEIGHT) > y1
+            {
+                let ch = char::from_u32(cell.codepoint).unwrap_or('?');
+                let (rows, glyph_width) = glyph(ch).unwrap_or_else(|| glyph('?').unwrap());
+                for (yy, row) in rows.iter().enumerate() {
+                    for xx in 0..glyph_width {
+                        if row & (1u16 << xx) != 0 {
+                            fb.put(x + xx, y + yy, FG);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_cells_in_rect(&mut self, rect: Rect) {
+        let x1 = rect.x;
+        let y1 = rect.y;
+        let x2 = rect.x.saturating_add(rect.w);
+        let y2 = rect.y.saturating_add(rect.h);
+        if let Some(cells) = self.console_cells.as_mut() {
+            for cell in cells.iter_mut().filter(|cell| cell.codepoint != 0) {
+                let x = cell.x as usize;
+                let y = cell.y as usize;
+                let width = (cell.width as usize).max(8);
+                if x < x2
+                    && x.saturating_add(width) > x1
+                    && y < y2
+                    && y.saturating_add(GLYPH_HEIGHT) > y1
+                {
+                    *cell = ConsoleCell::default();
+                }
+            }
+        }
+    }
+
+    fn store_cell(&mut self, ch: char, width: usize) {
+        let x = self.x.min(u16::MAX as usize) as u16;
+        let y = self.y.min(u16::MAX as usize) as u16;
+        let Some(cells) = self.console_cells.as_mut() else {
+            return;
+        };
+        if let Some(cell) = cells
+            .iter_mut()
+            .find(|cell| cell.codepoint != 0 && cell.x == x && cell.y == y)
+        {
+            *cell = ConsoleCell {
+                x,
+                y,
+                codepoint: ch as u32,
+                width: width.min(u8::MAX as usize) as u8,
+            };
+        } else if let Some(cell) = cells.iter_mut().find(|cell| cell.codepoint == 0) {
+            *cell = ConsoleCell {
+                x,
+                y,
+                codepoint: ch as u32,
+                width: width.min(u8::MAX as usize) as u8,
+            };
+        }
+    }
+
+    fn clear_console_layer(&mut self, rect: Rect) {
+        let width = self.fb.width;
+        let height = self.fb.height;
+        let x1 = rect.x.min(width);
+        let y1 = rect.y.min(height);
+        let x2 = rect.x.saturating_add(rect.w).min(width);
+        let y2 = rect.y.saturating_add(rect.h).min(height);
+        self.remove_cells_in_rect(Rect {
+            x: x1,
+            y: y1,
+            w: x2.saturating_sub(x1),
+            h: y2.saturating_sub(y1),
+        });
+        for y in y1..y2 {
+            for x in x1..x2 {
+                self.fb.put(x, y, BG);
+            }
+        }
+        self.mark_dirty(Rect {
+            x: x1,
+            y: y1,
+            w: x2.saturating_sub(x1),
+            h: y2.saturating_sub(y1),
+        });
+    }
+
+    fn clear_cell(&mut self, x: usize, y: usize) {
+        self.clear_console_layer(Rect {
+            x,
+            y,
+            w: CELL_CLEAR_WIDTH,
+            h: GLYPH_HEIGHT,
+        });
+    }
+
+    fn backspace(&mut self) {
+        let advance = if self.last_advance == 0 {
+            CELL_ADVANCE
+        } else {
+            self.last_advance
+        };
+        self.x = self.x.saturating_sub(advance).max(MARGIN);
+        self.clear_cell(self.x, self.y);
+        self.last_advance = 0;
+    }
+
+    fn clear_screen(&mut self) {
+        self.clear_console_layer(Rect {
+            x: 0,
+            y: 0,
+            w: self.fb.width,
+            h: self.fb.height,
+        });
+        self.x = MARGIN;
+        self.y = MARGIN;
+        self.last_advance = 0;
+    }
+
+    fn clear_line(&mut self) {
+        self.clear_console_layer(Rect {
+            x: self.x,
+            y: self.y,
+            w: self.fb.width.saturating_sub(self.x),
+            h: GLYPH_HEIGHT,
+        });
+    }
+
+    fn set_cursor(&mut self, row: u16, col: u16) {
+        let line_height = GLYPH_HEIGHT + 2;
+        let max_y = self.fb.height.saturating_sub(MARGIN + GLYPH_HEIGHT);
+        let row = row.max(1) as usize;
+        let col = col.max(1) as usize;
+        self.y = MARGIN
+            .saturating_add(row.saturating_sub(1).saturating_mul(line_height))
+            .min(max_y);
+        self.x = MARGIN
+            .saturating_add(col.saturating_sub(1).saturating_mul(CELL_ADVANCE))
+            .min(self.fb.width.saturating_sub(MARGIN + 8));
+        self.last_advance = 0;
+    }
+
+    fn csi_param(&self, index: usize, default: u16) -> u16 {
+        if index < self.csi_len as usize && self.csi_params[index] != 0 {
+            self.csi_params[index]
+        } else {
+            default
+        }
+    }
+
+    fn finish_csi_param(&mut self) {
+        if self.csi_len < CSI_MAX_PARAMS as u8 {
+            self.csi_params[self.csi_len as usize] = if self.csi_has_current {
+                self.csi_current
+            } else {
+                0
+            };
+            self.csi_len += 1;
+        }
+        self.csi_current = 0;
+        self.csi_has_current = false;
+    }
+
+    fn reset_csi(&mut self) {
+        self.csi_params = [0; CSI_MAX_PARAMS];
+        self.csi_len = 0;
+        self.csi_current = 0;
+        self.csi_has_current = false;
+    }
+
+    fn apply_csi(&mut self, final_byte: u8) {
+        if self.csi_has_current || self.csi_len != 0 {
+            self.finish_csi_param();
+        }
+        match final_byte {
+            b'A' => {
+                let n = self.csi_param(0, 1) as usize;
+                self.y = self
+                    .y
+                    .saturating_sub(n.saturating_mul(GLYPH_HEIGHT + 2))
+                    .max(MARGIN);
+                self.last_advance = 0;
+            }
+            b'B' => {
+                let n = self.csi_param(0, 1) as usize;
+                let max_y = self.fb.height.saturating_sub(MARGIN + GLYPH_HEIGHT);
+                self.y = self
+                    .y
+                    .saturating_add(n.saturating_mul(GLYPH_HEIGHT + 2))
+                    .min(max_y);
+                self.last_advance = 0;
+            }
+            b'C' => {
+                let n = self.csi_param(0, 1) as usize;
+                let max_x = self.fb.width.saturating_sub(MARGIN + 8);
+                self.x = self
+                    .x
+                    .saturating_add(n.saturating_mul(CELL_ADVANCE))
+                    .min(max_x);
+                self.last_advance = 0;
+            }
+            b'D' => {
+                let n = self.csi_param(0, 1) as usize;
+                self.x = self
+                    .x
+                    .saturating_sub(n.saturating_mul(CELL_ADVANCE))
+                    .max(MARGIN);
+                self.last_advance = 0;
+            }
+            b'H' | b'f' => {
+                self.set_cursor(self.csi_param(0, 1), self.csi_param(1, 1));
+            }
+            b'J' => {
+                let mode = self.csi_param(0, 0);
+                if mode == 0 || mode == 2 {
+                    self.clear_screen();
+                }
+            }
+            b'K' => {
+                let mode = self.csi_param(0, 0);
+                if mode == 0 || mode == 2 {
+                    self.clear_line();
+                }
+            }
+            // SGR/style changes are intentionally ignored; the kernel Console
+            // has one fixed foreground color, but the escape sequence itself
+            // must not become visible '?' glyphs.
+            b'm' => {}
+            _ => {}
+        }
+    }
+
+    fn feed_text_byte(&mut self, b: u8) {
+        match b {
+            b'\n' => {
+                self.decoder.reset();
+                self.draw_char('\n');
+            }
+            b'\r' => {
+                self.decoder.reset();
+                self.draw_char('\r');
+            }
+            b'\t' => {
+                self.decoder.reset();
+                self.draw_char('\t');
+            }
+            0x08 | 0x7f => {
+                self.decoder.reset();
+                self.backspace();
+            }
+            0x00..=0x1f => {
+                self.decoder.reset();
+            }
+            _ => {
+                if let Some(ch) = self.decoder.push(b) {
+                    self.draw_char(ch);
+                }
+            }
+        }
+    }
+
+    fn feed_byte(&mut self, b: u8) {
+        match self.escape {
+            0 => {
+                if b == 0x1b {
+                    self.decoder.reset();
+                    self.escape = 1;
+                } else {
+                    self.feed_text_byte(b);
+                }
+            }
+            1 => {
+                if b == b'[' {
+                    self.reset_csi();
+                    self.escape = 2;
+                } else if b == b'c' {
+                    self.clear_screen();
+                    self.escape = 0;
+                } else if b == 0x1b {
+                    self.escape = 1;
+                } else {
+                    self.escape = 0;
+                    self.feed_text_byte(b);
+                }
+            }
+            _ => match b {
+                0x1b => self.escape = 1,
+                b'0'..=b'9' => {
+                    self.csi_current = self
+                        .csi_current
+                        .saturating_mul(10)
+                        .saturating_add((b - b'0') as u16)
+                        .min(999);
+                    self.csi_has_current = true;
+                }
+                b';' => self.finish_csi_param(),
+                0x40..=0x7e => {
+                    self.apply_csi(b);
+                    self.escape = 0;
+                    self.reset_csi();
+                }
+                _ => self.escape = 0,
+            },
+        }
+    }
+
     fn fill_rect(&mut self, rect: Rect, color: Rgb) {
         let x1 = rect.x.min(self.fb.width);
         let y1 = rect.y.min(self.fb.height);
@@ -470,6 +883,7 @@ impl Console {
     fn newline(&mut self) {
         self.x = MARGIN;
         self.y = self.y.saturating_add(GLYPH_HEIGHT + 2);
+        self.last_advance = 0;
         if self.y + GLYPH_HEIGHT + MARGIN >= self.fb.height {
             self.scroll();
         }
@@ -510,8 +924,28 @@ impl Console {
             },
             BG,
         );
-        self.y = self.fb.height.saturating_sub(dy + MARGIN + GLYPH_HEIGHT);
+        if let Some(cells) = self.console_cells.as_mut() {
+            for cell in cells.iter_mut().filter(|cell| cell.codepoint != 0) {
+                let y = cell.y as usize;
+                if y < MARGIN + dy {
+                    *cell = ConsoleCell::default();
+                } else {
+                    cell.y = (y - dy).min(u16::MAX as usize) as u16;
+                }
+            }
+            self.mark_dirty(Rect {
+                x: 0,
+                y: MARGIN,
+                w: self.fb.width,
+                h: self.fb.height.saturating_sub(MARGIN),
+            });
+        }
+        // `newline` has already advanced the cursor. Move that position up
+        // with the scrolled pixels instead of recomputing a value that can
+        // overlap the last visible glyph row.
+        self.y = self.y.saturating_sub(dy).max(MARGIN);
         self.x = MARGIN;
+        self.last_advance = 0;
     }
 
     fn draw_char(&mut self, ch: char) {
@@ -522,10 +956,12 @@ impl Console {
             }
             '\r' => {
                 self.x = MARGIN;
+                self.last_advance = 0;
                 return;
             }
             '\t' => {
                 self.x = self.x.saturating_add(4 * 8);
+                self.last_advance = 0;
                 return;
             }
             _ => {}
@@ -534,9 +970,13 @@ impl Console {
         if self.x + width + MARGIN >= self.fb.width {
             self.newline();
         }
+        self.clear_cell(self.x, self.y);
+        if ch != ' ' {
+            self.store_cell(ch, width);
+        }
         for (yy, row) in rows.iter().enumerate() {
             for xx in 0..width {
-                if row & (1u16 << (width - 1 - xx)) != 0 {
+                if row & (1u16 << xx) != 0 {
                     self.fb.put(self.x + xx, self.y + yy, FG);
                 }
             }
@@ -547,14 +987,15 @@ impl Console {
             w: width,
             h: GLYPH_HEIGHT,
         });
-        self.x += width + 1;
+        self.last_advance = width + 1;
+        self.x += self.last_advance;
     }
 }
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for ch in s.chars() {
-            self.draw_char(ch);
+        for &b in s.as_bytes() {
+            self.feed_byte(b);
         }
         Ok(())
     }
@@ -586,6 +1027,11 @@ impl Utf8Decoder {
             min: 0,
         }
     }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     pub fn push(&mut self, b: u8) -> Option<char> {
         if self.need == 0 {
             match b {
@@ -632,6 +1078,168 @@ impl Utf8Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_console(width: usize, height: usize) -> (alloc::boxed::Box<[u32]>, Console) {
+        let mut backing = alloc::vec![pack_bgrx(BG); width * height].into_boxed_slice();
+        let fb = Framebuffer {
+            base: backing.as_mut_ptr() as usize,
+            size: width * height * 4,
+            width,
+            height,
+            stride: width,
+            format: Format::Bgrx,
+            volatile: false,
+            flip_y: false,
+        };
+        let console = Console {
+            fb,
+            x: MARGIN,
+            y: MARGIN,
+            dirty: None,
+            console_cells: Some(
+                alloc::vec![ConsoleCell::default(); console_cell_capacity(width, height)]
+                    .into_boxed_slice(),
+            ),
+            decoder: Utf8Decoder::new(),
+            escape: 0,
+            csi_params: [0; CSI_MAX_PARAMS],
+            csi_len: 0,
+            csi_current: 0,
+            csi_has_current: false,
+            last_advance: 0,
+        };
+        (backing, console)
+    }
+
+    #[test]
+    fn ansi_clear_and_home_are_control_sequences() {
+        let (_backing, mut c) = test_console(128, 64);
+        for &b in b"abc" {
+            c.feed_byte(b);
+        }
+        assert!(c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|cell| cell.codepoint != 0));
+
+        for &b in b"\x1b[2J\x1b[H" {
+            c.feed_byte(b);
+        }
+        assert_eq!((c.x, c.y), (MARGIN, MARGIN));
+        assert!(c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|cell| cell.codepoint == 0));
+    }
+
+    #[test]
+    fn backspace_and_space_erase_the_previous_cell() {
+        let (_backing, mut c) = test_console(128, 64);
+        for &b in b"ab" {
+            c.feed_byte(b);
+        }
+        let after_ab = c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell.codepoint != 0)
+            .count();
+        c.feed_byte(0x08);
+        let after_backspace = c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell.codepoint != 0)
+            .count();
+        assert!(after_backspace < after_ab);
+        assert_eq!(c.x, MARGIN + CELL_ADVANCE);
+
+        // Re-create an occupied second cell and overwrite it with a space;
+        // spaces must erase old glyph pixels instead of leaving stale ink.
+        for &b in b"b" {
+            c.feed_byte(b);
+        }
+        c.x = MARGIN + CELL_ADVANCE;
+        c.last_advance = 0;
+        let before_space = c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell.codepoint != 0)
+            .count();
+        c.feed_byte(b' ');
+        let after_space = c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell.codepoint != 0)
+            .count();
+        assert!(after_space < before_space);
+    }
+
+    #[test]
+    fn scroll_moves_cursor_with_the_scrolled_pixels() {
+        let (_backing, mut c) = test_console(64, 64);
+        for _ in 0..3 {
+            c.feed_byte(b'\n');
+        }
+        assert_eq!(c.y, MARGIN + GLYPH_HEIGHT + 2);
+    }
+
+    #[test]
+    fn console_cells_replay_after_compositor_present() {
+        let (mut backing, mut c) = test_console(128, 64);
+        let base_pixel = 0x0011_2233;
+        c.feed_byte(b'A');
+        c.repaint_dirty();
+        backing.fill(base_pixel);
+        c.render_console_region(Rect {
+            x: 0,
+            y: 0,
+            w: 128,
+            h: 64,
+        });
+        assert!(backing.iter().any(|pixel| *pixel != base_pixel));
+
+        c.clear_screen();
+        c.repaint_dirty();
+        assert!(backing.iter().all(|pixel| *pixel == pack_bgrx(BG)));
+        assert!(c
+            .console_cells
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|cell| cell.codepoint == 0));
+    }
+
+    #[test]
+    fn glyph_bits_follow_font_scanline_orientation() {
+        let (backing, mut c) = test_console(128, 64);
+        c.feed_byte(b'Z');
+        let (rows, width) = glyph('Z').unwrap();
+        assert_eq!(width, 8);
+        let row_index = rows
+            .iter()
+            .position(|row| {
+                let bits = *row & 0xff;
+                bits != 0 && bits != (bits.reverse_bits() >> 8)
+            })
+            .unwrap();
+        for xx in 0..width {
+            let expected = rows[row_index] & (1u16 << xx) != 0;
+            let pixel = backing[(MARGIN + row_index) * 128 + MARGIN + xx];
+            assert_eq!(pixel == pack_bgrx(FG), expected, "x={xx}");
+        }
+    }
+
     #[test]
     fn utf8_stream_decodes_chinese() {
         let mut d = Utf8Decoder::new();
