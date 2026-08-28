@@ -1082,6 +1082,21 @@ pub fn pid_at_slot(slot: usize) -> Option<ProcessId> {
     table[slot].map(|record| record.pid)
 }
 
+/// Whether the currently executing user process is the interactive console.
+/// Fork/exec descendants retain the `console` process name, so shell-launched
+/// diagnostics keep their output while independent services remain serial-only
+/// after the shell takes the graphical foreground.
+pub fn current_process_is_console() -> bool {
+    let Some(slot) = crate::scheduler::current_slot_opt() else {
+        return false;
+    };
+    let table = PROCESS_TABLE.lock();
+    table
+        .get(slot)
+        .and_then(|entry| entry.as_ref())
+        .is_some_and(|record| record.name == "console")
+}
+
 /// 读取指定槽位进程的父 pid（号位 23 GetPpid 的唯一只读助手，
 /// 模式照抄 `pid_at_slot`；只读，不修改任何记录字段）。
 ///

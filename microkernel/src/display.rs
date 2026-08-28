@@ -5,6 +5,7 @@
 
 use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::display_font::{ASCII, CJK, GLYPH_HEIGHT};
@@ -196,6 +197,10 @@ struct Console {
 }
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
+/// Once the interactive shell is ready, graphical output belongs to it. Kernel
+/// logs and service diagnostics remain available on serial but must not
+/// asynchronously overwrite the shell surface.
+static SHELL_FOREGROUND: AtomicBool = AtomicBool::new(false);
 
 /// Raw bootloader GOP aperture for early paging attribute classification.
 pub fn boot_framebuffer_range() -> Option<(usize, usize)> {
@@ -359,6 +364,14 @@ pub fn clear(color: Rgb) {
     }
 }
 
+/// Clear the boot log and switch the graphical console to the interactive
+/// shell. This is called before the shell is queued, so no user process can
+/// race the transition.
+pub fn begin_shell_session() {
+    clear(BG);
+    SHELL_FOREGROUND.store(true, Ordering::Release);
+}
+
 pub fn fill_rect(rect: Rect, color: Rgb) {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.fill_rect(rect, color);
@@ -448,6 +461,9 @@ pub fn write_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
+    if SHELL_FOREGROUND.load(Ordering::Acquire) && !crate::process::current_process_is_console() {
+        return;
+    }
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return };
     for &b in bytes {
@@ -462,6 +478,9 @@ pub fn write_bytes(bytes: &[u8]) {
 /// 都保证 UTF-8 有效，因此渲染层按 Unicode scalar 工作；原始 byte stream
 /// 的增量解码器见 [`Utf8Decoder`]。
 pub fn write_fmt_line(args: fmt::Arguments<'_>) {
+    if SHELL_FOREGROUND.load(Ordering::Acquire) {
+        return;
+    }
     {
         // Graphical logging is a best-effort mirror. Never make a kernel control
         // path wait behind another CPU doing framebuffer work during SMP bring-up.

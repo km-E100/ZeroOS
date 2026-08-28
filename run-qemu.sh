@@ -17,7 +17,7 @@ case "$MODE" in
     echo "run-qemu: network mode (usernet + virtio-rng)"
     ;;
   graphical)
-    BOOT_ARGS=(-display cocoa -netdev user,id=znet -device virtio-net-device,netdev=znet,bus=virtio-mmio-bus.1 -device virtio-gpu-device,bus=virtio-mmio-bus.2 -device virtio-keyboard-device,bus=virtio-mmio-bus.3 -device virtio-tablet-device,bus=virtio-mmio-bus.4 -object rng-random,filename=/dev/urandom,id=zrng -device virtio-rng-device,rng=zrng,bus=virtio-mmio-bus.5)
+    BOOT_ARGS=(-display cocoa -netdev user,id=znet -device virtio-net-device,netdev=znet,bus=virtio-mmio-bus.1 -device virtio-gpu-device,xres=1280,yres=720,bus=virtio-mmio-bus.2 -device virtio-keyboard-device,bus=virtio-mmio-bus.3 -device virtio-tablet-device,bus=virtio-mmio-bus.4 -object rng-random,filename=/dev/urandom,id=zrng -device virtio-rng-device,rng=zrng,bus=virtio-mmio-bus.5)
     echo "run-qemu: graphical mode (GOP + virtio-gpu + virtio-keyboard)"
     ;;
   recovery)

@@ -12,8 +12,8 @@ use zero_abi::syscall::SysError;
 static ABS_POINTER_SEEN: AtomicBool = AtomicBool::new(false);
 
 pub const MAX_WINDOWS: usize = 32;
-const SCREEN_WIDTH: usize = 640;
-const SCREEN_HEIGHT: usize = 480;
+const SCREEN_WIDTH: usize = 1280;
+const SCREEN_HEIGHT: usize = 720;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rect {

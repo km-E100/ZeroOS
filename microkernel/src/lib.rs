@@ -88,6 +88,10 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     match process::spawn_user_from_bootfs("/Applications/Shell", "console", false) {
         Ok(user_pid) => {
             process::set_capabilities(user_pid, zero_abi::cap::CAP_BLOCK_DEV);
+            // Boot diagnostics have finished; give the interactive shell a
+            // clean surface before making it runnable. Subsequent kernel and
+            // service logs stay on serial instead of overwriting the shell.
+            display::begin_shell_session();
             scheduler::enqueue(user_pid)
         }
         Err(e) => info!("failed to spawn console: {:?}", e),
