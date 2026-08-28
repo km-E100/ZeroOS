@@ -43,19 +43,20 @@ struct MmioLease {
 
 static MMIO_LEASES: Mutex<Vec<MmioLease>> = Mutex::new(Vec::new());
 
-/// 用户地址空间布局（与 mm/paging.rs 一致）：
+/// 用户地址空间布局（与 mm/paging.rs 一致）。冻结值自工程化第八刀起
+/// 单源于 `zero_abi::validate`（宿主可测纯函数层，见 tools/fuzz-syscall）；
+/// 内核侧仅保留 usize 镜像常量供既有单测对照（非测试构建不编译）：
 /// - [USER_VA_LO, 1GiB)：用户代码/数据（L1[0] 私有副本，可映射）
 /// - [1GiB, 2GiB)：内核专用共享表（L1[1]），用户指针一律拒绝
 /// - [2GiB, USER_VA_MAX]：bootfs 与用户栈（L1[2]/L1[3] 私有表，可映射）
-const USER_VA_LO: usize = 0x0020_0000;
-const KERNEL_REGION_START: usize = 0x4000_0000; // 1 GiB
-const KERNEL_REGION_END: usize = 0x8000_0000; // 2 GiB
-const USER_VA_MAX: usize = 0x0000_FFFF_F000; // 用户栈顶（4GiB - 4KiB）
-
-/// Legacy platform MMIO window. PCI BARs may live above 4GiB and are validated
-/// against the PCI registry instead of this fixed range.
-const DEVICE_MMIO_LO: usize = 0x0800_0000;
-const DEVICE_MMIO_HI: usize = 0x1000_0000;
+#[cfg(test)]
+const USER_VA_LO: usize = zero_abi::validate::USER_VA_LO as usize;
+#[cfg(test)]
+const KERNEL_REGION_START: usize = zero_abi::validate::KERNEL_REGION_START as usize; // 1 GiB
+#[cfg(test)]
+const KERNEL_REGION_END: usize = zero_abi::validate::KERNEL_REGION_END as usize; // 2 GiB
+#[cfg(test)]
+const USER_VA_MAX: usize = zero_abi::validate::USER_VA_MAX as usize; // 用户栈顶（4GiB - 4KiB）
 
 /// EL0 virtual window reserved for capability-gated device mappings. It sits
 /// above the 64MiB brk window (ends at 0x1400_0000) and below secure SHM
@@ -77,21 +78,9 @@ fn validate_user_ptr(addr: usize, size: usize) -> Result<(), SysError> {
 
 /// 第一道门：地址范围 + 布局（纯逻辑，host 可单测，不触页表）。
 fn validate_user_range(addr: usize, size: usize) -> Result<(), SysError> {
-    if addr == 0 {
-        return Err(SysError::InvalidArgument);
-    }
-    if addr < USER_VA_LO {
-        return Err(SysError::InvalidArgument);
-    }
-    if addr >= KERNEL_REGION_START && addr < KERNEL_REGION_END {
-        // 内核恒等映射区：共享页表本体，绝不能把用户缓冲区的拷贝写进去。
-        return Err(SysError::InvalidArgument);
-    }
-    let end = addr.checked_add(size).ok_or(SysError::InvalidArgument)?;
-    if end > USER_VA_MAX {
-        return Err(SysError::InvalidArgument);
-    }
-    Ok(())
+    // 工程化第八刀：判定逻辑上收 `zero_abi::validate`（纯函数、宿主可测、
+    // 由 tools/fuzz-syscall 模糊覆盖）；usize→u64 在 AArch64 同宽，语义逐位一致。
+    zero_abi::validate::validate_user_ptr(addr as u64, size as u64)
 }
 
 /// 第二道门（第八刀）：对 [addr, addr+len) 覆盖的每个 4KiB 页做
@@ -143,11 +132,9 @@ fn page_walk_accepts(outcome: WalkOutcome) -> bool {
 /// the architectural QEMU-virt window; PCI memory BARs are accepted only when
 /// the enumerated BAR registry proves the entire interval belongs to a device.
 fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
-    if len == 0 {
-        return Err(SysError::InvalidArgument);
-    }
-    let end = base.checked_add(len).ok_or(SysError::InvalidArgument)?;
-    let legacy = base >= DEVICE_MMIO_LO as u64 && end <= DEVICE_MMIO_HI as u64;
+    // 工程化第八刀：QEMU virt 设备区的纯范围判定上收 zero_abi；
+    // 当前硬件封板同时允许已枚举 PCI BAR（包括高于 4GiB 的 BAR）。
+    let legacy = zero_abi::validate::validate_mmio_region(base, len).is_ok();
     if legacy || crate::pci::contains_mmio_range(base, len) {
         Ok(())
     } else {
@@ -1453,8 +1440,8 @@ pub(crate) fn on_address_space_destroy(space_key: u64) {
 }
 
 unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
-    // 基本对齐检查：Message 指针需按自身对齐。
-    if addr % core::mem::align_of::<Message>() != 0 {
+    // 基本对齐检查：Message 指针需按自身对齐（规则真值源 zero_abi::validate）。
+    if !zero_abi::validate::message_ptr_aligned(addr as u64) {
         return Err(SysError::InvalidArgument);
     }
     let mut msg = Message::empty();
@@ -1467,7 +1454,7 @@ unsafe fn copy_message_from_user(addr: usize) -> Result<Message, SysError> {
 }
 
 unsafe fn copy_message_to_user(addr: usize, msg: &Message) -> Result<(), SysError> {
-    if addr % core::mem::align_of::<Message>() != 0 {
+    if !zero_abi::validate::message_ptr_aligned(addr as u64) {
         return Err(SysError::InvalidArgument);
     }
     let bytes = core::slice::from_raw_parts(

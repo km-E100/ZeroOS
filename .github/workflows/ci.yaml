@@ -1,0 +1,83 @@
+# Zero OS CI —— 工程化基建三件套（件三）
+#
+# 三个 job 与本地等价命令见同目录 README.md。runner 固定 macos-latest
+# （Apple Silicon，aarch64）：内核 trap/arch 路径含 aarch64 汇编，
+# host 单测必须在本机目标上编译执行。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ── job1：主机全量测试 ─────────────────────────────────────────
+  # 内核纯逻辑层 + MM 算法 + zero-abi 双端一致性 + syscall 参数模糊测试。
+  host-tests:
+    name: host-tests (macos, nightly)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none,aarch64-unknown-uefi
+      - name: Kernel pure-logic unit tests (69 items)
+        run: cargo test -p zero-microkernel
+      - name: MM algorithm host tests
+        run: cargo test --manifest-path microkernel/mm-host-tests/Cargo.toml
+      - name: zero-abi dual-side consistency tests
+        run: cargo test -p zero-abi
+      - name: syscall argument-validation fuzz suites
+        run: cargo test -p fuzz-syscall
+
+  # ── job2：三个裸机目标零 error 构建 ────────────────────────────
+  # kernel / uefi / user-app。除 cargo 退出码外，再对编译日志做
+  # `^error` 断言（防 warning 化的 error 输出被管道吞掉）。
+  baremetal-builds:
+    name: baremetal builds (zero errors)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain (+ rust-src for build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none,aarch64-unknown-uefi
+      - name: Build kernel (aarch64-unknown-none)
+        run: |
+          set -o pipefail
+          cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p zero-microkernel 2>&1 | tee build-kernel.log
+          ! grep -q "^error" build-kernel.log
+      - name: Build UEFI bootloader (aarch64-unknown-uefi)
+        run: |
+          set -o pipefail
+          cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-uefi -p bootloader-uefi 2>&1 | tee build-uefi.log
+          ! grep -q "^error" build-uefi.log
+      - name: Build user-app (aarch64-unknown-none)
+        run: |
+          set -o pipefail
+          cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app 2>&1 | tee build-userapp.log
+          ! grep -q "^error" build-userapp.log
+
+  # ── job3：build-iso 冒烟（可选）───────────────────────────────
+  # 全链打包冒烟；依赖宿主工具与磁盘余量，失败不阻塞合流
+  # （continue-on-error），日志保留供排查。
+  build-iso-smoke:
+    name: build-iso smoke (optional)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none,aarch64-unknown-uefi
+      - name: Full image smoke build
+        run: cargo run -p xtask -- build-iso

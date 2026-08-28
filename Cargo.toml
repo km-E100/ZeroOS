@@ -36,6 +36,7 @@ members = [
     "xtask",
     "bootloader-uefi",
     "tools",
+    "tools/fuzz-syscall",
 ]
 resolver = "2"
 

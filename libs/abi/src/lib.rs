@@ -1772,7 +1772,7 @@ pub mod syscall {
 
     /// 系统调用结果：成功返回 `u64`，失败返回 [`SysError`]。
     ///
-    /// 与内核的二进制契约（`encode_result` / 本模块的 [`decode`]）：
+    /// 与内核的二进制契约（本模块的 [`encode_result`] / [`decode`]，互逆）：
     /// 错误一律编码为 `u64::MAX - k`（k 见 [`SysError`] 判别值），
     /// 其余数值视为成功。
     pub type SyscallResult = Result<u64, SysError>;
@@ -1827,7 +1827,7 @@ pub mod syscall {
     /// 把内核返回的 `x0` 解码为 [`SyscallResult`]。
     ///
     /// 规则与内核 `encode_result` 严格镜像：
-    /// `u64::MAX` 及其以下 8 个值为错误（k=0..8，k=8 第八刀新增），
+    /// `u64::MAX` 及其以下 9 个值为错误（k=0..8，k=8 第八刀新增），
     /// 其余为成功数值。
     #[inline]
     pub const fn decode(value: u64) -> Result<u64, SysError> {
@@ -1878,6 +1878,132 @@ pub mod syscall {
                 assert_eq!(decode(u64::MAX - k), Err(err));
             }
         }
+    }
+
+    /// 错误哨兵区间长度（冻结）：合法错误编码恰为 `u64::MAX - k`，
+    /// `k ∈ [0, ERROR_INTERVAL_LEN)`，与 [`SysError`] 判别值个数一致。
+    /// 新增错误必须同步扩区间；表驱动一致性测试
+    /// （`libs/abi/tests/abi_consistency.rs`）锁定该不变量。
+    pub const ERROR_INTERVAL_LEN: u64 = 9;
+
+    /// **单一真值源**：把系统调用结果编码为内核写回 `x0` 的返回值。
+    ///
+    /// 编码规则（ABI 冻结，真值源即本函数与本文档）：
+    /// - `Ok(v)`：原样透传 `v`；
+    /// - `Err(e)`：`u64::MAX - k`（`k` = `e` 的判别值，见 [`SysError`]）。
+    ///
+    /// 内核 `trap.rs::encode_result` 与用户态 `userlib::decode_result`
+    /// 都必须与本函数一致。本轮工程化改造时 trap.rs 由并行 Agent 维护
+    /// （禁改），内核侧暂保留本地 match，一致性由
+    /// `libs/abi/tests/abi_consistency.rs` 的语义快照测试锁定；
+    /// 内核接入本函数后即可删除快照（待合并点，见该测试头部说明）。
+    #[inline]
+    pub const fn encode_result(result: Result<u64, SysError>) -> u64 {
+        match result {
+            Ok(value) => value,
+            Err(err) => err.code(),
+        }
+    }
+
+    /// 值域谓词：`value` 是否落在错误哨兵区间（即 [`decode`] 会报错的
+    /// `[u64::MAX - (ERROR_INTERVAL_LEN - 1), u64::MAX]`）。
+    ///
+    /// 内核处理器约定：任何以成功语义返回的值都**不得**落入本区间
+    /// （否则会被用户态误判为错误）；`tools/fuzz-syscall` 对该不变量
+    /// 做确定性随机扫描。
+    #[inline]
+    pub const fn is_error_encoded(value: u64) -> bool {
+        value >= u64::MAX - (ERROR_INTERVAL_LEN - 1)
+    }
+}
+
+/// 系统调用参数校验的**纯函数层**（宿主机可测，工程化第八刀上收）。
+///
+/// 内核 `microkernel/src/syscalls.rs` 的第一道防线原本以 `usize`
+/// 私有函数实现、无法脱离内核 crate 测试；本模块冻结其布局常量与
+/// 判定逻辑，内核侧只保留类型适配的薄委托（usize → u64，AArch64
+/// 两者同宽，语义逐位一致）。模糊测试套件见 `tools/fuzz-syscall`
+///（属性式边界值 + 伪随机扫描）。
+///
+/// ## 用户地址空间布局（与 mm/paging.rs 一致，冻结）
+///
+/// - `[USER_VA_LO, 1GiB)`：用户代码/数据（L1[0] 私有副本，可映射）
+/// - `[1GiB, 2GiB)`：内核专用共享表（L1[1]），用户指针一律拒绝
+/// - `[2GiB, USER_VA_MAX]`：bootfs 与用户栈（L1[2]/L1[3] 私有表）
+pub mod validate {
+    use super::syscall::SysError;
+
+    /// 用户区下界（2 MiB；低于它的地址一律拒绝，0 指针天然被覆盖）。
+    pub const USER_VA_LO: u64 = 0x0020_0000;
+    /// 内核恒等映射区起点（1 GiB）：共享页表本体，绝不能被用户缓冲区命中。
+    pub const KERNEL_REGION_START: u64 = 0x4000_0000;
+    /// 内核恒等映射区终点（2 GiB，半开区间）。
+    pub const KERNEL_REGION_END: u64 = 0x8000_0000;
+    /// 用户栈顶（4 GiB − 4 KiB）：`addr + len` 不得超过。
+    pub const USER_VA_MAX: u64 = 0x0000_FFFF_F000;
+
+    /// QEMU virt 外设空间下界（GIC/PL011/virtio-mmio 所在区间）。
+    pub const DEVICE_MMIO_LO: u64 = 0x0800_0000;
+    /// QEMU virt 外设空间上界（半开）。
+    pub const DEVICE_MMIO_HI: u64 = 0x1000_0000;
+
+    /// IPC [`crate::ipc::Message`] 的对齐要求（132 字节 `repr(C)`，对齐 4）。
+    pub const MESSAGE_ALIGN: u64 = core::mem::align_of::<crate::ipc::Message>() as u64;
+
+    /// 用户指针校验（第一道：地址范围 + 布局；与内核原实现逐条一致）：
+    ///
+    /// 1. `addr == 0` 拒绝（NULL 防御）；
+    /// 2. `addr < USER_VA_LO` 拒绝；
+    /// 3. 落在 `[KERNEL_REGION_START, KERNEL_REGION_END)` 拒绝（内核区）；
+    /// 4. `addr + len` 回绕溢出或 `> USER_VA_MAX` 拒绝（checked_add 防回绕）。
+    ///
+    /// 注意：只查范围、不查映射存在性——未映射页仍由硬件 data abort
+    /// 兜底杀进程（内核 syscalls.rs 的 📌 协调点：待 mm 落地逐页
+    /// `translate_user_addr` 后在此追加映射存在性检查）。
+    #[inline]
+    pub const fn validate_user_ptr(addr: u64, size: u64) -> Result<(), SysError> {
+        if addr == 0 {
+            return Err(SysError::InvalidArgument);
+        }
+        if addr < USER_VA_LO {
+            return Err(SysError::InvalidArgument);
+        }
+        if addr >= KERNEL_REGION_START && addr < KERNEL_REGION_END {
+            // 内核恒等映射区：共享页表本体，绝不能把用户缓冲区的拷贝写进去。
+            return Err(SysError::InvalidArgument);
+        }
+        let end = match addr.checked_add(size) {
+            Some(end) => end,
+            None => return Err(SysError::InvalidArgument),
+        };
+        if end > USER_VA_MAX {
+            return Err(SysError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    /// MMIO 租约校验：`[base, base+len)` 必须整体落在 QEMU virt 设备区
+    /// 且 `len != 0`（0 长度租约无意义，按 InvalidArgument 拒绝）。
+    #[inline]
+    pub const fn validate_mmio_region(base: u64, len: u64) -> Result<(), SysError> {
+        if len == 0 || base < DEVICE_MMIO_LO {
+            return Err(SysError::InvalidArgument);
+        }
+        let end = match base.checked_add(len) {
+            Some(end) => end,
+            None => return Err(SysError::InvalidArgument),
+        };
+        if end > DEVICE_MMIO_HI {
+            return Err(SysError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    /// IPC `Message` 用户指针对齐检查（内核 `copy_message_from/to_user`
+    /// 的前置判定；不对齐按 InvalidArgument 拒绝）。
+    #[inline]
+    pub const fn message_ptr_aligned(addr: u64) -> bool {
+        addr % MESSAGE_ALIGN == 0
     }
 }
 
