@@ -12,6 +12,8 @@ use zero_abi::syscall::SysError;
 static ABS_POINTER_SEEN: AtomicBool = AtomicBool::new(false);
 
 pub const MAX_WINDOWS: usize = 32;
+const SCREEN_WIDTH: usize = 640;
+const SCREEN_HEIGHT: usize = 480;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -307,18 +309,18 @@ fn i32_at(p: &[u8], o: usize) -> i32 {
 
 pub extern "C" fn server_main() -> ! {
     let _ = userlib::console_write(b"Zero OS WindowServer online\r\n");
-    let mut comp = Compositor::new(640, 400);
+    let mut comp = Compositor::new(SCREEN_WIDTH, SCREEN_HEIGHT);
     let _ = comp.create(
         0,
         Rect {
-            x: 48,
-            y: 48,
-            w: 360,
-            h: 220,
+            x: 0,
+            y: 0,
+            w: SCREEN_WIDTH as u32,
+            h: SCREEN_HEIGHT as u32,
         },
         b"Zero OS Terminal",
     );
-    let mut frame = vec![0u32; 640 * 400];
+    let mut frame = vec![0u32; SCREEN_WIDTH * SCREEN_HEIGHT];
     loop {
         let mut did = false;
         let mut msg = Message::empty();
@@ -331,11 +333,11 @@ pub extern "C" fn server_main() -> ! {
             did = true;
             handle_input(&mut comp, &input);
         }
-        if comp.compose(&mut frame, 640).is_some() {
+        if comp.compose(&mut frame, SCREEN_WIDTH).is_some() {
             let bytes = unsafe {
                 core::slice::from_raw_parts(frame.as_ptr().cast::<u8>(), frame.len() * 4)
             };
-            let _ = userlib::display_present_bgrx(bytes, 640, 400, 640);
+            let _ = userlib::display_present_bgrx(bytes, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH);
         }
         if !did {
             let _ = userlib::sleep_ticks(1);

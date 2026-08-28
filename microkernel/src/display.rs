@@ -66,9 +66,9 @@ struct Framebuffer {
     /// GOP is firmware/device memory and requires volatile accesses; VirtIO-GPU
     /// backing is ordinary coherent RAM and can use bulk copies.
     volatile: bool,
-    /// Parallels ARM exposes its GOP scanout with the first memory row at the
-    /// visual bottom. Keep the console in normal top-left coordinates and flip
-    /// only the physical row calculation for that firmware platform.
+    /// Some scanout backends expose their first memory row at the visual
+    /// bottom. Keep the console in normal top-left coordinates and flip only
+    /// the physical row calculation for those backends.
     flip_y: bool,
 }
 
@@ -538,9 +538,11 @@ impl Console {
             {
                 let ch = char::from_u32(cell.codepoint).unwrap_or('?');
                 let (rows, glyph_width) = glyph(ch).unwrap_or_else(|| glyph('?').unwrap());
-                for (yy, row) in rows.iter().enumerate() {
+                // The generated font stores scanlines bottom-to-top; emit
+                // them in the console's logical top-to-bottom order.
+                for (yy, row) in rows.iter().rev().enumerate() {
                     for xx in 0..glyph_width {
-                        if row & (1u16 << xx) != 0 {
+                        if row & (1u16 << (glyph_width - 1 - xx)) != 0 {
                             fb.put(x + xx, y + yy, FG);
                         }
                     }
@@ -892,10 +894,11 @@ impl Console {
     fn scroll(&mut self) {
         let dy = GLYPH_HEIGHT + 2;
         let end = self.fb.height.saturating_sub(dy);
-        if !self.fb.volatile && end > MARGIN {
-            // VirtIO-GPU backing is normal RAM: one overlap-safe memmove replaces
-            // ~1M volatile pixel read/writes on a 1280x800 scanout. This matters
-            // during SMP boot where several CPUs can emit log lines concurrently.
+        if !self.fb.volatile && !self.fb.flip_y && end > MARGIN {
+            // A non-flipped VirtIO-GPU backing is normal RAM: one overlap-safe
+            // memmove replaces ~1M volatile pixel read/writes on a 1280x800
+            // scanout. This matters during SMP boot where several CPUs can emit
+            // log lines concurrently.
             let rows = end - MARGIN;
             let row_bytes = self.fb.stride * 4;
             unsafe {
@@ -906,7 +909,8 @@ impl Console {
                 );
             }
         } else {
-            // GOP/device memory requires volatile accesses.
+            // GOP/device memory, and flipped backings whose logical rows do not
+            // form one forward physical range, require coordinate-aware copies.
             for y in MARGIN..end {
                 for x in 0..self.fb.width {
                     if let Some(px) = self.fb.pixel(x, y + dy) {
@@ -974,9 +978,11 @@ impl Console {
         if ch != ' ' {
             self.store_cell(ch, width);
         }
-        for (yy, row) in rows.iter().enumerate() {
+        // The generated font stores scanlines bottom-to-top; the console
+        // coordinate system is top-to-bottom.
+        for (yy, row) in rows.iter().rev().enumerate() {
             for xx in 0..width {
-                if row & (1u16 << xx) != 0 {
+                if row & (1u16 << (width - 1 - xx)) != 0 {
                     self.fb.put(self.x + xx, self.y + yy, FG);
                 }
             }
@@ -1078,6 +1084,37 @@ impl Utf8Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framebuffer_flip_y_maps_logical_rows_to_physical_rows() {
+        let mut backing = alloc::vec![0u32; 4 * 4];
+        let fb = Framebuffer {
+            base: backing.as_mut_ptr() as usize,
+            size: backing.len() * 4,
+            width: 4,
+            height: 4,
+            stride: 4,
+            format: Format::Bgrx,
+            volatile: false,
+            flip_y: true,
+        };
+        let top = Rgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33,
+        };
+        let bottom = Rgb {
+            r: 0xaa,
+            g: 0xbb,
+            b: 0xcc,
+        };
+
+        fb.put(0, 0, top);
+        fb.put(1, 3, bottom);
+
+        assert_eq!(backing[3 * 4], pack_bgrx(top));
+        assert_eq!(backing[1], pack_bgrx(bottom));
+    }
 
     fn test_console(width: usize, height: usize) -> (alloc::boxed::Box<[u32]>, Console) {
         let mut backing = alloc::vec![pack_bgrx(BG); width * height].into_boxed_slice();
@@ -1223,20 +1260,15 @@ mod tests {
     #[test]
     fn glyph_bits_follow_font_scanline_orientation() {
         let (backing, mut c) = test_console(128, 64);
-        c.feed_byte(b'Z');
-        let (rows, width) = glyph('Z').unwrap();
+        c.feed_byte(b'A');
+        let (rows, width) = glyph('A').unwrap();
         assert_eq!(width, 8);
-        let row_index = rows
-            .iter()
-            .position(|row| {
-                let bits = *row & 0xff;
-                bits != 0 && bits != (bits.reverse_bits() >> 8)
-            })
-            .unwrap();
-        for xx in 0..width {
-            let expected = rows[row_index] & (1u16 << xx) != 0;
-            let pixel = backing[(MARGIN + row_index) * 128 + MARGIN + xx];
-            assert_eq!(pixel == pack_bgrx(FG), expected, "x={xx}");
+        for yy in 0..GLYPH_HEIGHT {
+            for xx in 0..width {
+                let expected = rows[GLYPH_HEIGHT - 1 - yy] & (1u16 << (width - 1 - xx)) != 0;
+                let pixel = backing[(MARGIN + yy) * 128 + MARGIN + xx];
+                assert_eq!(pixel == pack_bgrx(FG), expected, "x={xx} y={yy}");
+            }
         }
     }
 
