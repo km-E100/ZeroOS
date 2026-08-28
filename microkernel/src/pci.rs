@@ -133,37 +133,59 @@ pub struct PciMmioResource {
     pub base: u64,
     pub len: u64,
     pub irq: u32,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub revision: u8,
+    pub class: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+}
+
+/// Resolve the VirtIO device type from the PCI identity. Modern devices encode
+/// `type + 0x1040` in Device ID. Transitional IDs (0x1000..0x103f) deliberately
+/// do *not* have that mapping; the VirtIO PCI specification makes Subsystem
+/// Device ID authoritative for the device type and requires revision 0.
+fn virtio_device_type_fields(
+    vendor: u16,
+    device: u16,
+    revision: u8,
+    subsystem: u16,
+) -> Option<u16> {
+    if vendor != 0x1af4 {
+        return None;
+    }
+    if (0x1041..=0x107f).contains(&device) {
+        return Some(device - 0x1040);
+    }
+    if (0x1000..=0x103f).contains(&device) && revision == 0 && subsystem != 0 {
+        return Some(subsystem);
+    }
+    None
+}
+
+pub fn virtio_device_type(dev: &PciDevice) -> Option<u16> {
+    virtio_device_type_fields(dev.vendor_id, dev.device_id, dev.revision, dev.subsystem_id)
 }
 
 fn driver_kind_for(dev: &PciDevice) -> DriverKind {
+    if dev.vendor_id == 0x1b36 && dev.device_id == 0x0005 {
+        return DriverKind::PciTest;
+    }
     if dev.class == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02 {
         return DriverKind::Nvme;
     }
     if dev.class == 0x0c && dev.subclass == 0x03 && dev.prog_if == 0x30 {
         return DriverKind::UsbXhci;
     }
-    if dev.vendor_id == 0x1af4 {
-        let dtype = if (0x1041..=0x107f).contains(&dev.device_id) {
-            Some(dev.device_id - 0x1040)
-        } else {
-            match dev.device_id {
-                0x1000 => Some(1),
-                0x1001 => Some(2),
-                0x1004 => Some(4),
-                _ => None,
-            }
-        };
-        return match dtype {
-            Some(1) => DriverKind::VirtIONet,
-            Some(2) => DriverKind::VirtIOBlk,
-            Some(4) => DriverKind::VirtIORng,
-            Some(16) => DriverKind::VirtIOGpu,
-            Some(18) => DriverKind::VirtIOInput,
-            Some(25) => DriverKind::VirtIOSound,
-            _ => DriverKind::PciGeneric,
-        };
+    match virtio_device_type(dev) {
+        Some(1) => DriverKind::VirtIONet,
+        Some(2) => DriverKind::VirtIOBlk,
+        Some(4) => DriverKind::VirtIORng,
+        Some(16) => DriverKind::VirtIOGpu,
+        Some(18) => DriverKind::VirtIOInput,
+        Some(25) => DriverKind::VirtIOSound,
+        _ => DriverKind::PciGeneric,
     }
-    DriverKind::PciGeneric
 }
 
 /// Flatten all memory BARs into capability/lease resources. I/O-port BARs are
@@ -181,6 +203,12 @@ pub fn mmio_resources() -> Vec<PciMmioResource> {
                 base: bar.address,
                 len: bar.size,
                 irq: 0, // MSI/MSI-X is allocated separately by the IRQ subsystem.
+                vendor_id: dev.vendor_id,
+                device_id: dev.device_id,
+                revision: dev.revision,
+                class: dev.class,
+                subclass: dev.subclass,
+                prog_if: dev.prog_if,
             });
         }
     }
@@ -194,6 +222,23 @@ pub fn contains_mmio_range(base: u64, len: u64) -> bool {
     mmio_resources()
         .iter()
         .any(|r| r.base <= base && r.base.checked_add(r.len).map_or(false, |re| end <= re))
+}
+
+#[cfg(test)]
+mod virtio_identity_tests {
+    use super::virtio_device_type_fields;
+
+    #[test]
+    fn modern_and_transitional_virtio_ids_resolve_by_spec() {
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1041, 1, 0), Some(1));
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1042, 1, 0), Some(2));
+        // Transitional Device ID is not the type: Subsystem Device ID is.
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1000, 0, 1), Some(1));
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1004, 0, 8), Some(8));
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1005, 0, 4), Some(4));
+        assert_eq!(virtio_device_type_fields(0x1af4, 0x1000, 1, 1), None);
+        assert_eq!(virtio_device_type_fields(0x1234, 0x1041, 1, 0), None);
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1012,6 +1057,42 @@ pub fn bar_mmio_ptr(dev: &PciDevice, bar_index: usize, offset: usize, len: usize
         return None;
     }
     let phys = bar.address.checked_add(offset as u64)? as usize;
+    crate::mm::paging::ioremap_device(phys, len)
+}
+
+/// Translate a legacy PCI I/O BAR into a CPU-mappable MMIO aperture.
+///
+/// On AArch64 there are no x86 IN/OUT instructions. UEFI exposes the root bridge
+/// host<->PCI I/O translation before ExitBootServices; the loader snapshots it
+/// into bootinfo. BAR addresses remain PCI bus I/O addresses, so map them through
+/// that window rather than treating the port number as a physical address.
+pub fn bar_io_ptr(dev: &PciDevice, bar_index: usize, offset: usize, len: usize) -> Option<usize> {
+    let bar = dev.bar(bar_index)?;
+    if !bar.is_io || len == 0 || offset.checked_add(len)? as u64 > bar.size {
+        return None;
+    }
+    let win = crate::bootinfo::pci_io_window()?;
+    if dev.address.segment != win.segment {
+        return None;
+    }
+    let bar_end = bar.address.checked_add(bar.size)?;
+    let win_bus_end = win.bus_base.checked_add(win.len)?;
+    if bar.address < win.bus_base || bar_end > win_bus_end {
+        crate::warn!(
+            "pcie: I/O BAR{} outside root window bus={:#x}+{:#x} bar={:#x}+{:#x}",
+            bar.index,
+            win.bus_base,
+            win.len,
+            bar.address,
+            bar.size
+        );
+        return None;
+    }
+    let delta = bar
+        .address
+        .checked_sub(win.bus_base)?
+        .checked_add(offset as u64)?;
+    let phys = win.host_base.checked_add(delta)? as usize;
     crate::mm::paging::ioremap_device(phys, len)
 }
 

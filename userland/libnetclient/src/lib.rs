@@ -15,6 +15,26 @@ pub struct NetStatus {
     pub dns: [u8; 4],
     pub lease_seconds: u32,
 }
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TcpDiag {
+    pub syn_sent: u32,
+    pub rx_segments: u32,
+    pub local_port_match: u32,
+    pub remote_ip_match: u32,
+    pub remote_port_match: u32,
+    pub full_tuple_match: u32,
+    pub synack_seen: u32,
+    pub synack_bad_ack: u32,
+    pub rst_seen: u32,
+    pub established: u32,
+    pub last_flags: u32,
+    pub last_seq: u32,
+    pub last_ack: u32,
+    pub last_expected_ack: u32,
+    pub last_header_len: u32,
+    pub last_payload_len: u32,
+}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Sys(SysError),
@@ -59,6 +79,35 @@ pub fn status() -> Result<NetStatus, Error> {
         lease_seconds: u32::from_le_bytes(
             r.payload[20..24].try_into().map_err(|_| Error::Protocol)?,
         ),
+    })
+}
+
+pub fn tcp_diag() -> Result<TcpDiag, Error> {
+    let r = rpc(np::TCP_DIAG, &[])?;
+    let rd = |off: usize| -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(
+            r.payload[off..off + 4]
+                .try_into()
+                .map_err(|_| Error::Protocol)?,
+        ))
+    };
+    Ok(TcpDiag {
+        syn_sent: rd(4)?,
+        rx_segments: rd(8)?,
+        local_port_match: rd(12)?,
+        remote_ip_match: rd(16)?,
+        remote_port_match: rd(20)?,
+        full_tuple_match: rd(24)?,
+        synack_seen: rd(28)?,
+        synack_bad_ack: rd(32)?,
+        rst_seen: rd(36)?,
+        established: rd(40)?,
+        last_flags: rd(44)?,
+        last_seq: rd(48)?,
+        last_ack: rd(52)?,
+        last_expected_ack: rd(56)?,
+        last_header_len: rd(60)?,
+        last_payload_len: rd(64)?,
     })
 }
 pub fn ping(ip: [u8; 4], seq: u16) -> Result<(), Error> {

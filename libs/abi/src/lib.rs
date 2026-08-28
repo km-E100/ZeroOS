@@ -257,6 +257,10 @@ pub mod driver {
         UsbXhci = 10,
         /// Generic PCI memory BAR resource (class-specific user driver may bind).
         PciGeneric = 11,
+        /// QEMU pci-testdev acceptance device (`1b36:0005`). This is deliberately
+        /// distinct from PciGeneric so production hardware is never touched by
+        /// destructive/read-side-effect acceptance probes.
+        PciTest = 12,
     }
 
     /// 单条驱动描述符（`DriverInfo` 系统调用回填用户缓冲区的**源格式**；
@@ -330,6 +334,68 @@ pub mod driver {
     }
 
     unsafe impl Sync for DriverTable {}
+
+    /// Read-only PCI BAR snapshot flags used by [`PciFunctionInfo`].
+    pub const PCI_BAR_IO: u32 = 1 << 0;
+    pub const PCI_BAR_64: u32 = 1 << 1;
+    pub const PCI_BAR_PREFETCH: u32 = 1 << 2;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct PciBarInfo {
+        pub address: u64,
+        pub size: u64,
+        pub flags: u32,
+        pub reserved: u32,
+    }
+
+    /// Read-only PCI function snapshot for syscall 74. This is inventory only:
+    /// it never grants configuration/MMIO/I/O-space access.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct PciFunctionInfo {
+        pub segment: u16,
+        pub bus: u8,
+        pub device: u8,
+        pub function: u8,
+        pub header_type: u8,
+        pub class: u8,
+        pub subclass: u8,
+        pub prog_if: u8,
+        pub revision: u8,
+        pub vendor_id: u16,
+        pub device_id: u16,
+        pub subsystem_vendor: u16,
+        pub subsystem_id: u16,
+        /// Standard PCI capability IDs 0..63 represented as a bitset.
+        pub capability_bits: u64,
+        /// VirtIO vendor capability cfg_type values represented as bit positions.
+        pub virtio_cfg_types: u32,
+        /// 0 when no MSI-X capability is present. Otherwise table entries count.
+        pub msix_table_size: u16,
+        pub msix_table_bar: u8,
+        pub msix_pba_bar: u8,
+        pub msix_table_offset: u32,
+        pub msix_pba_offset: u32,
+        pub bars: [PciBarInfo; 6],
+    }
+
+    /// Read-only virtio-net transport/queue snapshot for syscall 75.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct NetDriverDiag {
+        pub transport_version: u32,
+        pub device_status: u32,
+        pub rx_queue_size: u16,
+        pub tx_queue_size: u16,
+        pub rx_queue_pfn: u32,
+        pub tx_queue_pfn: u32,
+        pub tx_submits: u64,
+        pub tx_completions: u64,
+        pub rx_completions: u64,
+        pub mac: [u8; 6],
+        pub reserved: [u8; 2],
+    }
 }
 
 /// 进程 ID 包装类型：`raw` 即内核进程表分配的唯一编号
@@ -842,6 +908,8 @@ pub mod protocol {
         /// request payload: handle(u32), shm_handle(u32), max(u32).
         /// response payload: actual(u32). The bytes live in the shared region.
         pub const TCP_RECV_SHM: u32 = 0x24;
+        /// Read-only TCP bring-up counters used by platform diagnostics.
+        pub const TCP_DIAG: u32 = 0x25;
         pub const DNS_QUERY: u32 = 0x30;
         pub const HTTP_GET: u32 = 0x31;
         pub const OK: u32 = 0;
@@ -1676,6 +1744,17 @@ pub mod syscall {
         /// Requires [`crate::cap::CAP_POWER`]; success does not return.
         PowerControl {
             action: u32,
+        },
+        /// (73) Read-only PCI function count discovered from ACPI MCFG/ECAM.
+        PciCount,
+        /// (74) Read-only PCI function snapshot; x1=index, x2=&mut PciFunctionInfo.
+        PciInfo {
+            index: u32,
+            user_buffer: usize,
+        },
+        /// (75) Read-only virtio-net transport/queue diagnostic snapshot.
+        NetDiag {
+            user_buffer: usize,
         },
     }
 

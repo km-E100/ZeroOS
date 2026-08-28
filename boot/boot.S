@@ -121,6 +121,38 @@ __zero_memory_bytes:
 __zero_rsdp_phys:
     .quad 0
 
+// Early platform handoff. 0 = unknown/fail-safe, 1 = QEMU virt,
+// 2 = Parallels ARM. early_uart_base is nonzero only when the bootloader knows
+// that touching the MMIO address before ACPI/PCI discovery is safe.
+.align 3
+.globl __zero_platform_kind
+__zero_platform_kind: .quad 0
+.globl __zero_early_uart_base
+__zero_early_uart_base: .quad 0
+
+// UEFI PCI Root Bridge I/O handoff. The bootloader converts the root bridge
+// Configuration() QWORD I/O descriptor into one segment/bus/host/length tuple.
+// A PCI I/O BAR contains a bus address; the kernel maps it to CPU physical as
+// host_base + (bar_bus_address - bus_base). len=0 means unavailable.
+.globl __zero_pci_io_segment
+__zero_pci_io_segment:   .quad 0
+.globl __zero_pci_io_bus_base
+__zero_pci_io_bus_base:  .quad 0
+.globl __zero_pci_io_host_base
+__zero_pci_io_host_base: .quad 0
+.globl __zero_pci_io_len
+__zero_pci_io_len:       .quad 0
+
+// UEFI MP Services topology snapshot. The loader briefly runs a callback on each
+// enabled AP before ExitBootServices and records the architectural MPIDR_EL1
+// affinity value. The kernel uses this only when its runtime ACPI MADT view does
+// not enumerate the full topology. Count is capped at four (MAX_CPUS).
+.globl __zero_boot_cpu_count
+__zero_boot_cpu_count: .quad 0
+.globl __zero_boot_cpu_mpidrs
+__zero_boot_cpu_mpidrs:
+    .quad 0, 0, 0, 0
+
 // UEFI GOP framebuffer handoff（第21刀）。bootloader 在 ExitBootServices 前
 // 补丁这些标量；base=0 表示没有可直接访问的 GOP framebuffer。
 .align 3

@@ -2,6 +2,7 @@
 extern crate alloc;
 
 use alloc::{collections::VecDeque, vec, vec::Vec};
+use core::sync::atomic::{AtomicU32, Ordering};
 use zero_abi::channels::{NET_REQ, NET_RESP};
 use zero_abi::ipc::Message;
 use zero_abi::protocol::net as np;
@@ -20,6 +21,53 @@ const ARP_CACHE_MAX: usize = 16;
 const PENDING_MAX: usize = 16;
 const SOCKET_MAX: usize = 32;
 const TCP_RX_CAP: usize = 64 * 1024;
+const TCP_SYN_RETRY_MS: u64 = 750;
+const TCP_SYN_RETRY_LIMIT: u8 = 5;
+const TCP_EPHEMERAL_BASE: u16 = 49152;
+const TCP_EPHEMERAL_SPAN: u32 = 16384;
+// TEMP Parallels bring-up endpoint. Removed after TCP receive diagnosis.
+const TCP_DIAG_UDP_PORT: u16 = 31337;
+
+// TCP bring-up counters exposed read-only through NET::TCP_DIAG. They never
+// perform syscalls from the packet path, so enabling diagnostics does not alter
+// TCP_CONNECT timing or scheduler behaviour.
+static TCP_SYN_SENT: AtomicU32 = AtomicU32::new(0);
+static TCP_RX_SEGMENTS: AtomicU32 = AtomicU32::new(0);
+static TCP_LOCAL_PORT_MATCH: AtomicU32 = AtomicU32::new(0);
+static TCP_REMOTE_IP_MATCH: AtomicU32 = AtomicU32::new(0);
+static TCP_REMOTE_PORT_MATCH: AtomicU32 = AtomicU32::new(0);
+static TCP_FULL_TUPLE_MATCH: AtomicU32 = AtomicU32::new(0);
+static TCP_SYNACK_SEEN: AtomicU32 = AtomicU32::new(0);
+static TCP_SYNACK_BAD_ACK: AtomicU32 = AtomicU32::new(0);
+static TCP_RST_SEEN: AtomicU32 = AtomicU32::new(0);
+static TCP_ESTABLISHED: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_ACK: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_EXPECTED_ACK: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_HEADER_LEN: AtomicU32 = AtomicU32::new(0);
+static TCP_LAST_PAYLOAD_LEN: AtomicU32 = AtomicU32::new(0);
+
+fn tcp_diag_values() -> [u32; 16] {
+    [
+        TCP_SYN_SENT.load(Ordering::Relaxed),
+        TCP_RX_SEGMENTS.load(Ordering::Relaxed),
+        TCP_LOCAL_PORT_MATCH.load(Ordering::Relaxed),
+        TCP_REMOTE_IP_MATCH.load(Ordering::Relaxed),
+        TCP_REMOTE_PORT_MATCH.load(Ordering::Relaxed),
+        TCP_FULL_TUPLE_MATCH.load(Ordering::Relaxed),
+        TCP_SYNACK_SEEN.load(Ordering::Relaxed),
+        TCP_SYNACK_BAD_ACK.load(Ordering::Relaxed),
+        TCP_RST_SEEN.load(Ordering::Relaxed),
+        TCP_ESTABLISHED.load(Ordering::Relaxed),
+        TCP_LAST_FLAGS.load(Ordering::Relaxed),
+        TCP_LAST_SEQ.load(Ordering::Relaxed),
+        TCP_LAST_ACK.load(Ordering::Relaxed),
+        TCP_LAST_EXPECTED_ACK.load(Ordering::Relaxed),
+        TCP_LAST_HEADER_LEN.load(Ordering::Relaxed),
+        TCP_LAST_PAYLOAD_LEN.load(Ordering::Relaxed),
+    ]
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Ipv4(pub [u8; 4]);
@@ -97,6 +145,8 @@ struct TcpSocket {
     state: TcpState,
     snd_nxt: u32,
     rcv_nxt: u32,
+    syn_last_ms: u64,
+    syn_retries: u8,
     rx: VecDeque<u8>,
 }
 
@@ -153,6 +203,27 @@ impl NetStack {
                 self.send_request(xid, offer, server, now_ms)
             }
             _ => {}
+        }
+
+        // A real network may lose the first SYN (and stale packets from a
+        // recently reused four-tuple may arrive first). QEMU/slirp is unusually
+        // forgiving here, so keep a bounded SYN retransmit timer in the stack
+        // rather than making TCP_CONNECT a one-shot best effort.
+        let mut retries = Vec::new();
+        for (i, socket) in self.tcp.iter_mut().enumerate() {
+            if socket.state == TcpState::SynSent
+                && socket.syn_retries < TCP_SYN_RETRY_LIMIT
+                && now_ms.saturating_sub(socket.syn_last_ms) >= TCP_SYN_RETRY_MS
+            {
+                socket.syn_last_ms = now_ms;
+                socket.syn_retries = socket.syn_retries.saturating_add(1);
+                retries.push(i);
+            }
+        }
+        for i in retries {
+            let seq = self.tcp[i].snd_nxt.wrapping_sub(1);
+            self.send_tcp_raw(i, seq, 0, 0x02, &[]);
+            TCP_SYN_SENT.fetch_add(1, Ordering::Relaxed);
         }
     }
     fn send_discover(&mut self, now: u64) {
@@ -278,6 +349,16 @@ impl NetStack {
             return;
         }
         let data = &b[8..len];
+        if dport == TCP_DIAG_UDP_PORT && data == b"tcpdiag" && self.bound() {
+            let values = tcp_diag_values();
+            let mut payload = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            let udp = build_udp(TCP_DIAG_UDP_PORT, sport, &payload);
+            self.send_ip(src, IP_UDP, &udp);
+            return;
+        }
         if sport == DHCP_SERVER && dport == DHCP_CLIENT {
             self.ingest_dhcp(data, now);
             return;
@@ -329,6 +410,16 @@ impl NetStack {
             return;
         }
         let flags = b[13];
+        TCP_RX_SEGMENTS.fetch_add(1, Ordering::Relaxed);
+        if self.tcp.iter().any(|s| s.local == dport) {
+            TCP_LOCAL_PORT_MATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.tcp.iter().any(|s| s.remote == src) {
+            TCP_REMOTE_IP_MATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.tcp.iter().any(|s| s.remote_port == sport) {
+            TCP_REMOTE_PORT_MATCH.fetch_add(1, Ordering::Relaxed);
+        }
         let Some(i) = self
             .tcp
             .iter()
@@ -336,14 +427,32 @@ impl NetStack {
         else {
             return;
         };
+        TCP_FULL_TUPLE_MATCH.fetch_add(1, Ordering::Relaxed);
+        TCP_LAST_FLAGS.store(flags as u32, Ordering::Relaxed);
+        TCP_LAST_SEQ.store(seq, Ordering::Relaxed);
+        TCP_LAST_ACK.store(ack, Ordering::Relaxed);
+        TCP_LAST_HEADER_LEN.store(off as u32, Ordering::Relaxed);
+        TCP_LAST_PAYLOAD_LEN.store(b.len().saturating_sub(off) as u32, Ordering::Relaxed);
         let mut send_ack = false;
         {
             let s = &mut self.tcp[i];
+            TCP_LAST_EXPECTED_ACK.store(s.snd_nxt, Ordering::Relaxed);
             match s.state {
-                TcpState::SynSent if flags & 0x12 == 0x12 && ack == s.snd_nxt => {
-                    s.rcv_nxt = seq.wrapping_add(1);
-                    s.state = TcpState::Established;
-                    send_ack = true
+                TcpState::SynSent => {
+                    if flags & 0x04 != 0 {
+                        TCP_RST_SEEN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if flags & 0x12 == 0x12 {
+                        TCP_SYNACK_SEEN.fetch_add(1, Ordering::Relaxed);
+                        if ack == s.snd_nxt {
+                            s.rcv_nxt = seq.wrapping_add(1);
+                            s.state = TcpState::Established;
+                            send_ack = true;
+                            TCP_ESTABLISHED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            TCP_SYNACK_BAD_ACK.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 TcpState::Established => {
                     let data = &b[off..];
@@ -524,8 +633,22 @@ impl NetStack {
             return None;
         }
         let h = self.alloc_handle();
-        let local = 40000 + (h % 20000) as u16;
-        let iss = (userlib::monotonic_ns().unwrap_or(1) as u32) ^ h.rotate_left(13);
+        let now_ns = userlib::monotonic_ns().unwrap_or(1);
+        let seed = (now_ns as u32)
+            ^ ((now_ns >> 32) as u32).rotate_left(7)
+            ^ h.rotate_left(13)
+            ^ self.cfg.ip.to_u32().rotate_left(17);
+        let mut local = None;
+        for probe in 0..TCP_EPHEMERAL_SPAN {
+            let port =
+                (TCP_EPHEMERAL_BASE as u32 + seed.wrapping_add(probe) % TCP_EPHEMERAL_SPAN) as u16;
+            if !self.tcp.iter().any(|socket| socket.local == port) {
+                local = Some(port);
+                break;
+            }
+        }
+        let local = local?;
+        let iss = seed.rotate_left(11) ^ (now_ns as u32).rotate_right(3);
         self.tcp.push(TcpSocket {
             handle: h,
             owner,
@@ -535,10 +658,13 @@ impl NetStack {
             state: TcpState::SynSent,
             snd_nxt: iss.wrapping_add(1),
             rcv_nxt: 0,
+            syn_last_ms: now_ns / 1_000_000,
+            syn_retries: 0,
             rx: VecDeque::new(),
         });
         let i = self.tcp.len() - 1;
         self.send_tcp_raw(i, iss, 0, 0x02, &[]);
+        TCP_SYN_SENT.fetch_add(1, Ordering::Relaxed);
         Some(h)
     }
     pub fn tcp_state(&self, owner: u64, h: u32) -> Option<TcpState> {
@@ -624,11 +750,18 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 fn build_eth(dst: Mac, src: Mac, kind: u16, p: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(14 + p.len());
+    // Ethernet II requires at least 60 bytes on the wire before the NIC adds
+    // the 4-byte FCS. Real hardware/hypervisors may drop shorter runt frames;
+    // QEMU/slirp is more permissive, which previously hid this for 54-byte TCP
+    // SYN/ACK frames. Pad only at L2: IPv4 total-length/checksums remain unchanged.
+    const ETH_MIN_FRAME_NO_FCS: usize = 60;
+    let frame_len = (14 + p.len()).max(ETH_MIN_FRAME_NO_FCS);
+    let mut f = Vec::with_capacity(frame_len);
     f.extend_from_slice(&dst.0);
     f.extend_from_slice(&src.0);
     f.extend_from_slice(&kind.to_be_bytes());
     f.extend_from_slice(p);
+    f.resize(frame_len, 0);
     f
 }
 fn build_ipv4(src: Ipv4, dst: Ipv4, proto: u8, p: &[u8], id: u16) -> Vec<u8> {
@@ -813,11 +946,26 @@ fn response(target: u64, req: u32, code: u32, payload: &[u8]) {
 
 pub extern "C" fn server_main() -> ! {
     let _ = userlib::console_write(b"Zero OS netd starting\r\n");
+    let mut waiting_for_device_logged = false;
     let mac = loop {
         match userlib::net_get_mac() {
             Ok(v) => break Mac(v),
-            Err(SysError::DeviceError) => userlib::yield_now(),
-            Err(_) => userlib::yield_now(),
+            Err(SysError::DeviceError) => {
+                if !waiting_for_device_logged {
+                    let _ = userlib::console_write(
+                        b"netd: no network backend yet; retrying at low frequency\r\n",
+                    );
+                    waiting_for_device_logged = true;
+                }
+                // Device discovery is complete before launchd starts netd on the
+                // normal boot path. A missing backend therefore must not turn
+                // into a cooperative-yield busy loop that consumes an entire PE.
+                // Keep a low-frequency retry for future hotplug/recovery.
+                let _ = userlib::sleep_ticks(50);
+            }
+            Err(_) => {
+                let _ = userlib::sleep_ticks(50);
+            }
         }
     };
     let mut stack = NetStack::new(mac);
@@ -1011,6 +1159,14 @@ fn handle_req(s: &mut NetStack, owner: u64, m: &Message) {
                 Err(()) => response(owner, req, np::ERR, &[]),
             }
         }
+        np::TCP_DIAG => {
+            let values = tcp_diag_values();
+            let mut p = [0u8; 64];
+            for (i, v) in values.iter().copied().enumerate() {
+                p[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            response(owner, req, np::OK, &p)
+        }
         _ => response(owner, req, np::ERR, &[]),
     }
 }
@@ -1023,6 +1179,27 @@ mod tests {
         let p = build_ipv4(Ipv4([1, 2, 3, 4]), Ipv4([5, 6, 7, 8]), 17, &[1, 2, 3], 7);
         assert_eq!(checksum(&p[..20]), 0);
         assert_eq!(p.len(), 23)
+    }
+
+    #[test]
+    fn ethernet_pads_short_tcp_frames_to_wire_minimum() {
+        let tcp = build_tcp(
+            Ipv4([10, 0, 0, 1]),
+            Ipv4([10, 0, 0, 2]),
+            40000,
+            443,
+            1,
+            0,
+            0x02,
+            u16::MAX,
+            &[],
+        );
+        let ip = build_ipv4(Ipv4([10, 0, 0, 1]), Ipv4([10, 0, 0, 2]), IP_TCP, &tcp, 1);
+        assert_eq!(14 + ip.len(), 54, "bare SYN geometry should stay 54 bytes");
+        let frame = build_eth(Mac([0; 6]), Mac([2, 0, 0, 0, 0, 1]), ETH_IPV4, &ip);
+        assert_eq!(frame.len(), 60);
+        assert_eq!(&frame[14..14 + ip.len()], ip.as_slice());
+        assert!(frame[14 + ip.len()..].iter().all(|b| *b == 0));
     }
     #[test]
     fn arp_request_layout() {

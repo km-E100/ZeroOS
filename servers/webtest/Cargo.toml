@@ -13,5 +13,6 @@ path = "src/bin/main.rs"
 
 [dependencies]
 libweb = { path = "../../userland/libweb" }
+libnetclient = { path = "../../userland/libnetclient" }
 userlib = { path = "../../userland/userlib" }
 useralloc = { path = "../../userland/useralloc" }

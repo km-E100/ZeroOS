@@ -398,6 +398,41 @@ pub fn power_control(action: u32) -> Result<(), SysError> {
     decode_result(svc_call(72, [action as u64, 0, 0, 0])).map(|_| ())
 }
 
+/// Read-only PCI inventory count (syscall 73).
+pub fn pci_count() -> Result<usize, SysError> {
+    decode_result(svc_call(73, [0, 0, 0, 0])).map(|v| v as usize)
+}
+
+/// Read-only PCI function snapshot (syscall 74).
+pub fn pci_info(index: u32) -> Result<zero_abi::driver::PciFunctionInfo, SysError> {
+    let mut info = zero_abi::driver::PciFunctionInfo::default();
+    decode_result(svc_call(
+        74,
+        [
+            index as u64,
+            (&mut info as *mut zero_abi::driver::PciFunctionInfo) as u64,
+            0,
+            0,
+        ],
+    ))?;
+    Ok(info)
+}
+
+/// Read-only virtio-net queue/transport diagnostic snapshot (syscall 75).
+pub fn net_diag() -> Result<zero_abi::driver::NetDriverDiag, SysError> {
+    let mut info = zero_abi::driver::NetDriverDiag::default();
+    decode_result(svc_call(
+        75,
+        [
+            (&mut info as *mut zero_abi::driver::NetDriverDiag) as u64,
+            0,
+            0,
+            0,
+        ],
+    ))?;
+    Ok(info)
+}
+
 pub fn block_backend_type() -> Result<u8, SysError> {
     decode_result(svc_call(71, [0, 0, 0, 0])).map(|v| v as u8)
 }
@@ -496,12 +531,18 @@ pub fn gpu3d_get_capset(capset_id: u32, version: u32, out: &mut [u8]) -> Result<
 pub struct DriverInfo {
     /// 设备种类（[`zero_abi::driver::DriverKind`] 的 `u32` 值）。
     pub kind: u32,
+    /// PCI identity packed as low16=vendor, high16=device; zero for non-PCI.
+    /// This field occupies historical repr(C) padding, preserving all old offsets.
+    pub pci_id: u32,
     /// MMIO 寄存器基地址（物理地址）。
     pub mmio_base: u64,
     /// MMIO 区域长度。
     pub mmio_len: u64,
     /// 中断号。
     pub irq: u32,
+    /// low bytes: class, subclass, prog_if, revision; zero for non-PCI.
+    /// This occupies the historical tail padding; total ABI size stays 32 bytes.
+    pub pci_class: u32,
 }
 
 /// 查询驱动描述符数量（号位 15）。
@@ -516,9 +557,11 @@ pub fn driver_count() -> Result<u64, SysError> {
 pub fn driver_info(index: u32) -> Result<DriverInfo, SysError> {
     let mut info = DriverInfo {
         kind: 0,
+        pci_id: 0,
         mmio_base: 0,
         mmio_len: 0,
         irq: 0,
+        pci_class: 0,
     };
     let ret = svc_call(16, [index as u64, &mut info as *mut _ as u64, 0, 0]);
     decode_result(ret).map(|_| info)
@@ -751,6 +794,17 @@ fn decode_result(value: u64) -> Result<u64, SysError> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_info_abi_reuses_padding_without_growth() {
+        assert_eq!(core::mem::size_of::<DriverInfo>(), 32);
+        assert_eq!(core::mem::offset_of!(DriverInfo, kind), 0);
+        assert_eq!(core::mem::offset_of!(DriverInfo, pci_id), 4);
+        assert_eq!(core::mem::offset_of!(DriverInfo, mmio_base), 8);
+        assert_eq!(core::mem::offset_of!(DriverInfo, mmio_len), 16);
+        assert_eq!(core::mem::offset_of!(DriverInfo, irq), 24);
+        assert_eq!(core::mem::offset_of!(DriverInfo, pci_class), 28);
+    }
+
     use super::*;
     use zero_abi::syscall::{decode, SysError};
 

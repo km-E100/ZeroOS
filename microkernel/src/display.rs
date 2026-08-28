@@ -62,6 +62,10 @@ struct Framebuffer {
     /// GOP is firmware/device memory and requires volatile accesses; VirtIO-GPU
     /// backing is ordinary coherent RAM and can use bulk copies.
     volatile: bool,
+    /// Parallels ARM exposes its GOP scanout with the first memory row at the
+    /// visual bottom. Keep the console in normal top-left coordinates and flip
+    /// only the physical row calculation for that firmware platform.
+    flip_y: bool,
 }
 
 impl Framebuffer {
@@ -97,6 +101,7 @@ impl Framebuffer {
             stride,
             format,
             volatile: true,
+            flip_y: crate::bootinfo::platform_kind() == crate::bootinfo::PLATFORM_PARALLELS_ARM,
         })
     }
 
@@ -105,7 +110,12 @@ impl Framebuffer {
         if x >= self.width || y >= self.height {
             return None;
         }
-        let off = (y.checked_mul(self.stride)?.checked_add(x)?).checked_mul(4)?;
+        let physical_y = if self.flip_y {
+            self.height.checked_sub(1)?.checked_sub(y)?
+        } else {
+            y
+        };
+        let off = (physical_y.checked_mul(self.stride)?.checked_add(x)?).checked_mul(4)?;
         (off + 4 <= self.size).then_some(off)
     }
 
@@ -158,20 +168,27 @@ struct Console {
     x: usize,
     y: usize,
     dirty: Option<Rect>,
+    /// Incremental decoder for raw userland ConsoleWrite byte streams. Kernel
+    /// logger strings bypass this field because fmt::Arguments are already UTF-8.
+    decoder: Utf8Decoder,
 }
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 
-pub fn init() {
-    let Some(fb) = Framebuffer::from_boot() else {
-        return;
-    };
-    let reserved = crate::mm::phys::reserve_physical_range(fb.base, fb.size);
+/// Raw bootloader GOP aperture for early paging attribute classification.
+pub fn boot_framebuffer_range() -> Option<(usize, usize)> {
+    let fb = Framebuffer::from_boot()?;
+    Some((fb.base, fb.size))
+}
+
+fn boot_console() -> Option<Console> {
+    let fb = Framebuffer::from_boot()?;
     let mut c = Console {
         fb,
         x: MARGIN,
         y: MARGIN,
         dirty: None,
+        decoder: Utf8Decoder::new(),
     };
     c.fill_rect(
         Rect {
@@ -182,7 +199,33 @@ pub fn init() {
         },
         BG,
     );
-    *CONSOLE.lock() = Some(c);
+    Some(c)
+}
+
+/// Attach the bootloader-provided GOP framebuffer before MM/ACPI/platform init.
+/// This is intentionally allocation-free: early bring-up on an unfamiliar ARM64
+/// platform must have a diagnostic sink even when no UART is known yet. Physical
+/// reservation is deferred to [`init`] after the allocator exists.
+pub fn early_init() {
+    let mut guard = CONSOLE.lock();
+    if guard.is_some() {
+        return;
+    }
+    *guard = boot_console();
+}
+
+/// Finalize GOP ownership once physical memory management is online. If early
+/// init already installed the console, preserve its contents/cursor and only
+/// reserve the underlying physical range.
+pub fn init() {
+    if CONSOLE.lock().is_none() {
+        early_init();
+    }
+    let fb = { CONSOLE.lock().as_ref().map(|c| c.fb) };
+    let Some(fb) = fb else {
+        return;
+    };
+    let reserved = crate::mm::phys::reserve_physical_range(fb.base, fb.size);
     crate::info!(
         "display: GOP framebuffer {}x{} stride={} base={:#x} reserved_pages={}",
         fb.width,
@@ -227,12 +270,14 @@ pub fn install_virtio_gpu_framebuffer(
         stride,
         format: Format::Bgrx,
         volatile: false,
+        flip_y: false,
     };
     let mut c = Console {
         fb,
         x: MARGIN,
         y: MARGIN,
         dirty: None,
+        decoder: Utf8Decoder::new(),
     };
     c.fill_rect(
         Rect {
@@ -339,6 +384,25 @@ pub fn present_xrgb(data: &[u8], width: usize, height: usize, stride: usize) -> 
     }
     crate::drivers::virtio::gpu::flush_all();
     true
+}
+
+/// Mirror a raw userland console byte stream into the active graphical console.
+///
+/// ConsoleWrite is a byte ABI and callers may split a UTF-8 scalar across syscall
+/// boundaries, so keep an incremental decoder in the Console rather than calling
+/// `from_utf8` per chunk. Serial remains the authoritative headless sink; this is
+/// the visible terminal path on UEFI machines without an interactive UART.
+pub fn write_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut guard = CONSOLE.lock();
+    let Some(c) = guard.as_mut() else { return };
+    for &b in bytes {
+        if let Some(ch) = c.decoder.push(b) {
+            c.draw_char(ch);
+        }
+    }
 }
 
 /// 把一条已经格式化的内核日志镜像到 framebuffer。fmt 的每个 `&str`

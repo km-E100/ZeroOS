@@ -81,7 +81,10 @@ pub fn launch_core(_info: &BootInfo) {
         ServiceDescriptor {
             name: "webtest",
             entry: ServiceEntry::Bootfs("/System/Core/zero-webtest"),
-            essential: false,
+            // TEMP Parallels bring-up hook: auto-run the network diagnostic so
+            // the result does not depend on flaky host key injection. Revert
+            // after the TCPDIAG result is captured.
+            essential: crate::bootinfo::platform_kind() == crate::bootinfo::PLATFORM_PARALLELS_ARM,
             privileged: false,
             capabilities: 0,
         },

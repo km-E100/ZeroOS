@@ -273,16 +273,20 @@ pub fn init(_boot_info: &BootInfo) {
         set_vector_base(&__vector_table as *const _ as usize);
         crate::info!("arch/aarch64: vectors set");
 
-        // MAIR AttrIdx 1 配置为 Device-nGnRE（0b0000_0100）：恒等映射的
-        // MMIO 块引用该属性，寄存器访问不被缓存合并（对照 Linux ioremap）。
-        // 保留其余属性槽（固件 Normal 定义在 AttrIdx 0，继续生效）。
+        // Zero OS owns AttrIdx0/1 semantics once it builds its own page tables:
+        //   AttrIdx0 = Normal WB/WA cacheable (0xff)
+        //   AttrIdx1 = Device-nGnRE (0x04)
+        // Never inherit AttrIdx0 from firmware. Parallels EDK II uses AttrIdx0=0x00
+        // (Device-nGnRnE) and AttrIdx3=0xff for normal RAM; reusing that MAIR with
+        // our AttrIdx0 RAM descriptors makes kernel text/stack Device memory as soon
+        // as TTBR switches. QEMU happened to expose AttrIdx0=Normal and hid the bug.
         let mut mair: u64;
         asm!("mrs {}, mair_el1", out(reg) mair);
-        mair &= !(0xFFu64 << 8);
-        mair |= 0x04u64 << 8;
+        mair &= !0xFFFFu64;
+        mair |= 0x04FFu64;
         asm!("msr mair_el1, {}", in(reg) mair);
         BOOT_MAIR_EL1.store(mair, AtomicOrdering::Release);
-        asm!("tlbi vmalle1", options(nostack));
+        asm!("dsb ish", "isb", options(nostack));
 
         // GIC/timer 延后到 MM + ACPI 完成之后；否则 ACPI 永远只能“解析但不消费”。
         // Do not enable interrupts yet; defer until scheduler has installed a current slot.
@@ -1041,4 +1045,61 @@ fn decode_data_abort(esr: u64) -> Option<(AbortKind, Option<u8>)> {
         _ => (AbortKind::Unknown, None),
     };
     Some((kind, level))
+}
+
+/// Whether the current PE implements Arm FEAT_RNG (RNDR/RNDRRS).
+/// ID_AA64ISAR0_EL1.RNDR is bits [63:60]; zero means the instructions are absent.
+pub fn hardware_rng_available() -> bool {
+    let isar0: u64;
+    unsafe {
+        asm!(
+            "mrs {isar0}, ID_AA64ISAR0_EL1",
+            isar0 = out(reg) isar0,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((isar0 >> 60) & 0xf) != 0
+}
+
+/// Fill `out` from the architectural RNDR DRBG. No clock/address fallback is
+/// permitted here: callers use this for ASLR/TLS cryptographic randomness.
+pub fn fill_hardware_random(out: &mut [u8]) -> bool {
+    if out.is_empty() {
+        return true;
+    }
+    if !hardware_rng_available() {
+        return false;
+    }
+    let mut off = 0usize;
+    while off < out.len() {
+        let mut value = 0u64;
+        let mut success = false;
+        // RNDR may transiently fail; Arm recommends retrying rather than treating
+        // one failure as absence of the feature.
+        for _ in 0..16 {
+            let ok: u32;
+            unsafe {
+                asm!(
+                    "mrs {value}, S3_3_C2_C4_0",
+                    "cset {ok:w}, ne",
+                    value = out(reg) value,
+                    ok = out(reg) ok,
+                    options(nomem, nostack)
+                );
+            }
+            if ok != 0 {
+                success = true;
+                break;
+            }
+            spin_loop();
+        }
+        if !success {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        let n = (out.len() - off).min(bytes.len());
+        out[off..off + n].copy_from_slice(&bytes[..n]);
+        off += n;
+    }
+    true
 }

@@ -2022,7 +2022,7 @@ fn choose_user_load_bias(elf: &user_elf::UserElf) -> Result<usize, ProcessError>
         return Ok(0);
     }
     let mut bytes = [0u8; 8];
-    if !crate::drivers::virtio::rng::fill_random(&mut bytes) {
+    if !crate::drivers::fill_random(&mut bytes) {
         crate::error!("PIE load refused: cryptographic entropy unavailable");
         return Err(ProcessError::InvalidArgument);
     }

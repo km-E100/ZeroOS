@@ -585,6 +585,14 @@ fn decode_syscall(regs: &[u64; 31]) -> Option<Syscall> {
         72 => Some(Syscall::PowerControl {
             action: regs[1] as u32,
         }),
+        73 => Some(Syscall::PciCount),
+        74 => Some(Syscall::PciInfo {
+            index: regs[1] as u32,
+            user_buffer: regs[2] as usize,
+        }),
+        75 => Some(Syscall::NetDiag {
+            user_buffer: regs[1] as usize,
+        }),
         _ => None,
     }
 }

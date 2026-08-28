@@ -242,10 +242,15 @@ pub unsafe fn negotiate_features_low(base: usize, wanted_low: u32) -> Option<u32
         mmio_write32(base, REG_DRIVER_FEATURES_SEL, 1);
         mmio_write32(base, REG_DRIVER_FEATURES, 1);
     }
-    status |= STATUS_FEATURES_OK;
-    mmio_write32(base, REG_STATUS, status);
-    if mmio_read32(base, REG_STATUS) & STATUS_FEATURES_OK == 0 {
-        return None;
+    // FEATURES_OK belongs to the modern 1.0 transport. Legacy PCI/MMIO
+    // completes feature negotiation by proceeding directly to DRIVER_OK; old
+    // transitional devices may legally ignore this status bit.
+    if version == 2 {
+        status |= STATUS_FEATURES_OK;
+        mmio_write32(base, REG_STATUS, status);
+        if mmio_read32(base, REG_STATUS) & STATUS_FEATURES_OK == 0 {
+            return None;
+        }
     }
     Some(accepted_low)
 }
@@ -278,14 +283,26 @@ pub unsafe fn configure_queue<const N: usize>(
     if max == 0 {
         return None;
     }
-    let q = (N as u32).min(max);
+    // Legacy PCI has no queue-size negotiation: the device's queue_size is the
+    // exact ring geometry. Modern PCI and virtio-mmio may use a smaller queue.
+    let q = if pci_transport::is_legacy_pci(base) {
+        if max > N as u32 {
+            warn!(
+                "virtio: legacy PCI queue {} requires {} entries but driver capacity is {}",
+                queue_index, max, N
+            );
+            return None;
+        }
+        max
+    } else {
+        (N as u32).min(max)
+    };
     if q == 0 || !q.is_power_of_two() {
         return None;
     }
     if version == 1 {
         // Legacy virtio-mmio QueuePFN is expressed in units of GuestPageSize.
-        // This register is mandatory in v1; relying on firmware leftovers makes
-        // QueuePFN resolve to the wrong guest physical address after reset.
+        // The PCI legacy facade treats these two synthetic registers as no-ops.
         mmio_write32(base, REG_GUEST_PAGE_SIZE, 4096);
         mmio_write32(base, REG_QUEUE_ALIGN, 4096)
     }
@@ -304,11 +321,16 @@ pub unsafe fn configure_queue<const N: usize>(
     let used = mem.add(used_off) as *mut VirtqUsed<N>;
     mmio_write32(base, REG_QUEUE_NUM, q);
     if version == 1 {
-        mmio_write32(
-            base,
-            REG_QUEUE_PFN,
-            legacy_queue_pfn(mem as usize, 1usize << PAGE_SHIFT),
-        )
+        let pfn = legacy_queue_pfn(mem as usize, 1usize << PAGE_SHIFT);
+        mmio_write32(base, REG_QUEUE_PFN, pfn);
+        crate::info!(
+            "virtio: legacy queue={} max={} size={} pfn={:#x} mem={:#x}",
+            queue_index,
+            max,
+            q,
+            pfn,
+            mem as usize
+        );
     } else {
         write_u64_pair(base, REG_QUEUE_DESC_LOW, REG_QUEUE_DESC_HIGH, desc as u64);
         write_u64_pair(

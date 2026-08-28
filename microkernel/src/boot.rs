@@ -86,12 +86,22 @@ pub fn init_arch(boot_info: &BootInfo) {
         kernel_end,
         kernel_end.saturating_sub(kernel_start)
     );
-    mm::init_relocated(memory_bytes, LEGACY_LOW_RESERVE, kernel_start, kernel_end);
-    crate::info!("boot::init_arch: mm init done");
-
-    // 固件表位于物理地址空间；等恒等映射/设备属性稳定后再解析，随后
-    // 立刻让 GIC/timer/PSCI 消费结果。这样 ACPI 不再只是“打印出来”。
+    // Stage 1 keeps firmware page tables active: initialize phys + heap first,
+    // then parse/copy ACPI while every firmware table is still reachable. Some
+    // real/virtual firmware (Parallels included) places RSDP/XSDT above Zero
+    // OS's deliberately small 2GiB identity window.
+    mm::init_relocated_early(memory_bytes, LEGACY_LOW_RESERVE, kernel_start, kernel_end);
+    crate::info!("boot::init_arch: mm early init done; taking ownership of bootfs");
+    crate::rootfs::init(boot_info.rootfs);
+    crate::info!("boot::init_arch: bootfs cache owned; parsing ACPI under firmware TTBR");
     crate::acpi::init();
+
+    // Stage 2 owns the translation regime. paging::init_kernel_page_table now
+    // consumes the cached ACPI MMIO bases so GIC/SMMU registers are Device memory
+    // from the first instruction after TTBR takeover.
+    mm::activate_relocated_paging();
+    crate::info!("boot::init_arch: mm paging takeover done");
+
     arch::init_platform();
     // Knife35: enumerate PCIe from MCFG before user address spaces are cloned.
     crate::pci::init();

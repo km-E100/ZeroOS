@@ -1848,6 +1848,7 @@ dependencies = [
 name = "zero-webtest"
 version = "0.1.0"
 dependencies = [
+ "libnetclient",
  "libweb",
  "useralloc",
  "userlib",

@@ -6,6 +6,7 @@
 
 use alloc::alloc::{alloc_zeroed, Layout};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use zero_abi::driver::DriverDescriptor;
 
@@ -17,8 +18,11 @@ use super::{
     set_driver_ok, VirtQueue, VIRTQ_DESC_F_WRITE,
 };
 
-const RX_QUEUE_SIZE: usize = 64;
-const TX_QUEUE_SIZE: usize = 8;
+/// Legacy VirtIO PCI exposes a fixed, read-only Queue Size. Parallels net0
+/// reports 256 entries for both RX/TX, so use the full transport size on all
+/// backends; modern VirtIO can still negotiate down when a device advertises less.
+const RX_QUEUE_SIZE: usize = 256;
+const TX_QUEUE_SIZE: usize = 256;
 const MAX_FRAME: usize = 1536;
 const LEGACY_NET_HDR_LEN: usize = 10;
 const MODERN_NET_HDR_LEN: usize = 12;
@@ -61,6 +65,9 @@ impl VirtioNetState {
 unsafe impl Send for VirtioNetState {}
 
 static STATE: Mutex<VirtioNetState> = Mutex::new(VirtioNetState::new());
+static TX_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static TX_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static RX_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(descriptor: &DriverDescriptor) {
     let base = descriptor.mmio_base as usize;
@@ -147,7 +154,11 @@ pub fn init(descriptor: &DriverDescriptor) {
     state.ready = true;
     drop(state);
 
-    register_irq_handler(descriptor.irq, irq_handler);
+    if descriptor.irq != 0 {
+        register_irq_handler(descriptor.irq, irq_handler);
+    } else {
+        crate::info!("virtio-net: polling transport (no IRQ route)");
+    }
     unsafe { set_driver_ok(base) };
     info!(
         "driver: virtio-net 初始化完成 (base=0x{:016x} irq={})",
@@ -165,6 +176,39 @@ pub fn mac_address() -> Option<[u8; 6]> {
     (s.ready && s.mac != [0; 6]).then_some(s.mac)
 }
 
+/// Read-only transport/queue snapshot for platform bring-up.
+pub fn diagnostic_snapshot() -> Option<zero_abi::driver::NetDriverDiag> {
+    let state = STATE.lock();
+    if !state.ready {
+        return None;
+    }
+    unsafe {
+        let base = state.base;
+        let transport_version = super::transport_version(base);
+        let device_status = mmio_read32(base, 0x070);
+        mmio_write32(base, 0x030, 0);
+        let rx_queue_size = mmio_read32(base, 0x034) as u16;
+        let rx_queue_pfn = mmio_read32(base, 0x040);
+        mmio_write32(base, 0x030, 1);
+        let tx_queue_size = mmio_read32(base, 0x034) as u16;
+        let tx_queue_pfn = mmio_read32(base, 0x040);
+        mmio_write32(base, 0x030, 0);
+        Some(zero_abi::driver::NetDriverDiag {
+            transport_version,
+            device_status,
+            rx_queue_size,
+            tx_queue_size,
+            rx_queue_pfn,
+            tx_queue_pfn,
+            tx_submits: TX_SUBMITS.load(Ordering::Relaxed),
+            tx_completions: TX_COMPLETIONS.load(Ordering::Relaxed),
+            rx_completions: RX_COMPLETIONS.load(Ordering::Relaxed),
+            mac: state.mac,
+            reserved: [0; 2],
+        })
+    }
+}
+
 /// 主动收割 used ring。IRQ handler 与 syscall 轮询路径共用：网络正确性
 /// 不依赖中断一定及时到达（QEMU/真机均允许 interrupt suppression/coalescing）。
 fn reap_completions(state: &mut VirtioNetState) {
@@ -173,6 +217,14 @@ fn reap_completions(state: &mut VirtioNetState) {
         let mut lens = [0u16; RX_QUEUE_SIZE];
         let mut count = 0usize;
         while let Some(elem) = rx_queue.pop_used() {
+            let before = RX_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            if before == 0 {
+                crate::info!(
+                    "virtio-net: FIRST RX COMPLETE id={} len={}",
+                    elem.id,
+                    elem.len
+                );
+            }
             if count < RX_QUEUE_SIZE {
                 idxs[count] = elem.id as u16;
                 lens[count] = elem.len.min(u16::MAX as u32) as u16;
@@ -188,7 +240,15 @@ fn reap_completions(state: &mut VirtioNetState) {
     }
     if let Some(tx_queue) = state.tx_queue.as_mut() {
         let mut completed = false;
-        while tx_queue.pop_used().is_some() {
+        while let Some(elem) = tx_queue.pop_used() {
+            let before = TX_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            if before == 0 {
+                crate::info!(
+                    "virtio-net: FIRST TX COMPLETE id={} len={}",
+                    elem.id,
+                    elem.len
+                );
+            }
             completed = true;
         }
         if completed {
@@ -235,6 +295,15 @@ pub fn transmit(frame: &[u8]) -> Result<(), NetError> {
             (*desc).next = 0;
             // push 内部负责 dmb oshst + 通知。
             queue.push(0);
+            let before = TX_SUBMITS.fetch_add(1, Ordering::Relaxed);
+            if before == 0 {
+                crate::info!(
+                    "virtio-net: FIRST TX SUBMIT frame={} total={} hdr={}",
+                    frame.len(),
+                    hdr_len + frame.len(),
+                    hdr_len
+                );
+            }
         }
     }
     state.tx_inflight = true;

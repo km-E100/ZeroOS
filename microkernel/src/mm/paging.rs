@@ -69,6 +69,17 @@ pub unsafe fn init_kernel_page_table() {
     let flags_base = DESC_VALID | DESC_AF | DESC_SH_INNER | (AP_EL1_RW_EL0_NONE << 6);
     const DEVICE_LO: u64 = 0x0800_0000;
     const DEVICE_HI: u64 = 0x1000_0000;
+    // ACPI was intentionally parsed before TTBR takeover. One 2MiB block per
+    // advertised GIC/GICR/ITS/SMMU base is conservative and sufficient for the
+    // register apertures used during early platform bring-up. Legacy QEMU's
+    // fixed window remains for descriptor compatibility.
+    let platform_mmio = crate::acpi::early_mmio_bases();
+
+    // GOP below RAM_BASE is a device aperture, never normal RAM. Do not classify
+    // high GOP aliases here; they need page-granular ioremap rather than changing
+    // an entire 2MiB RAM block's memory type.
+    let boot_fb_low = crate::display::boot_framebuffer_range()
+        .filter(|(base, _)| *base < crate::mm::phys::RAM_BASE);
 
     // L0: 根表，所有 entry 先清零。
     let l0 =
@@ -116,8 +127,21 @@ pub unsafe fn init_kernel_page_table() {
         let table_idx = block / BLOCKS_PER_L2;
         let entry_idx = block % BLOCKS_PER_L2;
         let pa = (block as u64) * BLOCK_SIZE_L2;
-        // MMIO 窗口内的块用 Device-nGnRE（AttrIdx 1），其余 Normal。
-        let attridx = if pa >= DEVICE_LO && pa < DEVICE_HI {
+        // MMIO blocks use Device-nGnRE; RAM remains Normal WB. ACPI-derived
+        // bases are compared by containing 2MiB block so no exact alignment is
+        // assumed. A low GOP aperture is treated the same way.
+        let block_end = pa.saturating_add(BLOCK_SIZE_L2);
+        let acpi_device = platform_mmio
+            .iter()
+            .any(|base| pa <= *base && *base < block_end);
+        let fb_device = boot_fb_low
+            .map(|(base, size)| {
+                let start = base as u64;
+                let end = start.saturating_add(size as u64);
+                pa < end && start < block_end
+            })
+            .unwrap_or(false);
+        let attridx = if (pa >= DEVICE_LO && pa < DEVICE_HI) || acpi_device || fb_device {
             super::table_walk::DESC_ATTRIDX_DEVICE_NGNRE
         } else {
             DESC_ATTRIDX_NORMAL

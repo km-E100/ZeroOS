@@ -371,3 +371,28 @@ pub fn fpu_discard_live(frame: *mut TrapFrame) {
         let _ = frame;
     }
 }
+
+/// Architectural cryptographic random-number capability, when the CPU exposes one.
+pub fn hardware_rng_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64::hardware_rng_available();
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Fill from an architectural hardware RNG only; never synthesizes clock-based entropy.
+pub fn fill_hardware_random(out: &mut [u8]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64::fill_hardware_random(out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = out;
+        false
+    }
+}

@@ -1,4 +1,3 @@
-use core::sync::atomic::{AtomicPtr, Ordering};
 use core::{cmp, mem, ptr};
 
 use alloc::vec::Vec;
@@ -16,8 +15,6 @@ use zero_abi::bootfs::{UserBootFile, UserBootFs};
 // -----------------------------------------------------------------------------
 //  Global State
 // -----------------------------------------------------------------------------
-static ROOTFS_PTR: AtomicPtr<RootFsImage> = AtomicPtr::new(ptr::null_mut());
-
 /// 全系统唯一的 immutable bootfs 物理缓存。bundle/UEFI 内存不直接暴露给
 /// EL0：启动时复制到物理分配器一次，之后所有进程只 retain + RO map。
 struct BootFsCache {
@@ -57,7 +54,10 @@ pub fn init(image_ptr: *const RootFsImage) {
         image.entries as usize
     );
 
-    ROOTFS_PTR.store(image_ptr as *mut RootFsImage, Ordering::SeqCst);
+    // Transfer ownership away from firmware/UEFI memory now, while its original
+    // pointers are still valid under firmware translation. After this cache is
+    // built, no runtime path may dereference RootFsImage/RootFsEntry source
+    // pointers again.
 
     // 第25刀：把 bootfs payload 复制进物理分配器**一次**。旧实现每次
     // spawn/exec 都复制整份 bootfs；服务数增长后 9MiB × N 直接把启动
@@ -81,7 +81,7 @@ pub fn init(image_ptr: *const RootFsImage) {
 //  Validation
 // -----------------------------------------------------------------------------
 fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage {
-    const IDENTITY_LIMIT: usize = 0x0000_0000_8000_0000; // first 2 GiB
+    const MAX_BOOTFS_ENTRIES: usize = 4096;
 
     assert!(!image_ptr.is_null(), "rootfs::init: NULL image pointer");
     assert_eq!(
@@ -93,6 +93,11 @@ fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage 
     let image = unsafe { &*image_ptr };
 
     assert!(image.entry_count > 0, "rootfs::init: entry_count = 0");
+    assert!(
+        image.entry_count <= MAX_BOOTFS_ENTRIES,
+        "rootfs::init: implausible entry_count {}",
+        image.entry_count
+    );
 
     assert!(
         !image.entries.is_null(),
@@ -105,17 +110,18 @@ fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage 
         "rootfs::init: entries pointer misaligned"
     );
 
-    let entry_bytes = image.entry_count * mem::size_of::<RootFsEntry>();
+    let entry_bytes = image
+        .entry_count
+        .checked_mul(mem::size_of::<RootFsEntry>())
+        .expect("rootfs::init: entry table size overflow");
     let entries_base = image.entries as usize;
-    let entries_limit = entries_base + entry_bytes;
+    let _entries_limit = entries_base
+        .checked_add(entry_bytes)
+        .expect("rootfs::init: entry table address overflow");
 
-    assert!(
-        entries_limit <= IDENTITY_LIMIT,
-        "rootfs::init: entries (0x{:016x}..0x{:016x}) outside identity map",
-        entries_base,
-        entries_limit
-    );
-
+    // No 2GiB identity-map requirement here: this function intentionally runs
+    // before Zero OS replaces the firmware translation regime. Parallels and
+    // real firmware are free to allocate the bootfs table above 2GiB.
     unsafe {
         let slice = core::slice::from_raw_parts(image.entries, image.entry_count);
         for (i, entry) in slice.iter().enumerate() {
@@ -133,30 +139,6 @@ fn validate_rootfs_image(image_ptr: *const RootFsImage) -> &'static RootFsImage 
     }
 
     image
-}
-
-//
-// -----------------------------------------------------------------------------
-//  Accessors
-// -----------------------------------------------------------------------------
-pub fn image() -> Option<&'static RootFsImage> {
-    let ptr = ROOTFS_PTR.load(Ordering::SeqCst);
-    if ptr.is_null() {
-        None
-    } else {
-        if (ptr as usize) % core::mem::align_of::<RootFsImage>() != 0 {
-            crate::error!(
-                "rootfs::image: MISALIGNED ptr=0x{:016x} static@0x{:016x}",
-                ptr as usize,
-                &ROOTFS_PTR as *const _ as usize
-            );
-        }
-        Some(unsafe { &*ptr })
-    }
-}
-
-pub fn entries() -> Option<&'static [RootFsEntry]> {
-    image().map(|img| unsafe { core::slice::from_raw_parts(img.entries, img.entry_count) })
 }
 
 //
@@ -348,13 +330,31 @@ pub fn build_user_bootfs_for_process(
 /// 此前实现永远返回 None，导致 build_user_elf / map_user_elf_segments
 /// 全部失败，任何用户进程都无法启动。
 pub fn read_file(path: &str) -> Option<&'static [u8]> {
-    let image = image()?;
-    let entries = unsafe { image.as_slice() };
-    for entry in entries {
-        let entry_path = unsafe { entry.path() };
-        if entry_path == path {
-            return Some(unsafe { entry.data() });
+    let guard = BOOTFS_CACHE.lock();
+    let cache = guard.as_ref()?;
+    let wanted = path.as_bytes();
+    for file in &cache.files {
+        if file.path_phys == 0 {
+            continue;
         }
+        let path_bytes = unsafe {
+            core::slice::from_raw_parts(file.path_phys as *const u8, file.path_len as usize)
+        };
+        if path_bytes != wanted {
+            continue;
+        }
+        let data_len = file.data_len as usize;
+        if data_len == 0 {
+            return Some(&[]);
+        }
+        if file.data_phys == 0 {
+            return None;
+        }
+        let data_ptr = file.data_phys as *const u8;
+        // The cache owns a permanent base reference to every payload page for the
+        // lifetime of the kernel. Returning a 'static view is therefore sound
+        // even after the metadata mutex guard is dropped.
+        return Some(unsafe { core::slice::from_raw_parts(data_ptr, data_len) });
     }
     None
 }

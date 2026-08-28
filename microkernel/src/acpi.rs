@@ -24,6 +24,11 @@ pub struct MadtCpu {
     pub mpidr: u64,
     pub uid: u32,
     pub enabled: bool,
+    /// ACPI GICC flags bit3: disabled at boot but firmware permits later online.
+    pub online_capable: bool,
+    /// ACPI GICC parking protocol metadata. Version 0/address 0 means absent.
+    pub parking_protocol_version: u32,
+    pub parked_address: u64,
     /// GICv2 CPU interface MMIO base（0 = MADT 未提供/系统使用 sysreg interface）。
     pub gicc_base: u64,
     /// GIC redistributor base（GICv3；0 = 未提供）。
@@ -197,6 +202,9 @@ fn parse_madt_entries(
                 cpus.push(MadtCpu {
                     uid: le32(bytes, off + 8).unwrap_or(0),
                     enabled: flags & 1 != 0,
+                    online_capable: flags & (1 << 3) != 0,
+                    parking_protocol_version: le32(bytes, off + 16).unwrap_or(0),
+                    parked_address: le64(bytes, off + 24).unwrap_or(0),
                     gicc_base: le64(bytes, off + 32).unwrap_or(0),
                     gicr_base: le64(bytes, off + 60).unwrap_or(0),
                     mpidr: le64(bytes, off + 68).unwrap_or(0),
@@ -509,9 +517,15 @@ pub fn cpu_mpidrs() -> Vec<u64> {
     init();
     CPUS.lock()
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled || c.online_capable)
         .map(|c| c.mpidr)
         .collect()
+}
+
+/// Cached raw GICC inventory for SMP/platform diagnostics. Never re-reads ACPI.
+pub fn cpu_inventory() -> Vec<MadtCpu> {
+    init();
+    CPUS.lock().clone()
 }
 
 pub fn gicd_base() -> Option<u64> {
@@ -605,6 +619,38 @@ pub fn smmu_v3_units() -> Vec<SmmuV3Info> {
     SMMUS.lock().clone()
 }
 
+/// Early platform MMIO bases that must be Device memory in the kernel identity
+/// map before GIC/SMMU code can touch them. ACPI has already been parsed while
+/// firmware page tables are still active, so this function reads cached state
+/// only; it never dereferences firmware tables after TTBR handoff.
+pub fn early_mmio_bases() -> Vec<u64> {
+    init();
+    let mut out = Vec::new();
+    for base in [
+        GICD_BASE.load(Ordering::SeqCst),
+        GICC_BASE.load(Ordering::SeqCst),
+        GICR_BASE.load(Ordering::SeqCst),
+        ITS_BASE.load(Ordering::SeqCst),
+    ] {
+        if base != 0 && !out.contains(&base) {
+            out.push(base);
+        }
+    }
+    for cpu in CPUS.lock().iter() {
+        for base in [cpu.gicc_base, cpu.gicr_base] {
+            if base != 0 && !out.contains(&base) {
+                out.push(base);
+            }
+        }
+    }
+    for smmu in SMMUS.lock().iter() {
+        if smmu.base != 0 && !out.contains(&smmu.base) {
+            out.push(smmu.base);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,10 +689,47 @@ mod tests {
                 mpidr: 0x8000_0001,
                 uid: 7,
                 enabled: true,
+                online_capable: false,
+                parking_protocol_version: 0,
+                parked_address: 0,
                 gicc_base: 0x0801_0000,
                 gicr_base: 0x080a_0000
             }]
         );
+    }
+
+    #[test]
+    fn madt_preserves_online_capable_cpu() {
+        let mut b = vec![0u8; 44];
+        let cpu = b.len();
+        put(&mut b, cpu, &[11, 80]);
+        put(&mut b, cpu + 8, &9u32.to_le_bytes());
+        put(&mut b, cpu + 12, &(1u32 << 3).to_le_bytes());
+        put(&mut b, cpu + 68, &2u64.to_le_bytes());
+        b.resize(cpu + 80, 0);
+        let (cpus, _, _, _) = parse_madt_entries(&b, 44);
+        assert_eq!(cpus.len(), 1);
+        assert!(!cpus[0].enabled);
+        assert!(cpus[0].online_capable);
+        assert_eq!(cpus[0].parking_protocol_version, 0);
+        assert_eq!(cpus[0].parked_address, 0);
+        assert_eq!(cpus[0].mpidr, 2);
+    }
+
+    #[test]
+    fn madt_parses_parking_protocol_metadata() {
+        let mut b = vec![0u8; 44];
+        let cpu = b.len();
+        put(&mut b, cpu, &[11, 80]);
+        put(&mut b, cpu + 8, &3u32.to_le_bytes());
+        put(&mut b, cpu + 12, &1u32.to_le_bytes());
+        put(&mut b, cpu + 16, &1u32.to_le_bytes());
+        put(&mut b, cpu + 24, &0x1234_5000u64.to_le_bytes());
+        put(&mut b, cpu + 68, &3u64.to_le_bytes());
+        b.resize(cpu + 80, 0);
+        let (cpus, _, _, _) = parse_madt_entries(&b, 44);
+        assert_eq!(cpus[0].parking_protocol_version, 1);
+        assert_eq!(cpus[0].parked_address, 0x1234_5000);
     }
 
     #[test]

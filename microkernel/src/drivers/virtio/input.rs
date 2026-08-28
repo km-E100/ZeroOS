@@ -147,6 +147,10 @@ fn translate(raw: RawEvent, device_id: u32) -> Option<InputEvent> {
     })
 }
 fn push_ring(s: &mut State, e: InputEvent) {
+    // Mirror keyboard text into the independent terminal byte queue before
+    // inputd consumes the normalized event. GUI and console therefore both see
+    // the key without racing for one shared IPC/ring element.
+    crate::drivers::console_input::feed(&e);
     let next = (s.head + 1) % RING;
     if next == s.tail {
         s.dropped = s.dropped.saturating_add(1);

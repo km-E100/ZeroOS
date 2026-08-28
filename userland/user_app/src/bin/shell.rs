@@ -23,9 +23,9 @@
 use core::panic::PanicInfo;
 use useralloc::StaticFreeList;
 use userlib::{
-    cause_segv, console_read, console_write, create_channel, encode_message, exec, exit,
-    extract_payload_text, get_session, session_begin, session_list, wait_pid, wait_pid_flags,
-    WAIT_NOHANG,
+    cause_segv, console_read, console_write, create_channel, driver_count, driver_info,
+    encode_message, exec, exit, extract_payload_text, get_session, net_diag, pci_count, pci_info,
+    session_begin, session_list, wait_pid, wait_pid_flags, WAIT_NOHANG,
 };
 use zero_abi::cap::{CAP_CHANNEL_CREATE, CAP_POWER, CAP_SECURE_IPC, CAP_SESSION};
 use zero_abi::channels::{
@@ -142,8 +142,14 @@ pub fn user_entry(bootfs_ptr: u64, bootfs_len: u64, a2: u64, _a3: u64) -> u64 {
             println("  fs ops:  ls <dir>/cat <path>/mkdir <path>");
             println("  security: login/su/whoami/sessions/secdemo");
             println(
-                "  system: launchd/pid/ppid/shutdown/reboot/clear/history/echo/whoami/help/exit",
+                "  system: launchd/drivers/pci/netdiag/pid/ppid/shutdown/reboot/clear/history/echo/whoami/help/exit",
             );
+        } else if cmd == b"drivers" {
+            drivers_command();
+        } else if cmd == b"pci" {
+            pci_command();
+        } else if cmd == b"netdiag" {
+            netdiag_command();
         } else if cmd == b"shutdown" {
             power_command(zero_abi::syscall::POWER_OFF);
         } else if cmd == b"reboot" {
@@ -1378,7 +1384,7 @@ fn read_line_impl(buf: &mut [u8], echo: bool) -> usize {
         let mut c: [u8; 1] = [0];
         match console_read(&mut c) {
             Ok(0) => {
-                userlib::yield_now();
+                let _ = userlib::sleep_ticks(1);
                 continue;
             }
             Err(SysError::WouldBlock) => {
@@ -1386,7 +1392,7 @@ fn read_line_impl(buf: &mut [u8], echo: bool) -> usize {
                 // continue 就会贯穿到 ch=c[0]，把缓冲区残留的 0 当成收到的
                 // 字节 —— 缓冲区被 NUL 填满、真实命令永远匹配不上。
                 // （旧代码靠 yield_now 的错误 -> ! 标注掩盖了这一逻辑。）
-                userlib::yield_now();
+                let _ = userlib::sleep_ticks(1);
                 continue;
             }
             Err(_) => return i,
@@ -1425,6 +1431,181 @@ fn read_line(buf: &mut [u8]) -> usize {
 
 fn read_line_hidden(buf: &mut [u8]) -> usize {
     read_line_impl(buf, false)
+}
+
+fn netdiag_command() {
+    let info = match net_diag() {
+        Ok(v) => v,
+        Err(e) => {
+            print("netdiag: unavailable 0x");
+            print_hex(e.code());
+            println("");
+            return;
+        }
+    };
+    print("netdiag: v=");
+    print_u64(info.transport_version as u64);
+    print(" status=0x");
+    print_hex(info.device_status as u64);
+    print(" rxq=");
+    print_u64(info.rx_queue_size as u64);
+    print(" rxpfn=0x");
+    print_hex(info.rx_queue_pfn as u64);
+    print(" txq=");
+    print_u64(info.tx_queue_size as u64);
+    print(" txpfn=0x");
+    print_hex(info.tx_queue_pfn as u64);
+    println("");
+    print("netdiag: tx_submit=");
+    print_u64(info.tx_submits);
+    print(" tx_complete=");
+    print_u64(info.tx_completions);
+    print(" rx_complete=");
+    print_u64(info.rx_completions);
+    print(" mac=");
+    for i in 0..6 {
+        if i != 0 {
+            print(":");
+        }
+        print_hex(info.mac[i] as u64);
+    }
+    println("");
+}
+
+fn pci_command() {
+    use zero_abi::driver::{PCI_BAR_64, PCI_BAR_IO, PCI_BAR_PREFETCH};
+    let count = match pci_count() {
+        Ok(v) => v.min(128),
+        Err(e) => {
+            print("pci: count failed 0x");
+            print_hex(e.code());
+            println("");
+            return;
+        }
+    };
+    print("pci: count=");
+    print_u64(count as u64);
+    println("");
+    for index in 0..count {
+        let Ok(info) = pci_info(index as u32) else {
+            continue;
+        };
+        print("  ");
+        print_hex(info.segment as u64);
+        print(":");
+        print_hex(info.bus as u64);
+        print(":");
+        print_hex(info.device as u64);
+        print(".");
+        print_hex(info.function as u64);
+        print(" pci=");
+        print_hex(info.vendor_id as u64);
+        print(":");
+        print_hex(info.device_id as u64);
+        print(" sub=");
+        print_hex(info.subsystem_vendor as u64);
+        print(":");
+        print_hex(info.subsystem_id as u64);
+        print(" class=");
+        print_hex(info.class as u64);
+        print(":");
+        print_hex(info.subclass as u64);
+        print(":");
+        print_hex(info.prog_if as u64);
+        print(" rev=");
+        print_hex(info.revision as u64);
+        print(" caps=0x");
+        print_hex(info.capability_bits);
+        print(" virtio_cfg=0x");
+        print_hex(info.virtio_cfg_types as u64);
+        if info.msix_table_size != 0 {
+            print(" msix=");
+            print_u64(info.msix_table_size as u64);
+            print(" table=BAR");
+            print_u64(info.msix_table_bar as u64);
+            print("+0x");
+            print_hex(info.msix_table_offset as u64);
+            print(" pba=BAR");
+            print_u64(info.msix_pba_bar as u64);
+            print("+0x");
+            print_hex(info.msix_pba_offset as u64);
+        }
+        println("");
+        for (bar_index, bar) in info.bars.iter().enumerate() {
+            if bar.size == 0 {
+                continue;
+            }
+            print("    BAR");
+            print_u64(bar_index as u64);
+            print(if bar.flags & PCI_BAR_IO != 0 {
+                " IO "
+            } else {
+                " MEM "
+            });
+            print("base=0x");
+            print_hex(bar.address);
+            print(" size=0x");
+            print_hex(bar.size);
+            if bar.flags & PCI_BAR_64 != 0 {
+                print(" 64");
+            }
+            if bar.flags & PCI_BAR_PREFETCH != 0 {
+                print(" prefetch");
+            }
+            println("");
+        }
+    }
+}
+
+fn drivers_command() {
+    let count = match driver_count() {
+        Ok(v) => v.min(128),
+        Err(e) => {
+            print("drivers: count failed 0x");
+            print_hex(e.code());
+            println("");
+            return;
+        }
+    };
+    print("drivers: count=");
+    print_u64(count);
+    println("");
+    for index in 0..count {
+        let Ok(info) = driver_info(index as u32) else {
+            continue;
+        };
+        print("  drv");
+        print_u64(index);
+        print(" kind=");
+        print_u64(info.kind as u64);
+        if info.pci_id != 0 {
+            let vendor = info.pci_id & 0xffff;
+            let device = info.pci_id >> 16;
+            print(" pci=");
+            print_hex(vendor as u64);
+            print(":");
+            print_hex(device as u64);
+            let class = info.pci_class & 0xff;
+            let subclass = (info.pci_class >> 8) & 0xff;
+            let prog_if = (info.pci_class >> 16) & 0xff;
+            let revision = info.pci_class >> 24;
+            print(" class=");
+            print_hex(class as u64);
+            print(":");
+            print_hex(subclass as u64);
+            print(":");
+            print_hex(prog_if as u64);
+            print(" rev=");
+            print_hex(revision as u64);
+        }
+        print(" mmio=0x");
+        print_hex(info.mmio_base);
+        print("+0x");
+        print_hex(info.mmio_len);
+        print(" irq=");
+        print_u64(info.irq as u64);
+        println("");
+    }
 }
 
 fn print(text: &str) {

@@ -1,7 +1,8 @@
 use zero_abi::driver::{DriverDescriptor, DriverKind, DriverTable};
 
-// QEMU virt 平台的驱动描述符，通过强符号覆盖 boot.S 弱符号占位，
-// 内核 drivers::init 才能拿到真实的设备表。
+// QEMU virt 平台的 legacy/MMIO 驱动描述符。该表仍编进镜像以保留
+// QEMU 启动兼容，但 microkernel::drivers::init 仅在 bootloader 明确标记
+// PLATFORM_QEMU_VIRT 时消费；其他 ARM64 平台绝不盲探这些地址。
 //
 // IRQ 编号约定 = GIC INTID（SGI 0-15 / PPI 16-31 / SPI 32+）：
 // - PL011        = INTID 33（QEMU virt SPI 1）

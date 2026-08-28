@@ -44,19 +44,16 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
         panic!("microkernel: kernel_main invoked twice");
     }
 
+    // Unknown ARM64 platforms may have no usable early UART. GOP is already
+    // captured by the UEFI loader, so attach it before the very first log line.
+    display::early_init();
     info!("kernel_main: runtime init");
     runtime::init();
     info!("kernel_main: bootinfo init");
     bootinfo::init(boot_info);
     info!("kernel_main: entering boot::init_arch");
     boot::init_arch(boot_info);
-    info!("kernel_main: boot::init_arch complete (ACPI/platform ready)");
-    info!(
-        "kernel_main: rootfs init (boot_info.rootfs=0x{:016x})",
-        boot_info.rootfs as usize
-    );
-    rootfs::init(boot_info.rootfs);
-    info!("kernel_main: rootfs ready");
+    info!("kernel_main: boot::init_arch complete (ACPI/platform/rootfs ready)");
     info!(
         "kernel_main: drivers init (boot_info.drivers=0x{:016x})",
         boot_info.drivers as usize

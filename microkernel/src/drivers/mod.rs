@@ -15,11 +15,12 @@
 //! 仅探测失败、超时、越界等异常事件走 `warn!`，初始化完成各保留一行 `info!`。
 
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use zero_abi::driver::{DriverDescriptor, DriverKind, DriverTable};
 
 use crate::{debug, warn};
 
+pub mod console_input;
 pub mod irq;
 pub mod nvme;
 pub mod pl011;
@@ -49,48 +50,82 @@ pub enum NetError {
 /// 引导器提供的驱动描述符表（boot_info.drivers）。
 static DRIVER_TABLE_PTR: AtomicPtr<DriverTable> = AtomicPtr::new(ptr::null_mut());
 
+// 0=unreported, 1=VirtIO RNG, 2=AArch64 RNDR. This is diagnostic only; the
+// backend is selected afresh per request so hot-added devices remain usable.
+static RNG_BACKEND_LOGGED: AtomicU8 = AtomicU8::new(0);
+
+/// Cryptographic random bytes from a real platform source. Never mixes clocks,
+/// addresses or other predictable state. VirtIO RNG remains preferred when
+/// present; FEAT_RNG/RNDR is the architecture-native fallback.
+pub fn fill_random(out: &mut [u8]) -> bool {
+    if virtio::rng::fill_random(out) {
+        if RNG_BACKEND_LOGGED.swap(1, Ordering::Relaxed) != 1 {
+            crate::info!("entropy: backend=virtio-rng");
+        }
+        return true;
+    }
+    if crate::arch::fill_hardware_random(out) {
+        if RNG_BACKEND_LOGGED.swap(2, Ordering::Relaxed) != 2 {
+            crate::info!("entropy: backend=arm64-rndr");
+        }
+        return true;
+    }
+    false
+}
+
 /// 驱动注册入口：遍历引导器描述符，按类型分派到各驱动。
 pub fn init(table_ptr: *const DriverTable) {
     debug!("drivers::init: table_ptr=0x{:016x}", table_ptr as usize);
     DRIVER_TABLE_PTR.store(table_ptr as *mut DriverTable, Ordering::SeqCst);
 
-    let Some(descriptors) = descriptors() else {
-        debug!("drivers::init: bootloader 未提供描述符");
-        return;
-    };
-
-    debug!("drivers::init: {} 个描述符", descriptors.len());
-    for descriptor in descriptors {
-        let name = unsafe { descriptor.name() };
-        debug!(
-            "drivers::init: 探测 {} (kind={} mmio=0x{:016x} irq={})",
-            name, descriptor.kind as u32, descriptor.mmio_base, descriptor.irq
-        );
-
-        match descriptor.kind {
-            DriverKind::Pl011 => pl011::init(descriptor),
-            DriverKind::VirtIOBlk => virtio::blk::init(descriptor),
-            DriverKind::VirtIONet => virtio::net::init(descriptor),
-            DriverKind::VirtIOGpu => virtio::gpu::init(descriptor),
-            DriverKind::VirtIORng => virtio::rng::init(descriptor),
-            DriverKind::VirtIOInput => virtio::input::init(descriptor),
-            DriverKind::VirtIOSound => virtio::sound::init(descriptor),
-            DriverKind::VirtIOConsole => {
-                warn!("driver: 暂不支持 virtio kind {}", descriptor.kind as u32)
-            }
-            DriverKind::Nvme => {
+    // The compiled boot descriptor table is a QEMU-virt legacy board table, not
+    // an ARM64 universal device list. Touch it only when the UEFI loader has
+    // positively identified that platform; other firmware proceeds through
+    // ACPI/PCI discovery without speculative MMIO.
+    if crate::bootinfo::qemu_virt_static_mmio() {
+        if let Some(descriptors) = descriptors() {
+            debug!(
+                "drivers::init: {} QEMU-virt static descriptor(s)",
+                descriptors.len()
+            );
+            for descriptor in descriptors {
+                let name = unsafe { descriptor.name() };
                 debug!(
-                    "driver: boot descriptor NVMe '{}' deferred to PCI discovery",
-                    name
-                )
-            }
-            DriverKind::UsbXhci | DriverKind::PciGeneric => {
-                debug!(
-                    "driver: dynamic PCI resource '{}' is not a boot transport",
-                    name
-                )
+                    "drivers::init: 探测 {} (kind={} mmio=0x{:016x} irq={})",
+                    name, descriptor.kind as u32, descriptor.mmio_base, descriptor.irq
+                );
+
+                match descriptor.kind {
+                    DriverKind::Pl011 => pl011::init(descriptor),
+                    DriverKind::VirtIOBlk => virtio::blk::init(descriptor),
+                    DriverKind::VirtIONet => virtio::net::init(descriptor),
+                    DriverKind::VirtIOGpu => virtio::gpu::init(descriptor),
+                    DriverKind::VirtIORng => virtio::rng::init(descriptor),
+                    DriverKind::VirtIOInput => virtio::input::init(descriptor),
+                    DriverKind::VirtIOSound => virtio::sound::init(descriptor),
+                    DriverKind::VirtIOConsole => {
+                        warn!("driver: 暂不支持 virtio kind {}", descriptor.kind as u32)
+                    }
+                    DriverKind::Nvme => {
+                        debug!(
+                            "driver: boot descriptor NVMe '{}' deferred to PCI discovery",
+                            name
+                        )
+                    }
+                    DriverKind::UsbXhci | DriverKind::PciGeneric | DriverKind::PciTest => {
+                        debug!(
+                            "driver: dynamic PCI resource '{}' is not a boot transport",
+                            name
+                        )
+                    }
+                }
             }
         }
+    } else {
+        crate::info!(
+            "drivers: skipping QEMU-virt static MMIO table on platform kind={}",
+            crate::bootinfo::platform_kind()
+        );
     }
     // Knife37: modern VirtIO PCI devices discovered from the Knife35 PCI registry.
     virtio::pci_transport::discover_and_init();
@@ -148,6 +183,14 @@ pub fn block_flush() -> Result<(), BlockError> {
 
 /// 读取引导器提供的驱动描述符列表。
 pub fn descriptors() -> Option<&'static [DriverDescriptor]> {
+    // The compiled descriptor table describes the QEMU `virt` board only.
+    // Never expose those synthetic MMIO devices to EL0 on another ARM64
+    // platform: DriverCount/DriverInfo are part of the capability boundary, so
+    // a descriptor that was intentionally skipped by drivers::init must not
+    // remain visible as an apparently mappable device resource.
+    if !crate::bootinfo::qemu_virt_static_mmio() {
+        return None;
+    }
     let ptr = DRIVER_TABLE_PTR.load(Ordering::SeqCst);
     if ptr.is_null() {
         None

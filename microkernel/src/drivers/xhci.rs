@@ -280,9 +280,34 @@ fn neutral_port(v: u32) -> u32 {
     (v & PORT_RO) | (v & PORT_RWS)
 }
 
+fn controller_required_aperture(
+    caplen: usize,
+    hcs1: u32,
+    dboff: usize,
+    rtsoff: usize,
+) -> Option<usize> {
+    let max_slots = (hcs1 & 0xff) as usize;
+    let max_ports = ((hcs1 >> 24) & 0xff) as usize;
+    // Operational registers through the last PORTSC, doorbells through slot N,
+    // and Runtime Interrupter 0 through ERDP. Conservatively round each region
+    // upward inside the actual PCI BAR instead of assuming a 16KiB aperture.
+    let op_end = caplen
+        .checked_add(0x400)?
+        .checked_add(max_ports.checked_mul(0x10)?)?;
+    let db_end = dboff.checked_add((max_slots + 1).checked_mul(4)?)?;
+    let rt_end = rtsoff.checked_add(0x40)?;
+    Some(op_end.max(db_end).max(rt_end).max(0x20))
+}
+
 impl Controller {
     unsafe fn create(dev: &PciDevice) -> Option<Self> {
-        let base = crate::pci::bar_mmio_ptr(dev, 0, 0, 0x4000)?;
+        let bar0 = dev.bar(0)?;
+        let bar_len = usize::try_from(bar0.size).ok()?;
+        if !(0x20..=0x10_0000).contains(&bar_len) {
+            crate::warn!("xhci: BAR0 size unsupported len={:#x}", bar_len);
+            return None;
+        }
+        let base = crate::pci::bar_mmio_ptr(dev, 0, 0, bar_len)?;
         let command = crate::pci::read_u16(dev.address, 0x04)?;
         crate::pci::write_u16(dev.address, 0x04, command | 0x2 | 0x4);
         let caplen = r8(base) as usize;
@@ -296,14 +321,22 @@ impl Controller {
         let rtsoff = (r32(base + 0x18) & !0x1f) as usize;
         let max_slots = (hcs1 & 0xff) as u8;
         let max_ports = ((hcs1 >> 24) & 0xff) as u8;
+        let required = controller_required_aperture(caplen, hcs1, dboff, rtsoff)?;
+        if required > bar_len {
+            crate::warn!(
+                "xhci: BAR0 aperture too small len={:#x} required={:#x} caplen={:#x} dboff={:#x} rtsoff={:#x} slots={} ports={}",
+                bar_len, required, caplen, dboff, rtsoff, max_slots, max_ports
+            );
+            return None;
+        }
         let ctx_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 };
         let scratch_lo = (hcs2 >> 27) & 0x1f;
         let scratch_hi = (hcs2 >> 16) & 0x3e0;
         let scratchpads = scratch_lo | scratch_hi;
         crate::info!(
-            "xhci: PCI {:04x}:{:02x}:{:02x}.{} base={:#x} caplen={:#x} slots={} ports={} ctx={} scratch={}",
+            "xhci: PCI {:04x}:{:02x}:{:02x}.{} base={:#x} bar_len={:#x} required={:#x} caplen={:#x} slots={} ports={} ctx={} scratch={}",
             dev.address.segment, dev.address.bus, dev.address.device, dev.address.function,
-            base, caplen, max_slots, max_ports, ctx_size, scratchpads
+            base, bar_len, required, caplen, max_slots, max_ports, ctx_size, scratchpads
         );
         let op = base + caplen;
         let rt = base + rtsoff;
@@ -1092,7 +1125,16 @@ impl Controller {
             crate::error!("xhci: Host System Error status={:#x}", r32(self.op + 4));
             return false;
         }
-        while let Some(e) = self.event_pop() {
+        // A device/hypervisor is allowed to complete interrupt transfers very
+        // aggressively. Never let one InputRead syscall become an unbounded
+        // producer/consumer loop (completion -> requeue -> immediate completion).
+        // A bounded batch also gives userland a chance to sleep/yield between
+        // empty-report storms while preserving low latency for real bursts.
+        const MAX_EVENTS_PER_POLL: usize = 128;
+        let mut processed = 0usize;
+        while processed < MAX_EVENTS_PER_POLL {
+            let Some(e) = self.event_pop() else { break };
+            processed += 1;
             let ty = (e.control >> 10) & 0x3f;
             match ty {
                 TRB_TRANSFER => {
@@ -1119,6 +1161,9 @@ impl Controller {
                 }
                 _ => {}
             }
+        }
+        if processed == MAX_EVENTS_PER_POLL {
+            crate::debug!("xhci: runtime event budget exhausted; deferring remaining events");
         }
         self.poll_hubs();
         true
@@ -1313,6 +1358,7 @@ fn usage_to_linux(u: u8) -> Option<u16> {
         0x36 => 51,
         0x37 => 52,
         0x38 => 53,
+        0x39 => 58,
         _ => return None,
     })
 }
@@ -1357,7 +1403,7 @@ fn consume_hid_report(d: &mut UsbHid, n: usize) {
             }
             d.prev_keys = now;
             d.prev_mods = mods;
-            crate::info!(
+            crate::debug!(
                 "usb-hid: keyboard report slot={} mods={:#x} keys={:02x?}",
                 d.slot,
                 mods,
@@ -1539,6 +1585,22 @@ pub fn active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_kib_controller_bar_can_be_sufficient() {
+        // Small virtual xHCI implementations (e.g. Parallels) can fit their
+        // entire register set in one 4KiB BAR; never impose QEMU's larger BAR.
+        let hcs1 = 8u32 | (2u32 << 24);
+        let required = controller_required_aperture(0x20, hcs1, 0x400, 0x800).unwrap();
+        assert!(required <= 0x1000);
+    }
+
+    #[test]
+    fn aperture_validation_accounts_for_ports_and_offsets() {
+        let hcs1 = 32u32 | (16u32 << 24);
+        let required = controller_required_aperture(0x40, hcs1, 0x2000, 0x3000).unwrap();
+        assert!(required >= 0x3040);
+    }
     #[test]
     fn dci_math() {
         assert_eq!(endpoint_dci(0x81), Some(3));

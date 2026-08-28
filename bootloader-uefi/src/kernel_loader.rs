@@ -1,3 +1,4 @@
+use core::arch::asm;
 use uefi::prelude::*;
 use uefi::proto::rng::Rng;
 use uefi::table::boot::BootServices;
@@ -261,7 +262,55 @@ unsafe fn store_u64(buf: *mut u8, off: usize, value: u64) {
     store(buf, off, &value.to_le_bytes());
 }
 
+const PF_X: u32 = 1;
+
+/// Publish bootloader-written executable PT_LOAD bytes to AArch64 instruction
+/// fetch. Loading/relocating a kernel is self-modifying-code from the CPU's
+/// perspective: QEMU TCG often hides the required cache maintenance, while
+/// real ARM/AppleHV may otherwise fetch stale bytes from a reused physical page.
+unsafe fn sync_instruction_cache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nostack, preserves_flags));
+    // CTR_EL0 line-size fields are log2(words-per-line), one word = 4 bytes.
+    let iline = 4usize << (ctr & 0xf);
+    let dline = 4usize << ((ctr >> 16) & 0xf);
+    let end = start.saturating_add(len);
+
+    let mut p = start & !(dline - 1);
+    while p < end {
+        asm!("dc cvau, {0}", in(reg) p, options(nostack));
+        p = p.saturating_add(dline);
+    }
+    asm!("dsb ish", options(nostack));
+
+    let mut p = start & !(iline - 1);
+    while p < end {
+        asm!("ic ivau, {0}", in(reg) p, options(nostack));
+        p = p.saturating_add(iline);
+    }
+    asm!("dsb ish", "isb", options(nostack));
+}
+
+unsafe fn publish_kernel_instruction_cache(kernel: &KernelImage) {
+    let mut ranges = 0usize;
+    for seg in &kernel.segments.segments {
+        if seg.flags & PF_X == 0 || seg.mem_size == 0 {
+            continue;
+        }
+        sync_instruction_cache_range(seg.physical_addr as usize, seg.mem_size as usize);
+        ranges += 1;
+    }
+    log_info!(
+        "kernel I-cache publication complete: {} executable segment(s)",
+        ranges
+    );
+}
+
 pub unsafe fn jump_to_kernel(kernel: &KernelImage, ctx: &KernelBootContext) -> ! {
+    publish_kernel_instruction_cache(kernel);
     let entry: extern "C" fn(&KernelBootContext) -> ! =
         core::mem::transmute(kernel.entry_point as usize);
     entry(ctx)

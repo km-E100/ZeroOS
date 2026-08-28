@@ -19,9 +19,14 @@ use crate::runtime::serial;
 #[derive(Clone, Copy, Debug)]
 struct DriverResource {
     kind: zero_abi::driver::DriverKind,
+    // Occupy the historical repr(C) padding after `kind` without moving any
+    // existing field: low16=vendor, high16=device; zero for non-PCI resources.
+    pci_id: u32,
     mmio_base: u64,
     mmio_len: u64,
     irq: u32,
+    // Occupy the historical tail padding: class/subclass/prog_if/revision.
+    pci_class: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -243,7 +248,13 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
             }
             let request_len = len.min(1024);
             let mut buffer = vec![0u8; request_len];
-            let read = crate::drivers::pl011::read_into(&mut buffer);
+            // Preserve the historical serial console when PL011 exists, but
+            // fall back to the independent HID terminal queue on ARM64 platforms
+            // without an interactive UART (Parallels/real UEFI machines).
+            let mut read = crate::drivers::pl011::read_into(&mut buffer);
+            if read == 0 {
+                read = crate::drivers::console_input::read_into(&mut buffer);
+            }
             if read == 0 {
                 return Err(SysError::WouldBlock);
             }
@@ -265,6 +276,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                     copy_slice_from_user(user_buffer + offset, &mut buffer)?;
                 }
                 serial::write_bytes(&buffer);
+                crate::display::write_bytes(&buffer);
                 remaining -= chunk;
                 offset += chunk;
             }
@@ -728,7 +740,7 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 return Ok(0);
             }
             let mut bytes = vec![0u8; len];
-            if !crate::drivers::virtio::rng::fill_random(&mut bytes) {
+            if !crate::drivers::fill_random(&mut bytes) {
                 return Err(SysError::DeviceError);
             }
             unsafe {
@@ -757,6 +769,36 @@ pub fn handle(syscall: Syscall, frame: *mut TrapFrame) -> SyscallResult {
                 BlockBackendKind::Virtio => Ok(zero_abi::protocol::blk::DEVICE_TYPE_VIRTIO as u64),
                 BlockBackendKind::Nvme => Ok(zero_abi::protocol::blk::DEVICE_TYPE_NVME as u64),
             }
+        }
+        Syscall::PciCount => Ok(crate::pci::devices().len() as u64),
+        Syscall::PciInfo { index, user_buffer } => {
+            let devices = crate::pci::devices();
+            let dev = devices.get(index as usize).ok_or(SysError::NotFound)?;
+            let info = pci_function_info(dev);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const zero_abi::driver::PciFunctionInfo).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::driver::PciFunctionInfo>(),
+                )
+            };
+            unsafe {
+                copy_slice_to_user(user_buffer, bytes)?;
+            }
+            Ok(0)
+        }
+        Syscall::NetDiag { user_buffer } => {
+            let info =
+                crate::drivers::virtio::net::diagnostic_snapshot().ok_or(SysError::NotFound)?;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const zero_abi::driver::NetDriverDiag).cast::<u8>(),
+                    core::mem::size_of::<zero_abi::driver::NetDriverDiag>(),
+                )
+            };
+            unsafe {
+                copy_slice_to_user(user_buffer, bytes)?;
+            }
+            Ok(0)
         }
         Syscall::PowerControl { action } => {
             let slot = crate::scheduler::current_slot();
@@ -1186,6 +1228,79 @@ fn check_block_io_len(len: usize) -> Result<(), SysError> {
     Ok(())
 }
 
+fn pci_function_info(dev: &crate::pci::PciDevice) -> zero_abi::driver::PciFunctionInfo {
+    use zero_abi::driver::{PciBarInfo, PciFunctionInfo, PCI_BAR_64, PCI_BAR_IO, PCI_BAR_PREFETCH};
+
+    let mut bars = [PciBarInfo::default(); 6];
+    for (i, bar) in dev.bars.iter().enumerate() {
+        let mut flags = 0u32;
+        if bar.is_io {
+            flags |= PCI_BAR_IO;
+        }
+        if bar.is_64 {
+            flags |= PCI_BAR_64;
+        }
+        if bar.prefetchable {
+            flags |= PCI_BAR_PREFETCH;
+        }
+        bars[i] = PciBarInfo {
+            address: bar.address,
+            size: bar.size,
+            flags,
+            reserved: 0,
+        };
+    }
+    let mut capability_bits = 0u64;
+    let mut virtio_cfg_types = 0u32;
+    for cap in &dev.capabilities {
+        if cap.id < 64 {
+            capability_bits |= 1u64 << cap.id;
+        }
+        if cap.id == 0x09 {
+            if let Some(cfg_type) = crate::pci::read_u8(dev.address, cap.offset as usize + 3) {
+                if cfg_type < 32 {
+                    virtio_cfg_types |= 1u32 << cfg_type;
+                }
+            }
+        }
+    }
+    let (msix_table_size, msix_table_bar, msix_pba_bar, msix_table_offset, msix_pba_offset) =
+        if let Some(msix) = dev.msix {
+            (
+                msix.table_size,
+                msix.table_bar,
+                msix.pba_bar,
+                msix.table_offset,
+                msix.pba_offset,
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+    PciFunctionInfo {
+        segment: dev.address.segment,
+        bus: dev.address.bus,
+        device: dev.address.device,
+        function: dev.address.function,
+        header_type: dev.header_type,
+        class: dev.class,
+        subclass: dev.subclass,
+        prog_if: dev.prog_if,
+        revision: dev.revision,
+        vendor_id: dev.vendor_id,
+        device_id: dev.device_id,
+        subsystem_vendor: dev.subsystem_vendor,
+        subsystem_id: dev.subsystem_id,
+        capability_bits,
+        virtio_cfg_types,
+        msix_table_size,
+        msix_table_bar,
+        msix_pba_bar,
+        msix_table_offset,
+        msix_pba_offset,
+        bars,
+    }
+}
+
 fn driver_resource_count() -> usize {
     let boot = crate::drivers::descriptors().map_or(0, |d| d.len());
     boot.saturating_add(crate::pci::mmio_resources().len())
@@ -1197,9 +1312,11 @@ fn resource_for_index(index: u32) -> Result<DriverResource, SysError> {
     if let Some(d) = boot.get(i) {
         return Ok(DriverResource {
             kind: d.kind,
+            pci_id: 0,
             mmio_base: d.mmio_base,
             mmio_len: d.mmio_len,
             irq: d.irq,
+            pci_class: 0,
         });
     }
     let pci = crate::pci::mmio_resources();
@@ -1208,9 +1325,14 @@ fn resource_for_index(index: u32) -> Result<DriverResource, SysError> {
         .ok_or(SysError::NotFound)?;
     Ok(DriverResource {
         kind: r.kind,
+        pci_id: (r.vendor_id as u32) | ((r.device_id as u32) << 16),
         mmio_base: r.base,
         mmio_len: r.len,
         irq: r.irq,
+        pci_class: (r.class as u32)
+            | ((r.subclass as u32) << 8)
+            | ((r.prog_if as u32) << 16)
+            | ((r.revision as u32) << 24),
     })
 }
 
@@ -1411,15 +1533,19 @@ unsafe fn write_driver_info(addr: usize, resource: DriverResource) -> Result<(),
     #[repr(C)]
     struct DriverInfoRecord {
         kind: u32,
+        pci_id: u32,
         mmio_base: u64,
         mmio_len: u64,
         irq: u32,
+        pci_class: u32,
     }
     let record = DriverInfoRecord {
         kind: resource.kind as u32,
+        pci_id: resource.pci_id,
         mmio_base: resource.mmio_base,
         mmio_len: resource.mmio_len,
         irq: resource.irq,
+        pci_class: resource.pci_class,
     };
     let bytes = core::slice::from_raw_parts(
         (&record as *const DriverInfoRecord).cast::<u8>(),

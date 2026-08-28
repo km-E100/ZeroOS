@@ -28,6 +28,20 @@ pub enum Error {
     Entropy,
 }
 
+impl Error {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Dns => "dns",
+            Self::Protocol => "protocol",
+            Self::Tls => "tls",
+            Self::TooLarge => "too-large",
+            Self::Entropy => "entropy",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetIoError;
 impl fmt::Display for NetIoError {

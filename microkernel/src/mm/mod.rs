@@ -43,7 +43,11 @@ pub fn init_early(memory_bytes: usize, reserved_bytes: usize) {
     }
 }
 
-pub fn init_relocated(
+/// Stage 1 of relocated-kernel MM bring-up. Keep firmware translations active
+/// while initializing the physical allocator and kernel heap. This lets ACPI
+/// tables live anywhere firmware mapped them (including above Zero OS's 2GiB
+/// identity window) and gives the parser an allocator for its cached Vec state.
+pub fn init_relocated_early(
     memory_bytes: usize,
     legacy_reserved_bytes: usize,
     kernel_start: usize,
@@ -63,17 +67,39 @@ pub fn init_relocated(
         kernel_start,
         kernel_end,
     );
-    crate::info!("mm::init: paging setup");
-    ensure_paging_ready();
-    crate::info!("mm::init: heap init");
+    crate::info!("mm::init: heap init under firmware translation");
     unsafe {
         heap::init_heap(memory_bytes);
     }
+}
+
+/// Stage 2: after ACPI has been parsed/cached, build and install Zero OS page
+/// tables using those discovered device ranges. No firmware table access is
+/// required after this point.
+pub fn activate_relocated_paging() {
+    crate::info!("mm::init: paging setup after ACPI cache");
+    ensure_paging_ready();
     crate::info!(
         "mm::init: complete (RAM=0x{:x} free_pages={})",
-        memory_bytes,
+        memory_bytes(),
         phys::free_pages()
     );
+}
+
+/// Compatibility wrapper for callers that do not need pre-paging ACPI parsing.
+pub fn init_relocated(
+    memory_bytes: usize,
+    legacy_reserved_bytes: usize,
+    kernel_start: usize,
+    kernel_end: usize,
+) {
+    init_relocated_early(
+        memory_bytes,
+        legacy_reserved_bytes,
+        kernel_start,
+        kernel_end,
+    );
+    activate_relocated_paging();
 }
 
 pub fn init(memory_bytes: usize, reserved_bytes: usize) {

@@ -101,7 +101,7 @@ fn pci_mmio_lease_self_test() {
         let Ok(info) = driver_info(index as u32) else {
             continue;
         };
-        if info.kind != zero_abi::driver::DriverKind::PciGeneric as u32 || info.mmio_len < 4 {
+        if info.kind != zero_abi::driver::DriverKind::PciTest as u32 || info.mmio_len < 4 {
             continue;
         }
         let Ok(region) = mmio_map(index as u32) else {

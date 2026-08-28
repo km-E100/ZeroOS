@@ -1,6 +1,10 @@
 use alloc::{boxed::Box, vec::Vec};
+use core::ffi::c_void;
+use core::time::Duration;
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::pi::mp::MpServices;
+use uefi::proto::unsafe_protocol;
 use uefi::table::Runtime;
 use zero_abi::boot::{RootFsEntry, RootFsImage};
 
@@ -14,7 +18,153 @@ const KERNEL_MEMORY_SYMBOL: &str = "__zero_memory_bytes";
 /// 符号 `__zero_rsdp_phys`（0 = 未找到，内核回退硬编码探测路径）。
 const KERNEL_RSDP_SYMBOL: &str = "__zero_rsdp_phys";
 
+/// Early platform contract. These slots are patched before ExitBootServices so
+/// kernel code can decide whether board-specific MMIO is safe before ACPI/PCI
+/// discovery is available. Unknown firmware is deliberately fail-safe.
+const KERNEL_PLATFORM_KIND_SYMBOL: &str = "__zero_platform_kind";
+const KERNEL_EARLY_UART_BASE_SYMBOL: &str = "__zero_early_uart_base";
+const KERNEL_PCI_IO_SEGMENT_SYMBOL: &str = "__zero_pci_io_segment";
+const KERNEL_PCI_IO_BUS_BASE_SYMBOL: &str = "__zero_pci_io_bus_base";
+const KERNEL_PCI_IO_HOST_BASE_SYMBOL: &str = "__zero_pci_io_host_base";
+const KERNEL_PCI_IO_LEN_SYMBOL: &str = "__zero_pci_io_len";
+const KERNEL_BOOT_CPU_COUNT_SYMBOL: &str = "__zero_boot_cpu_count";
+const KERNEL_BOOT_CPU_MPIDRS_SYMBOL: &str = "__zero_boot_cpu_mpidrs";
+const BOOT_CPU_CAPACITY: usize = 4;
+const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
+const PLATFORM_UNKNOWN: u64 = 0;
+const PLATFORM_QEMU_VIRT: u64 = 1;
+const PLATFORM_PARALLELS_ARM: u64 = 2;
+const QEMU_VIRT_PL011_BASE: u64 = 0x0900_0000;
+
 const KERNEL_ROOTFS_IMAGE_SYMBOL: &str = "__zero_rootfs_image";
+
+/// Minimal ABI view of EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL. Only Configuration()
+/// and SegmentNumber are used; pointer-sized placeholders preserve the exact
+/// UEFI structure layout for the preceding callbacks/access pairs.
+#[repr(C)]
+#[unsafe_protocol("2f707ebb-4a1a-11d4-9a38-0090273fc14d")]
+struct PciRootBridgeIo {
+    parent_handle: *mut c_void,
+    poll_mem: usize,
+    poll_io: usize,
+    mem_access: [usize; 2],
+    io_access: [usize; 2],
+    pci_access: [usize; 2],
+    copy_mem: usize,
+    map: usize,
+    unmap: usize,
+    allocate_buffer: usize,
+    free_buffer: usize,
+    flush: usize,
+    get_attributes: usize,
+    set_attributes: usize,
+    configuration:
+        extern "efiapi" fn(this: *mut PciRootBridgeIo, resources: *mut *mut c_void) -> Status,
+    segment_number: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PciIoWindow {
+    segment: u16,
+    bus_base: u64,
+    host_base: u64,
+    len: u64,
+}
+
+fn read_unaligned_u16(p: *const u8) -> u16 {
+    u16::from_le(unsafe { core::ptr::read_unaligned(p.cast::<u16>()) })
+}
+
+fn read_unaligned_u64(p: *const u8) -> u64 {
+    u64::from_le(unsafe { core::ptr::read_unaligned(p.cast::<u64>()) })
+}
+
+/// Capture the first usable PCI I/O window from UEFI's root-bridge protocol.
+/// QWORD descriptors report host AddressRangeMin plus a translation offset that
+/// converts host -> PCI bus address; therefore bus_base = host_base + xlate.
+fn collect_pci_io_window(st: &SystemTable<Boot>) -> Option<PciIoWindow> {
+    const QWORD_ADDRESS_SPACE: u8 = 0x8a;
+    const END_TAG: u8 = 0x79;
+    const RESOURCE_IO: u8 = 1;
+    let bs = st.boot_services();
+    let handles = bs.find_handles::<PciRootBridgeIo>().ok()?;
+    for handle in handles {
+        let Ok(rb) = bs.open_protocol_exclusive::<PciRootBridgeIo>(handle) else {
+            continue;
+        };
+        let mut resources: *mut c_void = core::ptr::null_mut();
+        let this = (&*rb) as *const PciRootBridgeIo as *mut PciRootBridgeIo;
+        let status = (rb.configuration)(this, &mut resources);
+        if status.is_error() || resources.is_null() {
+            continue;
+        }
+        let segment = rb.segment_number as u16;
+        let mut p = resources.cast::<u8>();
+        for _ in 0..32 {
+            let tag = unsafe { p.read() };
+            if tag == END_TAG {
+                break;
+            }
+            if tag != QWORD_ADDRESS_SPACE {
+                log_warn!(
+                    "PCI root bridge seg={} unexpected resource tag=0x{:02x}",
+                    segment,
+                    tag
+                );
+                break;
+            }
+            let body_len = read_unaligned_u16(unsafe { p.add(1) }) as usize;
+            let total_len = body_len.checked_add(3)?;
+            if body_len < 0x2b {
+                break;
+            }
+            let resource_type = unsafe { p.add(3).read() };
+            if resource_type == RESOURCE_IO {
+                let host_base = read_unaligned_u64(unsafe { p.add(0x0e) });
+                let host_max = read_unaligned_u64(unsafe { p.add(0x16) });
+                let xlate = read_unaligned_u64(unsafe { p.add(0x1e) });
+                let len = read_unaligned_u64(unsafe { p.add(0x26) });
+                if len != 0 {
+                    let bus_base = host_base.wrapping_add(xlate);
+                    log_info!(
+                        "PCI root IO: seg={} host=[0x{:x},0x{:x}] bus_base=0x{:x} xlate=0x{:x} len=0x{:x}",
+                        segment,
+                        host_base,
+                        host_max,
+                        bus_base,
+                        xlate,
+                        len
+                    );
+                    return Some(PciIoWindow {
+                        segment,
+                        bus_base,
+                        host_base,
+                        len,
+                    });
+                }
+            }
+            p = unsafe { p.add(total_len) };
+        }
+    }
+    log_info!("PCI root IO: no usable UEFI I/O window");
+    None
+}
+
+fn patch_kernel_pci_io_window(
+    kernel: &crate::kernel_loader::KernelImage,
+    window: Option<PciIoWindow>,
+) {
+    let w = window.unwrap_or(PciIoWindow {
+        segment: 0,
+        bus_base: 0,
+        host_base: 0,
+        len: 0,
+    });
+    let _ = patch_u64_symbol(kernel, KERNEL_PCI_IO_SEGMENT_SYMBOL, w.segment as u64);
+    let _ = patch_u64_symbol(kernel, KERNEL_PCI_IO_BUS_BASE_SYMBOL, w.bus_base);
+    let _ = patch_u64_symbol(kernel, KERNEL_PCI_IO_HOST_BASE_SYMBOL, w.host_base);
+    let _ = patch_u64_symbol(kernel, KERNEL_PCI_IO_LEN_SYMBOL, w.len);
+}
 
 fn take_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
     let end = off.checked_add(4)?;
@@ -201,6 +351,285 @@ fn patch_kernel_rsdp(kernel: &crate::kernel_loader::KernelImage, rsdp: Option<u6
     }
 }
 
+fn patch_u64_symbol(kernel: &crate::kernel_loader::KernelImage, symbol: &str, value: u64) -> bool {
+    let Some(addr) = kernel.segments.symbol_address(symbol) else {
+        log_warn!("kernel platform symbol `{}` missing", symbol);
+        return false;
+    };
+    unsafe { core::ptr::write_volatile(addr as *mut u64, value) };
+    true
+}
+
+fn rsdp_oem_id(st: &SystemTable<Boot>) -> Option<[u8; 6]> {
+    let rsdp = find_rsdp_phys(st)? as usize;
+    if rsdp == 0 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    unsafe {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = core::ptr::read_volatile((rsdp + 9 + i) as *const u8);
+        }
+    }
+    Some(out)
+}
+
+fn oem_ascii(id: Option<[u8; 6]>) -> alloc::string::String {
+    let Some(id) = id else {
+        return alloc::string::String::from("<none>");
+    };
+    id.iter()
+        .map(|b| {
+            if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+#[inline]
+fn acpi_rd8(addr: u64) -> u8 {
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
+}
+
+fn acpi_rd32(addr: u64) -> u32 {
+    let mut b = [0u8; 4];
+    for (i, v) in b.iter_mut().enumerate() {
+        *v = acpi_rd8(addr + i as u64);
+    }
+    u32::from_le_bytes(b)
+}
+
+fn acpi_rd64(addr: u64) -> u64 {
+    let mut b = [0u8; 8];
+    for (i, v) in b.iter_mut().enumerate() {
+        *v = acpi_rd8(addr + i as u64);
+    }
+    u64::from_le_bytes(b)
+}
+
+fn acpi_sig(addr: u64, sig: &[u8; 4]) -> bool {
+    (0..4).all(|i| acpi_rd8(addr + i as u64) == sig[i])
+}
+
+/// ACPI SPCR early-console discovery. The SPCR structure starts with the common
+/// 36-byte SDT header, then interface_type at +36 and a 12-byte GAS at +40.
+/// Accept only SystemMemory + ARM PL011 (DBG2 subtype 0x03); other serial kinds
+/// need a different register protocol and stay disabled rather than guessed.
+fn find_spcr_pl011_base(st: &SystemTable<Boot>) -> Option<u64> {
+    const ACPI_DBG2_ARM_PL011: u8 = 0x03;
+    const GAS_SYSTEM_MEMORY: u8 = 0;
+    let rsdp = find_rsdp_phys(st)?;
+    let xsdt = acpi_rd64(rsdp + 24);
+    if xsdt == 0 || !acpi_sig(xsdt, b"XSDT") {
+        return None;
+    }
+    let len = acpi_rd32(xsdt + 4) as usize;
+    if len < 36 || len > 1024 * 1024 || (len - 36) % 8 != 0 {
+        return None;
+    }
+    for i in 0..((len - 36) / 8) {
+        let table = acpi_rd64(xsdt + 36 + (i * 8) as u64);
+        if table == 0 || !acpi_sig(table, b"SPCR") {
+            continue;
+        }
+        let table_len = acpi_rd32(table + 4) as usize;
+        if table_len < 52 {
+            return None;
+        }
+        let interface = acpi_rd8(table + 36);
+        let space_id = acpi_rd8(table + 40);
+        let base = acpi_rd64(table + 44);
+        log_info!(
+            "SPCR: interface=0x{:02x} space={} base=0x{:x}",
+            interface,
+            space_id,
+            base
+        );
+        return (interface == ACPI_DBG2_ARM_PL011 && space_id == GAS_SYSTEM_MEMORY && base != 0)
+            .then_some(base);
+    }
+    log_info!("SPCR: absent");
+    None
+}
+
+#[inline]
+fn local_mpidr_affinity() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mpidr: u64;
+        unsafe {
+            core::arch::asm!("mrs {0}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags))
+        };
+        mpidr & MPIDR_AFFINITY_MASK
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
+}
+
+extern "efiapi" fn capture_ap_mpidr(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let affinity = local_mpidr_affinity();
+    unsafe { core::ptr::write_volatile(arg.cast::<u64>(), affinity) };
+}
+
+/// Snapshot the architectural CPU affinities while UEFI still owns the APs.
+/// `ProcessorId` from EFI_MP_SERVICES_PROTOCOL is deliberately *not* assumed to
+/// be MPIDR: PI only promises a hardware-unique ID. Instead, StartupThisAP runs a
+/// tiny synchronous callback on each enabled/healthy AP and reads MPIDR_EL1 there.
+fn collect_uefi_mpidrs(st: &SystemTable<Boot>) -> Vec<u64> {
+    let bs = st.boot_services();
+    let Ok(handle) = bs.get_handle_for_protocol::<MpServices>() else {
+        log_info!("MP Services: protocol absent");
+        return Vec::new();
+    };
+    let Ok(mp) = bs.open_protocol_exclusive::<MpServices>(handle) else {
+        log_warn!("MP Services: protocol open failed");
+        return Vec::new();
+    };
+    let Ok(count) = mp.get_number_of_processors() else {
+        log_warn!("MP Services: processor count failed");
+        return Vec::new();
+    };
+    let bsp_number = mp.who_am_i().ok();
+    log_info!(
+        "MP Services: total={} enabled={} bsp={:?}",
+        count.total,
+        count.enabled,
+        bsp_number
+    );
+
+    let mut out = Vec::with_capacity(count.total.min(BOOT_CPU_CAPACITY));
+    // Always seed the BSP from the architectural register itself; this also
+    // keeps topology useful on firmware that exposes MP Services but refuses AP callbacks.
+    out.push(local_mpidr_affinity());
+
+    for number in 0..count.total {
+        if out.len() >= BOOT_CPU_CAPACITY {
+            break;
+        }
+        let Ok(info) = mp.get_processor_info(number) else {
+            continue;
+        };
+        if info.is_bsp() || bsp_number == Some(number) {
+            continue;
+        }
+        if !info.is_enabled() || !info.is_healthy() {
+            log_info!(
+                "MP Services: cpu{} skipped enabled={} healthy={}",
+                number,
+                info.is_enabled(),
+                info.is_healthy()
+            );
+            continue;
+        }
+        let mut affinity = u64::MAX;
+        let arg = (&mut affinity as *mut u64).cast::<c_void>();
+        match mp.startup_this_ap(
+            number,
+            capture_ap_mpidr,
+            arg,
+            Some(Duration::from_millis(100)),
+        ) {
+            Ok(()) if affinity != u64::MAX => {
+                affinity &= MPIDR_AFFINITY_MASK;
+                if !out.contains(&affinity) {
+                    log_info!(
+                        "MP Services: cpu{} processor_id=0x{:x} mpidr=0x{:x}",
+                        number,
+                        info.processor_id,
+                        affinity
+                    );
+                    out.push(affinity);
+                }
+            }
+            Ok(()) => {
+                log_warn!("MP Services: cpu{} callback returned no MPIDR", number);
+            }
+            Err(e) => {
+                log_warn!(
+                    "MP Services: cpu{} callback failed: {:?}",
+                    number,
+                    e.status()
+                );
+            }
+        }
+    }
+    out
+}
+
+fn patch_kernel_cpu_topology(kernel: &crate::kernel_loader::KernelImage, mpidrs: &[u64]) {
+    let count = mpidrs.len().min(BOOT_CPU_CAPACITY);
+    let _ = patch_u64_symbol(kernel, KERNEL_BOOT_CPU_COUNT_SYMBOL, count as u64);
+    let Some(base) = kernel
+        .segments
+        .symbol_address(KERNEL_BOOT_CPU_MPIDRS_SYMBOL)
+    else {
+        log_warn!(
+            "kernel CPU topology symbol `{}` missing",
+            KERNEL_BOOT_CPU_MPIDRS_SYMBOL
+        );
+        return;
+    };
+    unsafe {
+        for i in 0..BOOT_CPU_CAPACITY {
+            let value = mpidrs.get(i).copied().unwrap_or(0);
+            core::ptr::write_volatile((base as *mut u64).add(i), value);
+        }
+    }
+    if count != 0 {
+        log_info!(
+            "CPU topology handoff: count={} mpidrs={:?}",
+            count,
+            &mpidrs[..count]
+        );
+    }
+}
+
+/// Classify only platforms for which Zero OS has an explicit early-MMIO
+/// contract. QEMU's ArmVirt ACPI tables use RSDP OEM ID `BOCHS `; combine that
+/// positive board fingerprint with EDK II before enabling QEMU-only MMIO.
+/// Any unknown firmware remains fail-safe with early UART disabled.
+fn patch_kernel_platform(st: &SystemTable<Boot>, kernel: &crate::kernel_loader::KernelImage) {
+    let vendor = alloc::string::String::from(st.firmware_vendor());
+    let oem = rsdp_oem_id(st);
+    let oem_text = oem_ascii(oem);
+    log_info!(
+        "platform probe: vendor=\"{}\" rsdp_oem=\"{}\"",
+        vendor,
+        oem_text
+    );
+
+    let qemu_virt = vendor == "EDK II" && oem == Some(*b"BOCHS ");
+    let spcr_uart = find_spcr_pl011_base(st);
+    let (kind, fallback_uart, name) = if qemu_virt {
+        (PLATFORM_QEMU_VIRT, QEMU_VIRT_PL011_BASE, "qemu-virt")
+    } else if oem == Some(*b"PRLS  ") {
+        (PLATFORM_PARALLELS_ARM, 0, "parallels-arm")
+    } else {
+        (PLATFORM_UNKNOWN, 0, "unknown-safe")
+    };
+    let uart_base = spcr_uart.unwrap_or(fallback_uart);
+
+    let k = patch_u64_symbol(kernel, KERNEL_PLATFORM_KIND_SYMBOL, kind);
+    let u = patch_u64_symbol(kernel, KERNEL_EARLY_UART_BASE_SYMBOL, uart_base);
+    if k || u {
+        log_info!(
+            "platform handoff: vendor=\"{}\" kind={} ({}) early_uart=0x{:x}",
+            vendor,
+            kind,
+            name,
+            uart_base
+        );
+    }
+}
+
 /// 内核引导上下文：UEFI bootloader 与内核之间的协议载体。
 ///
 /// 当前内核入口 (boot.S `_start`) 固定读取静态 `boot_info_struct`，
@@ -254,6 +683,20 @@ impl KernelBootContext {
 
         // ACPI（WS-A）：ExitBootServices 前 RSDP 仍由固件持有/有效。
         patch_kernel_rsdp(kernel, find_rsdp_phys(st));
+
+        // Snapshot CPU topology while UEFI MP Services can still run AP callbacks.
+        // Runtime ACPI remains primary; this handoff is the architectural fallback
+        // for firmware whose post-EBS MADT view does not enumerate all processors.
+        let boot_mpidrs = collect_uefi_mpidrs(st);
+        patch_kernel_cpu_topology(kernel, &boot_mpidrs);
+
+        // Root bridge I/O translation is a Boot Services protocol and must be
+        // captured before ExitBootServices. It enables legacy PCI I/O BARs on ARM64.
+        patch_kernel_pci_io_window(kernel, collect_pci_io_window(st));
+
+        // Early board contract: protect the kernel from touching QEMU-virt MMIO
+        // on unrelated ARM64 firmware before ACPI/PCI discovery can take over.
+        patch_kernel_platform(st, kernel);
 
         // Display Foundation：GOP mode/framebuffer 仅在 Boot Services 存活时
         // 可通过 protocol 查询，故在退出前捕获并补丁进内核只读槽位。
