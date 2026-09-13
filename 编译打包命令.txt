@@ -1,0 +1,110 @@
+╔══════════════════════════════════════════════════════════════╗
+║  Zero OS 编译 · 打包 · 运行 · 验收 速查手册                     ║
+║  （与 xtask 构建系统保持同步；结构变动时先读本文件再动手）        ║
+╚══════════════════════════════════════════════════════════════╝
+
+# ── 0. 环境准备（一次性）─────────────────────────────────────────
+rustup toolchain install nightly
+rustup target add aarch64-unknown-none    --toolchain nightly
+rustup target add aarch64-unknown-uefi   --toolchain nightly
+# macOS 另需：qemu(≥8)、edk2-aarch-code.fd(/opt/homebrew/share/qemu/)、
+#             xorriso、mtools(mformat/mcopy)、dtc（xtask build-iso 依赖）
+
+# ── 1. 一键全链构建（日常唯一入口）───────────────────────────────
+#   自动顺序：host 组件 → 裸机服务(launchd/securityd/blkdrv/fsd) →
+#   user-app(shell) → blob 同步进 kernel/rootfs → rootfs bundle →
+#   installer 写 zero-rootfs.img → 内核嵌入(含 rootfs) → 引导器 → ISO。
+#   全程无手动步骤；源码有改动会自动增量重建。
+cargo run -p xtask -- build-iso
+
+# ⚠ 体积硬闸：项目目录 >2048MB 时所有构建命令前置拒绝（磁盘写满曾两度
+#   产生截断 ISO）。超限执行清理后重试：
+cargo run -p xtask -- purge          # 清除全部可再生构建产物
+
+# ── 2. 分步构建（调试单个组件时用）───────────────────────────────
+# 主机侧组件（安装器/ZFS 工具/recovery 等，宿主目标）：
+cargo build -p zero-fs-zfs -p zero-fsd -p zero-blkdrv \
+  -p zero-ipc-router -p zero-securityd -p zero-service-controller \
+  -p zero-installer -p zero-recovery -p mkzfs
+
+# 用户态裸机 ELF（shell 与 launchd；产物经 sync 进 kernel/rootfs）：
+cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-none -p user-app
+cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-none -p zero-launchd --release
+
+# 微内核（aarch64 裸机，debug 含符号表→供故障符号化回溯）：
+cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-none -p zero-kernel
+
+# UEFI 引导器（自研 Loader：解析 boot.cfg/boot.env，失败 3 次自动进恢复）：
+cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc \
+  --target aarch64-unknown-uefi -p bootloader-uefi
+
+# rootfs bundle + 安装器写盘（一般由 build-iso 内部调用，无需手动）：
+cargo run -p xtask -- build-rootfs
+cargo run -p zero-installer
+
+# ── 3. 主机测试（提交前必跑）────────────────────────────────────
+cargo test -p zero-microkernel                    # 内核纯逻辑层（69 项）
+cargo test --manifest-path microkernel/mm-host-tests/Cargo.toml   # MM 算法 26 项
+
+# ── 4. QEMU 实机运行 ────────────────────────────────────────────
+# 测试盘：专用空盘 target/disk.img（32MiB raw；run 命令会自动创建）。
+# ⚠ 禁止挂载 zero-rootfs.img —— 用户态服务（securityd userdb、fsd 卷）
+#   会真实写入该设备，挂错等于毁掉 rootfs。
+# 槽位约定：virtio-mmio-bus.0 @0x0A000000 = virtio-blk0，GIC INTID 48。
+
+# a) 一键脚本：交互串口 mon:stdio，可直接操作 shell（Ctrl-A X 退出）
+./run-qemu.sh              # 正常模式
+./run-qemu.sh recovery     # 恢复模式（-boot d，与 xtask run recovery 同参）
+# 挂盘固定 cache=writethrough：writeback 下宿主 QEMU 被 SIGKILL 会整批丢失
+# 未落盘的 guest 写入，fstest「跨重启再读仍 MATCH」的持久化判定就不可信了。
+
+# b) xtask run：串口写入 target/qemu-run.log，适合脚本化验收
+cargo run -p xtask -- run              # 正常模式（自动建盘+挂盘）
+cargo run -p xtask -- run recovery     # 恢复模式
+
+# c) 等价手动命令：
+dd if=/dev/zero of=target/disk.img bs=1m count=32
+qemu-system-aarch64 \
+  -machine virt -cpu cortex-a72 -m 1024 \
+  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+  -serial mon:stdio -display none \
+  -cdrom target/zero-os.iso \
+  -drive if=none,file=target/disk.img,format=raw,id=zdisk,cache=writethrough \
+  -device virtio-blk-device,drive=zdisk,bus=virtio-mmio-bus.0
+
+# ── 5. 实机验收清单（启动约 12 秒出 zero> 提示符）──────────────────
+# 开机自动拉起四个 EL0 服务：launchd / fsd / blkdrv / securityd。
+# 逐项在 shell 里验证：
+help                # 命令总览（分组输出：process / storage / system 三组）
+pid                 # GetPid 系统调用（应返回当前 shell pid）
+forktest            # fork 端到端：父子双行 [P]/[C]，子 getpid 与父打印一致
+waittest            # zombie→waitpid 收集：collected pid=N code=42
+nohangtest          # WNOHANG 轮询语义：polls-missed 后收集，存活期立即返回 0
+orphantest          # 四代孤儿链：收尸→AdoptToInit→防御回收，无僵尸滞留
+launchd list        # fsd/blkdrv/securityd 应为 [running] pid=N
+fstest              # 文件服务端到端：open→write→close→reopen→read 比对 MATCH
+                    #   （跨重启再跑一次仍 MATCH = 卷持久化生效）
+blktest             # raw 块直通验证：号位 7/8 写 LBA 60000 特征图案→读回比对 PASS
+                    #   （绕过 fsd；<40000 的 LBA 会拒绝执行以保护 fsd 卷保留区）
+launchd status      # launchd up; services registered=N
+
+# 脚本化验收（固化序列，CI 与人工回归共用）：
+#   scripts/acceptance.sh              # 全链：build-iso → 启动 → 串口注入
+#                                      #   launchd list/forktest/blktest/fstest
+#                                      #   → grep 判定 → 摘要 + 退出码
+#   scripts/acceptance.sh --no-build   # 复用现有 ISO 的快速回归（实机段 ~50 秒）
+# 日志落在 target/acceptance-serial.log；任一项失败会回放日志末尾辅助定位。
+
+# ── 6. 关键机制备忘 ─────────────────────────────────────────────
+# * UEFI Loader：默认 0 秒直进系统；连续失败 3 次自动切恢复模式。
+#   启动成功后在系统内执行 `bootctl` 清除失败计数（操作 boot.env）。
+# * fsd 卷布局（LBA 保留地图）：内核 blk 自检@2048 | securityd userdb@4096 |
+#   fsd 超级块@8192 | fsd 数据区@16384 起。新增常驻占用需登记避让。
+# * 故障诊断：内核 panic 输出寄存器堆 + Call Trace（FP 链符号化，
+#   符号表由引导器灌入 .data 汇槽，release strip 后优雅退化为裸地址）；
+#   用户态拷贝路径故障自动降级杀进程返回（不再重启整机）。
+# * 内存图：引导器把 EFI CONVENTIONAL 合并区间灌入 __zero_memory_map，
+#   物理分配器按区间精确登记空洞；旧引导器回退总量路径。

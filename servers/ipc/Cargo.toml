@@ -1,0 +1,19 @@
+[package]
+name = "zero-ipc-router"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zero-ipc-router"
+path = "src/bin/main.rs"
+
+[dependencies]
+zero-abi = { path = "../../libs/abi" }
+log = { workspace = true }
+heapless = { version = "0.8", default-features = false }
+userlib = { path = "../../userland/userlib" }
+spin = { workspace = true }

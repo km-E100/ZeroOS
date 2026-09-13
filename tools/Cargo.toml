@@ -1,0 +1,22 @@
+[package]
+name = "mkzfs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mkzfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mkzfs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+spin = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+zero-zfs-core = { path = "../libs/zfs-core" }
+tempfile = "3"
+cpio = "0.2"

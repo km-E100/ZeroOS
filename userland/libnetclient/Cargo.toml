@@ -1,0 +1,8 @@
+[package]
+name = "libnetclient"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[dependencies]
+zero-abi = { path = "../../libs/abi" }
+userlib = { path = "../userlib" }

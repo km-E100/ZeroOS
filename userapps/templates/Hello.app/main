@@ -1,0 +1,23 @@
+#!/bin/sh
+# Zero OS 应用包模板 —— main 入口脚本
+#
+# 说明（打包进目标系统后如何被拉起）：
+#   1. launchd 收到 `launchd spawn <binary>`（协议 0x11）或
+#      service-controller 的 CMD_START（协议 0x01）后，经系统调用
+#      20（SpawnService）以 EL0 用户态进程拉起 binary；
+#   2. 本目录结构由 zeropkg 打包工具生成（见 userland/commands/src/app_bundle.rs），
+#      `.app` 包布局：
+#        main        —— 可执行入口（此处为可移植 shell 脚手架的占位）
+#        config      —— TOML 风格元数据（包名/标识符/版本/存储名）
+#        Resources/  —— 运行时资源目录（$APP_ROOT/Resources 下相对引用）
+#   3. ABI 契约参考 libs/abi（syscall 0-20、错误编码 u64::MAX-k、
+#      Message{code:u32,payload:[u8;128]}、通道 ID 见 channels 模块）。
+#
+# 更贴近真实系统的替换方向：把 main 换成 aarch64-unknown-none 构建的
+# 用户态 ELF（链接基址 0x200000，入口 _start），仅依赖 userlib。
+APP_ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+echo "Hello from Zero OS sample app!"
+if [ -f "$APP_ROOT/Resources/message.txt" ]; then
+    echo "---"
+    cat "$APP_ROOT/Resources/message.txt"
+fi

@@ -1,0 +1,18 @@
+[package]
+name = "user-app"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "zero-shell"
+path = "src/bin/shell.rs"
+
+[dependencies]
+userlib = { path = "../userlib" }
+zero-abi = { path = "../../libs/abi" }
+
+useralloc = { path = "../useralloc" }

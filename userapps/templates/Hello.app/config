@@ -1,0 +1,21 @@
+# Zero OS 应用包模板 —— config 元数据
+#
+# 字段语义（解析器：userland/commands/src/app_bundle.rs）：
+#   name        —— 应用显示名（launchd list / service-controller 查询用）
+#   identifier  —— 全局唯一标识（反向域名风格，用于审计/会话跟踪）
+#   version     —— 语义化版本字符串
+#   storage     —— 数据目录名（挂载为 .app/ 下的数据区，fs 线 Agent 契约）
+#   permissions —— 权限声明（本轮仅记录，内核强制尚待设计）
+#   args        —— 启动参数（传给用户态入口 x2/x3 的预留方向）
+#
+# 打包命令：userland/commands 的 zeropkg / appctl 工具按此文件结构
+# 生成 .app bundle；运行时经 rootfs（UserBootFs）或 FS 服务访问。
+name = "Hello"
+identifier = "com.zero.templates.hello"
+version = "1.0.0"
+storage = "HelloData"
+
+# 选填字段，演示可扩展配置。
+description = "Zero OS 示例应用，展示 main/config 新结构"
+permissions = ["console.write"]
+args = []

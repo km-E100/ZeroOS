@@ -1,0 +1,8 @@
+{
+  "volume": "root",
+  "mountpoint": "/",
+  "filesystem": "zfs",
+  "options": {
+    "readonly": false
+  }
+}

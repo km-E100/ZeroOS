@@ -1,0 +1,8 @@
+[package]
+name = "libblkclient"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+userlib = { path = "../userlib" }
+zero-abi = { path = "../../libs/abi" }

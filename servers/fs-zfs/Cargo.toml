@@ -1,0 +1,24 @@
+[package]
+name = "zero-fs-zfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zero-fs-zfs"
+path = "src/bin/main.rs"
+
+[dependencies]
+zero-abi = { path = "../../libs/abi" }
+zero-zfs-core = { path = "../../libs/zfs-core" }
+serde = { workspace = true, features = ["derive"] }
+log = { workspace = true }
+userlib = { path = "../../userland/userlib" }
+spin = { workspace = true }
+heapless = { version = "0.8", default-features = false }
+libblkclient = { path = "../../userland/libblkclient" }
+
+useralloc = { path = "../../userland/useralloc" }

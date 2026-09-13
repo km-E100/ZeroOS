@@ -1,0 +1,6 @@
+{
+  "Label": "com.zero.ipcrouter",
+  "Program": "/System/Servers/ipc-router",
+  "Sockets": ["kernel-ipc"],
+  "RunAtLoad": true
+}

@@ -1,0 +1,5 @@
+{
+  "Label": "com.zero.recovery",
+  "Program": "/Applications/Recovery/recovery.sh",
+  "RunAtLoad": true
+}

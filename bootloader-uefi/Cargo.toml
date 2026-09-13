@@ -1,0 +1,15 @@
+[package]
+name = "bootloader-uefi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Zero OS Project"]
+
+[dependencies]
+uefi = { version = "0.24", features = ["alloc"] }
+uefi-services = "0.21"
+log = "0.4"
+zero-abi = { path = "../libs/abi" }
+bitflags = "2"
+heapless = { version = "0.8", default-features = false, features = ["serde"] }
+spin = "0.9"

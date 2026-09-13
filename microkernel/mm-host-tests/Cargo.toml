@@ -1,0 +1,9 @@
+[package]
+name = "mm-host-tests"
+version = "0.1.0"
+edition = "2024"
+
+# 独立 mini 工程：脱离主 workspace（主 crate 因 runtime #[panic_handler]
+# 无法在 host 上跑 cargo test——见 https://github.com/rust-lang/rust/issues/54198）。
+# 通过 #[path] 引入 microkernel 的纯算法模块，在 host 上直接单测。
+[workspace]
