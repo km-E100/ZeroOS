@@ -2,6 +2,126 @@
 
 > 新会话先读本文件 + `git log --oneline` 接上进度。
 
+## 2026-10-16 · TODO List（下一阶段路线，第45～50刀）
+
+> 本节由 2026-10-16 基线复核后建立。上一节记录的 45/45、36/36 等指标为
+> 2026-08-27 的声明值；2026-10-16 本机复跑 `hardware-acceptance.sh` 实测
+> **36/45**，差异已在下方 P0/P1 中定位。所有条目按「底层优先」排序。
+
+### 🔴 P0 · 真实缺陷（实机暴露，优先修复）
+
+**blkdrv 后端探测不验证可用性** — 一条探测缺陷废掉整条 NVMe 存储路径。
+
+```
+driver: virtio-blk 自检写入失败 (LBA=2048): DeviceError        ← 自检失败
+blkdrv: passthrough backend ready (VirtIO blk via kernel svc 7/8)   ← 却仍然绑定
+nvme: READ/WRITE/FLUSH SELFTEST PASS                            ← NVMe 已就绪却被跳过
+Zero OS zfsd mount FAILED
+[1/6] open "zerofsd.txt" create: FAIL (open: invalid argument)
+```
+
+根因 `servers/blkdrv/src/lib.rs` `probe_backend()` 只判断容量 > 0，不做读写验证：
+```rust
+fn probe_backend() -> bool {
+    block_capacity_sectors().map(|v| v > 0).unwrap_or(false)
+}
+```
+自检失败的 virtio-blk 被照单全收，且**无回退到下一候选设备**；fsd 拿到坏后端后
+mount 失败且未上报，级联导致 ZeroPkg 安装与全部文件系统操作返回 `invalid argument`。
+
+| # | 任务 |
+| --- | --- |
+| P0-1 | `probe_backend` 增加读写往返验证（写标记→读回→比对），而非仅看容量 |
+| P0-2 | 绑定失败时回退到下一候选设备（NVMe 已就绪却被跳过） |
+| P0-3 | fsd/zfsd 拿到不可用后端时明确上报 `NODEV`，不静默返回 `invalid argument` |
+| P0-4 | regression：`hardware-acceptance.sh` 增加「blkdrv 必须自绑定成功」断言 |
+
+### 🟡 P1 · 测试脚本缺陷（非系统缺陷，但掩盖真实状态）
+
+| # | 任务 | 真相 |
+| --- | --- | --- |
+| P1-1 | `check()` 等待串口日志落盘，消除竞态假 FAIL | K36/K37 SMP4 系统正常，`boot_secondaries done, requested=3 online=4` 确实在日志第 178 行，判定时日志未刷新 |
+| P1-2 | K40 期望字符串随 P0 修复后同步 | 现期望 `NVMe via`，实测 `VirtIO blk via` |
+
+### 🔵 第45刀 · 内存管理地基（最底层，后续一切依赖它）
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 45-a | 物理分配器水位线游标 | `phys_bitmap.rs` `alloc_page` 每次从第 0 字扫至第 16384 字，无游标 |
+| 45-b | SMP 并发分配 | 全局单 `spin::Mutex`，SMP 下所有核串行 |
+| 45-c | 突破 4 GiB 硬上限 | `phys.rs` `MAX_PAGES = 1024*1024` 写死 |
+| 45-d | 内核堆动态化 | `heap.rs` `HEAP_PAGES = 2048` 静态 8 MiB BSS |
+| 45-e | slab / size-class 分配器 | 小对象碎片与锁竞争 |
+| 45-f | host 回归 | 碎片守恒 / 耗尽 / 并发压力入 `mm-host-tests` |
+
+### 🔵 第46刀 · 地址空间与 VM API（KPTI 的前置条件）
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 46-a | 通用 `mmap`/`munmap`/`mprotect` | 当前零实现，仅 brk / 栈 / ELF 三条专用路径 |
+| 46-b | 按需分页 demand paging | 无缺页异常路径 |
+| 46-c | ASID 引入 | 无 ASID，每次切换 `tlbi vmalle1` 全量清 TLB |
+| 46-d | 跨核 TLB shootdown | 仅本核精确失效，无按 ASID / IPI 广播 |
+| 46-e | 用户栈 guard 页显式化 | 当前隐式设计 |
+| 46-f | 进程表扩容 | `MAX_PROCESSES = 256` 固定 |
+
+### 🔵 第47刀 · netd TCP 可靠传输
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 47-a | 数据段重传队列 + RTO 指数退避 + 快速重传 | 仅 SYN 有重传（`TCP_SYN_RETRY_MS=750` / `LIMIT=5`），已发数据段无任何重传 |
+| 47-b | ACK 去重与累计确认 | 状态机仅 SynSent/Established/Closed 三态 |
+| 47-c | 补齐状态机 + `listen`/`accept` | 缺 Listen/SynReceived/FinWait/CloseWait/TimeWait |
+| 47-d | 拥塞控制 slow start + congestion avoidance | 无 cwnd/ssthresh |
+| 47-e | 丢包注入回归纳入 acceptance | 需新增 |
+
+### 🔵 第48刀 · 存储持久化
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 48-a | 快照落盘 + 重启恢复 | `metadata.rs` 中 `snapshot` 出现 0 次，重启即丢 |
+| 48-b | 突破 metadata bank 上限 | `BANK_BLOCKS = 32` → 约 252 KiB，超出即 `CheckpointTooLarge` |
+| 48-c | Journal 落盘与崩溃重放 | `journal.rs` 纯内存 `Vec`，满了 `remove(0)` |
+
+### 🔵 第49刀 · 内核安全与健壮性
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 49-a | PAN / UAO 引入 | 全仓库零使用 |
+| 49-b | 中断栈分离 | `process.rs` 自承「我们无中断栈分离」 |
+| 49-c | 进程槽引用计数 / pin | `remove_slot` 后存在 UAF 窗口 |
+| 49-d | 口令哈希加盐 + 迭代 | `security` 用无 salt 单次 `sha256` |
+| 49-e | capability 台账持久化 | 签发/撤销重启即丢 |
+| 49-f | 孤儿语义修正 | adopted 走 `ReapImmediately`，偏离 POSIX |
+
+### 🔵 第50刀 · KPTI 与真 KASLR
+
+| # | 任务 | 现状依据 |
+| --- | --- | --- |
+| 50-a | 真 KASLR | 页表基址与内核镜像固定，仅随机栈顶约 1 MiB |
+| 50-b | KPTI | `TTBR0_EL1`/`TTBR1_EL1` 指向同一根表 |
+| 50-c | 内核栈随机化与 KASLR 联动 | — |
+
+### 横切 · 系统完整性
+
+| # | 任务 |
+| --- | --- |
+| C-1 | launchd 自动崩溃恢复（退出检测 + 退避重启；`restart` 命令当前仅人工触发） |
+| C-2 | 僵尸进程收割：launchd `wait`/`reap` 循环（全库无） |
+| C-3 | README 指标同步：45/45 等改为本机实测值并标注复现命令 |
+| C-4 | 本节基线复跑：hardening-acceptance 36/36 与 stress-loop SMP4 待补 |
+
+### 排序说明
+
+```
+P0/P1  →  第45刀 内存地基  →  第46刀 地址空间/ASID  →  47/48/49  →  第50刀 KPTI
+  ↑            ↑                    ↑                    ↑            ↑
+真实缺陷    一切的前提          KPTI 的前提        功能可靠性     纵深防御
+```
+
+第50刀 KPTI 排最后并非低估：它依赖第46刀的 ASID 与通用 VM API，改动面最大，
+且属纵深防御而非当前正确性缺口。
+
 ## 2026-08-27 · 第35～44刀：真机硬件链与可靠性收口（当前最高权威状态）
 
 > 第20～34刀全栈基线继续成立；本节记录其后的 PCIe/ITS/IOMMU/xHCI/NVMe、
