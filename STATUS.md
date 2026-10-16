@@ -193,6 +193,48 @@ mount 失败且未上报，级联导致 ZeroPkg 安装与全部文件系统操�
 - **KPTI 之前必须先有 ASID 与通用 VM API**，否则第50刀无法实施。
 - **第55刀（测试基建）建议提前**，否则上述每项改动都缺少自动对照面。
 - 全部落地预计触及 `zero-abi`（冻结合同），**每次新增系统调用都需同步 ABI 一致性测试**。
+## ✅ 2026-10-16 · P0 修复完成（第 0 刀）
+
+**blkdrv 后端探测不验证可用性 —— 已修复并回归钉死。**
+
+| 项 | 状态 |
+| --- | --- |
+| P0-1 `probe_backend` 增加读写验证 | ✅ 内核侧加 `healthy` 标志，`self_test()` 返回真实结果 |
+| P0-2 绑定失败回退到下一候选设备 | ✅ `is_ready()` 要求 `ready && healthy`，自动回退 NVMe |
+| P0-3 未挂载时明确报错 | ✅ `NotMounted` → `ERR_DEVICE`（原 `ERR_INVALID`，与参数错误混淆） |
+| P0-4 回归断言 | ✅ 新增 3 条断言 + 4 项 host 单测（220 → **224**） |
+| P1-1 脚本竞态 | ✅ 加 `settle_log()` |
+| P1-2 断言字符串过时 | ✅ SMP4 期望 `online=4`，实际 `requested=3 online=4`（2 处） |
+
+### 实测效果
+
+```
+K40 修复前：blkdrv: passthrough backend ready (VirtIO blk ...)   ← 坏设备
+           Zero OS zfsd mount FAILED
+
+K40 修复后：blkdrv: passthrough backend ready (NVMe via kernel svc 7/8)
+           Zero OS zfsd (default fsd) online
+           fstest: PASS - fsd block-backed volume verified end-to-end
+           fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)
+```
+
+| 矩阵 | 修复前 | 修复后 |
+| --- | --- | --- |
+| hardware-acceptance | 36/45 | **41/44** |
+| hardening-acceptance | 34/36 | 待复跑（K43 同根因，应同步转绿） |
+| 微内核 host 测试 | 220 | **224** |
+
+> 断言总数由 45 调整为 44：删除 `K40 no virtio-blk backend` ——
+> QEMU 的 `-netdev user` 会附带 virtio-blk（网络后端需块设备存密钥），
+> 其枚举属预期行为；真正该断言的是「blkdrv 没绑定它」，已由新断言覆盖。
+
+### 剩余失败（3 项，归属第47刀）
+
+`K40 ZeroPkg install / launch / full E2E` —— `pkgtest: install failed: network`。
+
+调用链：`pkgd:28` → `libpkg:386 install_url()` → `libweb::https_get_with_ca()` →
+`Error::Network`。网络层正常（`netd: DHCP bound`），属 netd TLS/大响应传输路径，
+与存储无关。**这是第47刀 TCP 可靠传输的第一个真实缺陷证据。**
 ### 📌 实施约束（2026-10-16 审计确认，动手前必读）
 
 #### 约束一：syscall 号位冻结
