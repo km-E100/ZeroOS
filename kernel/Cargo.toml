@@ -1,0 +1,15 @@
+[package]
+name = "zero-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+[dependencies]
+zero-microkernel = { path = "../microkernel" }
+zero-abi = { path = "../libs/abi" }
+zero-ipc-router = { path = "../servers/ipc" }
+zero-fs-zfs = { path = "../servers/fs-zfs" }
+zero-securityd = { path = "../servers/security" }
+zero-service-controller = { path = "../servers/service-controller" }
+zero-fsd = { path = "../servers/fsd" }
+zero-blkdrv = { path = "../servers/blkdrv" }

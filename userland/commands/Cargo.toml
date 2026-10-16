@@ -1,0 +1,68 @@
+[package]
+name = "zero-user-commands"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zero_user_commands"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+
+[[bin]]
+name = "cp"
+path = "src/bin/cp.rs"
+
+[[bin]]
+name = "defaults"
+path = "src/bin/defaults.rs"
+
+[[bin]]
+name = "launchctl"
+path = "src/bin/launchctl.rs"
+
+[[bin]]
+name = "diskutil"
+path = "src/bin/diskutil.rs"
+
+[[bin]]
+name = "softwareupdate"
+path = "src/bin/softwareupdate.rs"
+
+[[bin]]
+name = "security"
+path = "src/bin/security.rs"
+
+[[bin]]
+name = "appctl"
+path = "src/bin/appctl.rs"
+
+[[bin]]
+name = "fsctl"
+path = "src/bin/fsctl.rs"
+
+[[bin]]
+name = "zeropkg"
+path = "src/bin/zeropkg.rs"
+
+[[bin]]
+name = "bootctl"
+path = "src/bin/bootctl.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+walkdir = "2"
+anyhow = "1"
+dirs-next = "2"
+toml = "0.8"
+libfsclient = { path = "../libfsclient" }
+userlib = { path = "../userlib" }
+
+useralloc = { path = "../useralloc" }
+
+ed25519-dalek = { version = "2.2", default-features = false }

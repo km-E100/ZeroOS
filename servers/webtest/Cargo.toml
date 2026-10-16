@@ -1,0 +1,18 @@
+[package]
+name = "zero-webtest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+[[bin]]
+name = "zero-webtest"
+path = "src/bin/main.rs"
+
+[dependencies]
+libweb = { path = "../../userland/libweb" }
+libnetclient = { path = "../../userland/libnetclient" }
+userlib = { path = "../../userland/userlib" }
+useralloc = { path = "../../userland/useralloc" }

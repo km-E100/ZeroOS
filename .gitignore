@@ -1,0 +1,24 @@
+# 构建产物
+/target/
+**/target/
+
+# macOS 垃圾
+.DS_Store
+
+# 运行日志（遗物 qemu.log 已压缩为 qemu.log.gz 存档）
+/qemu.log
+
+# 本地开发/回归用测试私钥：公共证书/公钥可入库，私钥与签名种子禁止提交
+/tools/testkeys/*.key.pem
+/tools/testkeys/*.seed.hex
+/tools/testkeys/*.srl
+
+# 本地演示/第三方引导文件及历史构建归档
+/boot/grub-assets/
+/kali linux boot/
+/codebuddy-sessions/
+/qemu-console.log
+/qemu.log.gz
+/*.zip
+/videos/
+/kernel/rootfs/System/Security/Identities/admin.txt

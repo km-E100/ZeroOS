@@ -1,0 +1,20 @@
+[package]
+name = "zero-blkdrv"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zero-blkdrv"
+path = "src/bin/main.rs"
+
+[dependencies]
+# 直通委托块服务：号位7/8 + IPC，无堆依赖（heapless/log 已随原生队列实现移除）。
+zero-abi = { path = "../../libs/abi" }
+spin = { workspace = true }
+userlib = { path = "../../userland/userlib" }
+
+useralloc = { path = "../../userland/useralloc" }

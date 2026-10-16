@@ -1,0 +1,13 @@
+[package]
+name = "zero-abi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# 设备端包管理（第十五刀后续 WS-A）：启用 zpkg 解析模块（需 alloc）。
+# 默认关闭——no_std 消费者（shell 等）不背 alloc 链接义务。
+zpkg = []

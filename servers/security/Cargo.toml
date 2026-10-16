@@ -1,0 +1,25 @@
+[package]
+name = "zero-securityd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zero-securityd"
+path = "src/bin/main.rs"
+
+[dependencies]
+zero-abi = { path = "../../libs/abi" }
+serde = { workspace = true, features = ["derive"] }
+log = { workspace = true }
+heapless = { version = "0.8", default-features = false, features = ["serde"] }
+userlib = { path = "../../userland/userlib" }
+spin = { workspace = true }
+
+useralloc = { path = "../../userland/useralloc" }
+zero-zfs-core = { path = "../../libs/zfs-core" }
+
+ed25519-dalek = { version = "2.2", default-features = false }

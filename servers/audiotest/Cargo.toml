@@ -1,0 +1,14 @@
+[package]
+name="zero-audiotest"
+version="0.1.0"
+edition="2021"
+license="MIT OR Apache-2.0"
+build="build.rs"
+[lib]
+crate-type=["rlib"]
+[[bin]]
+name="zero-audiotest"
+path="src/bin/main.rs"
+[dependencies]
+zero-abi={path="../../libs/abi"}
+userlib={path="../../userland/userlib"}

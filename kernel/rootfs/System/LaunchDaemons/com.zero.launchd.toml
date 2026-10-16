@@ -1,0 +1,7 @@
+[[services]]
+name = "launchd"
+binary = "/System/Core/zero-launchd"
+
+[[services]]
+name = "ipc-router"
+binary = "/System/Core/zero-ipc-router"

@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "microkernel",
+    "servers/ipc",
+    "servers/fs-zfs",
+    "servers/blkdrv",
+    "servers/fsd",
+    "servers/launchd",
+    "servers/security",
+    "servers/service-controller",
+    "servers/inputd",
+    "servers/windowserver",
+    "servers/audiod",
+    "servers/audiotest",
+    "servers/gputest",
+    "servers/webtest",
+    "servers/pkgd",
+    "servers/pkgtest",
+    "servers/pkghello",
+    "servers/pietest",
+    "servers/netd",
+    "libs/zfs-core",
+    "libs/abi",
+    "installer",
+    "recovery",
+    "kernel",
+    "userland/commands",
+    "userland/libfsclient",
+    "userland/libblkclient",
+    "userland/libnetclient",
+    "userland/libweb",
+    "userland/libpkg",
+    "userland/user_app",
+    "userland/userlib",
+    "userland/useralloc",
+    "xtask",
+    "bootloader-uefi",
+    "tools",
+    "tools/fuzz-syscall",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/km-E100/ZeroOS"
+repository = "https://github.com/km-E100/ZeroOS.git"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace.dependencies]
+spin = "0.9"
+log = { version = "0.4", default-features = false, features = ["max_level_debug"] }
+bitflags = "2"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }

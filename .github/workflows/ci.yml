@@ -1,0 +1,43 @@
+# Zero OS 可靠性冲刺（第十四刀）：主机测试 + 内核构建双闸。
+#
+# 设计取舍：
+# - 宿主单测（141+ 内核 / abi / fsd / mm-host-tests / userlib 等）全量跑，
+#   它们是回归的第一道闸（历次实机 bug 均有对应主机测试钉死）。
+# - build-iso 在 CI 里只验证"可构建"（xtask 磁盘闸在 CI 磁盘上不会触发；
+#   QEMU 实机验收依赖 KVM/HVF 与 edk2 固件路径，留待自托管 runner 扩展）。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 主机单元测试（微内核/ABI/fsd/zfs-core/securityd/userlib）
+        run: |
+          cargo test -p zero-microkernel -p zero-abi -p zero-fsd \
+                     -p zero-zfs-core -p zero-securityd -p userlib -p useralloc \
+                     -p libfsclient -p zero-ipc-router
+      - name: 用户命令面 host check
+        run: cargo check -p zero-user-commands
+      - name: mm-host-tests（独立宿主 crate，不在 workspace）
+        working-directory: microkernel/mm-host-tests
+        run: cargo test
+
+  kernel-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-none,aarch64-unknown-uefi
+      - name: ISO host tools
+        run: sudo apt-get update && sudo apt-get install -y mtools xorriso
+      - name: 裸机用户态 blob（zero-shell 等）
+        run: cargo +nightly build -Zbuild-std=core,compiler_builtins,alloc --target aarch64-unknown-none -p user-app
+      - name: 微内核构建（build-iso 全链，含 rootfs 打包与磁盘闸）
+        run: cargo run -p xtask -- build-iso

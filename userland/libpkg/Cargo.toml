@@ -1,0 +1,11 @@
+[package]
+name = "libpkg"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[dependencies]
+zero-abi = { path = "../../libs/abi" }
+zero-zfs-core = { path = "../../libs/zfs-core" }
+userlib = { path = "../userlib" }
+libfsclient = { path = "../libfsclient" }
+libweb = { path = "../libweb" }
