@@ -142,9 +142,19 @@ pub enum BlockBackendKind {
 }
 
 pub fn block_backend_kind() -> Option<BlockBackendKind> {
-    if virtio::blk::is_ready() {
+    select_block_backend(virtio::blk::is_ready(), nvme::is_ready())
+}
+
+/// 后端选择规则（纯函数，便于 host 侧回归）。
+///
+/// VirtIO 优先于 NVMe，保证辅助 NVMe 设备不会静默替换启动盘；
+/// 但「优先」以**真实可用**为前提：枚举完成却读写自检失败的 VirtIO
+/// 必须让位给已就绪的 NVMe。早前版本只看枚举完成标志，导致 K40/K43
+/// 把一个写不通的 virtio-blk 当成后端，fsd 随之挂载失败。
+fn select_block_backend(virtio_ready: bool, nvme_ready: bool) -> Option<BlockBackendKind> {
+    if virtio_ready {
         Some(BlockBackendKind::Virtio)
-    } else if nvme::is_ready() {
+    } else if nvme_ready {
         Some(BlockBackendKind::Nvme)
     } else {
         None
@@ -196,5 +206,40 @@ pub fn descriptors() -> Option<&'static [DriverDescriptor]> {
         None
     } else {
         Some(unsafe { (*ptr).as_slice() })
+    }
+}
+
+#[cfg(test)]
+mod block_backend_selection_tests {
+    use super::{select_block_backend, BlockBackendKind};
+
+    /// K40 回归：virtio-blk 枚举完成但自检失败（ready=false）时，
+    /// 必须回退到已就绪的 NVMe，而不是返回一个写不通的设备。
+    #[test]
+    fn falls_back_to_nvme_when_virtio_selftest_failed() {
+        assert_eq!(
+            select_block_backend(false, true),
+            Some(BlockBackendKind::Nvme)
+        );
+    }
+
+    /// VirtIO 真正可用时仍保持优先（不因 NVMe 存在而更换启动盘）。
+    #[test]
+    fn virtio_keeps_priority_when_healthy() {
+        assert_eq!(
+            select_block_backend(true, true),
+            Some(BlockBackendKind::Virtio)
+        );
+    }
+
+    #[test]
+    fn nvme_used_when_virtio_absent() {
+        assert_eq!(select_block_backend(false, true), Some(BlockBackendKind::Nvme));
+    }
+
+    /// 无任何可用后端时必须返回 None，让上层报 NotReady 而非盲选。
+    #[test]
+    fn none_when_no_backend_usable() {
+        assert_eq!(select_block_backend(false, false), None);
     }
 }
