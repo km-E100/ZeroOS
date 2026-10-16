@@ -23,6 +23,15 @@ pub struct PhysBitmap {
     total: usize,
     reserved: usize,
     free: usize,
+    /// 上次成功分配所在的位图字，作为下次分配的起点。
+    ///
+    /// 位图最多 1M 页 = 16384 个 u64 字。早前 alloc_page 每次都从第 0 字
+    /// 扫起，满载时单次分配要触碰上万字，且全程持全局锁——SMP 下这是
+    /// 明确的争用热点。记录命中位置后，稳态分配通常只需检查当前字。
+    ///
+    /// 仅作优化提示：当前字无可用位时仍会完整扫描一轮，因此分配结果
+    /// 与原来「从头扫到尾」的实现完全等价。
+    cursor: usize,
 }
 
 unsafe impl Send for PhysBitmap {}
@@ -40,6 +49,7 @@ impl PhysBitmap {
             total: 0,
             reserved: 0,
             free: 0,
+            cursor: 0,
         }
     }
 
@@ -96,28 +106,46 @@ impl PhysBitmap {
     /// 分配一页，返回物理地址；无空闲页返回 None。
     pub fn alloc_page(&mut self) -> Option<usize> {
         self.assert_ready();
+        // 快路径：先看上次命中的字。稳态下相邻分配落在同一个字里，
+        // 这里只检查 1 个字而非全部 nwords 个。
+        if self.cursor < self.nwords {
+            if let Some(page) = self.try_alloc_in_word(self.cursor) {
+                return Some(page);
+            }
+        }
+        // 慢路径：完整扫描。与「从头扫到尾」的原实现逐位等价，
+        // 因此当前字已满不会改变任何分配结果，也不存在绕回死循环。
         for index in 0..self.nwords {
-            let slot = unsafe { *self.words.add(index) };
-            // 只有“整字全忙”才能跳过；全零字（整个字都空闲）同样要
-            // 分配——历史上 `|| slot == 0` 会跳过所有未被触碰过的字，
-            // 导致 reserved 跨越多个字后（如保留 4096 页）所有分配
-            // 立即 OOM（详见 mm-host-tests 回归用例）。
-            if slot == u64::MAX {
+            if let Some(page) = self.try_alloc_in_word(index) {
+                return Some(page);
+            }
+        }
+        None
+    }
+
+    /// 尝试在指定字内分配一页；该字无可用位时返回 None。
+    fn try_alloc_in_word(&mut self, index: usize) -> Option<usize> {
+        let slot = unsafe { *self.words.add(index) };
+        // 只有「整字全忙」才能跳过；全零字（整个字都空闲）同样要
+        // 分配——历史上 `|| slot == 0` 会跳过所有未被触碰过的字，
+        // 导致 reserved 跨越多个字后（如保留 4096 页）所有分配
+        // 立即 OOM（详见 mm-host-tests 回归用例）。
+        if slot == u64::MAX {
+            return None;
+        }
+        for bit in 0..64 {
+            let page = index * 64 + bit;
+            if page < self.reserved || page >= self.total {
                 continue;
             }
-            for bit in 0..64 {
-                let page = index * 64 + bit;
-                if page < self.reserved || page >= self.total {
-                    continue;
+            if slot & (1u64 << bit) == 0 {
+                unsafe {
+                    *self.words.add(index) |= 1u64 << bit;
                 }
-                if slot & (1u64 << bit) == 0 {
-                    unsafe {
-                        *self.words.add(index) |= 1u64 << bit;
-                    }
-                    self.set_refs(page, 1);
-                    self.free -= 1;
-                    return Some(self.base + page * PAGE_SIZE);
-                }
+                self.set_refs(page, 1);
+                self.free -= 1;
+                self.cursor = index;
+                return Some(self.base + page * PAGE_SIZE);
             }
         }
         None
