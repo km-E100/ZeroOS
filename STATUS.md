@@ -193,6 +193,35 @@ mount 失败且未上报，级联导致 ZeroPkg 安装与全部文件系统操�
 - **KPTI 之前必须先有 ASID 与通用 VM API**，否则第50刀无法实施。
 - **第55刀（测试基建）建议提前**，否则上述每项改动都缺少自动对照面。
 - 全部落地预计触及 `zero-abi`（冻结合同），**每次新增系统调用都需同步 ABI 一致性测试**。
+## ✅ 2026-10-16 · 验收基础设施修复（44/44 全绿）
+
+**基线里剩下的失败，多半不是系统缺陷，而是验收脚本自身的问题。** 这一刀把
+「脚本故障」与「系统故障」彻底分开。
+
+| 问题 | 表现 | 真实根因 |
+| --- | --- | --- |
+| K40 pkgtest × 3 | `install failed: network` | **宿主 8443 被系统组件占用**（bind 失败但 lsof 查不到属主），`s_server` 静默退出 |
+| 全矩阵 | 日志只有 UEFI 固件错误 | **非交互 shell 的 PATH 不含 Homebrew bin**，QEMU 解析失败 |
+| K40 时序 | 偶发 bind 失败 | 端口检查与 `s_server` 启动之间的竞态 |
+| K36/K37 SMP4 | 假 FAIL | 断言字符串过时（`online=4` vs `requested=3 online=4`）+ 日志未落盘 |
+
+### 修复要点
+
+- **pkgtest 候选端口**：系统无参数传递、无环境变量，端口无法注入，
+  故 `pkgtest` 按序尝试 `8443 / 8444 / 18443`，任一可用即通过。
+- **QEMU 路径回退**：`PATH` → `/opt/homebrew/bin` → `/usr/local/bin`。
+- **端口探测用 `bind` 而非 `connect_ex`**：`openssl s_server` 的成败取决于 bind；
+  实测 `connect_ex` 对被 DROP 的端口返回 60 而非 0，会给出错误结论。
+
+### 实测
+
+| 矩阵 | 修复前 | 修复后 |
+| --- | --- | --- |
+| hardware-acceptance | 36/45 | **44/44** |
+| mm-host-tests | 42/42 | 42/42（未变） |
+
+> **教训**：分配器水位线游标改动曾让 `allocator_serves_all_zero_words` 死锁，
+> 已回滚。**未验证的改动不进主干**——这比多一项优化更重要。
 ## ✅ 2026-10-16 · P0 修复完成（第 0 刀）
 
 **blkdrv 后端探测不验证可用性 —— 已修复并回归钉死。**
@@ -221,7 +250,7 @@ K40 修复后：blkdrv: passthrough backend ready (NVMe via kernel svc 7/8)
 | 矩阵 | 修复前 | 修复后 |
 | --- | --- | --- |
 | hardware-acceptance | 36/45 | **41/44** |
-| hardening-acceptance | 34/36 | 待复跑（K43 同根因，应同步转绿） |
+| hardening-acceptance | 34/36 | **36/36** ✓ |
 | 微内核 host 测试 | 220 | **224** |
 
 > 断言总数由 45 调整为 44：删除 `K40 no virtio-blk backend` ——
