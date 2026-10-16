@@ -193,6 +193,54 @@ mount 失败且未上报，级联导致 ZeroPkg 安装与全部文件系统操�
 - **KPTI 之前必须先有 ASID 与通用 VM API**，否则第50刀无法实施。
 - **第55刀（测试基建）建议提前**，否则上述每项改动都缺少自动对照面。
 - 全部落地预计触及 `zero-abi`（冻结合同），**每次新增系统调用都需同步 ABI 一致性测试**。
+### 📌 实施约束（2026-10-16 审计确认，动手前必读）
+
+#### 约束一：syscall 号位冻结
+
+- 号段现状：**0–28 全用，29–39 空洞保留，40–75 连续**；最高已用 **75 = NetDiag**，下一个可用 **76**。
+- 新增 syscall 需**三处手工同步**（非宏）：
+  `libs/abi/src/lib.rs` 枚举 → `microkernel/src/trap.rs` `decode_syscall` → `microkernel/src/syscalls.rs` `handle` → `userland/userlib` 封装。
+- ⚠️ **隐藏地雷**：`tools/fuzz-syscall/tests/decode_table_fuzz.rs` 断言 `40..=75` 必须解码、
+  `76..=1023` 必须为 None。新增 76 会**直接打红**，必须同步改边界。
+  同类断言另见 `trap.rs:1141` 的 `decode_syscall_table` 内嵌表。
+
+#### 约束二：信号机制已有骨架（并非从零）
+
+第九刀「信号位图最小版」已落地：
+
+- `zero_abi::signals`（SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGSEGV）已定义；
+- `ProcessRecord.pending_signals: u16` 位图**已存在**（`process.rs:234`），投递用 `|=` 累积；
+- EL0 故障的**致命信号投递路径已通**（`trap.rs` → `deliver_fatal_signal` → `exit_current_with_status`）。
+
+**缺的是**：kill 注入 / sigaction / sigreturn / 阻塞式可挂起信号。
+故 51-a 是「补齐消费方」而非「新建投递机制」，风险低于预期。
+
+#### 约束三：进程状态迁移的 SMP 纪律
+
+- `ProcessState` 五态：Runnable / Running / Blocked / Dying / Zombie。
+- 所有迁移**必须在 `PROCESS_TABLE` 单锁内完成，且与 `PROCESS_OWNER` 释放在同一临界区**
+  （无「Running 无 owner」也无「Runnable 有 owner」的非法组合）。
+- ⚠️ **禁止使用 `set_state` / `set_state_slot`**（`process.rs:738/749`）——它们不做 owner 纪律，
+  会破坏该不变量。信号注入必须走 `request_wake` 之类带断言的转换。
+- ⚠️ **持表锁时不得调 `restore_frame` / 切地址空间**；`deliver_fatal_signal` 是正确写法范例。
+
+#### 约束四：信号不应复用 `ipc::Message`
+
+- `Message` = `{code: u32, payload: [u8;128]}`，语义是**通道队列里的排队数据报**（需 channel id + ACL + wait 登记）。
+- POSIX 信号是**定向单 pid 的位图置位**，标准信号不排队（同号多次投递只置一位）。
+- `Message` 连来源 pid 字段都没有（发送者 pid 是 receive 的返回值）。
+- **结论**：沿用 `pending_signals` 位图 + 新 syscall 号位，不走 IPC。
+
+#### 约束五：符号链接必须先解决磁盘格式兼容
+
+- `InodeKind::Symlink` 当前**仅是 1 字节判别值，无目标路径字段、无 API、无解析逻辑**（全仓零行为实现）。
+- ⚠️ **`metadata.rs` 的 checkpoint 无版本号**：MAGIC `"ZMDT0001"` 是唯一版本线索，代码无版本分支。
+- `decode` 末尾强制校验游标正好耗尽（`metadata.rs:219-221`），失败即整 bank 判废并静默回退。
+  因此**在条目头插入 symlink target 字段会双向静默破坏旧卷**。
+- 安全做法二选一：(a) MAGIC 升到 `"ZMDT0002"` 并给 `load_bank` 加版本分派；
+  (b) 保持头部不变，把 target 追加到条目尾部，用 `payload_len` 做可选扩展。
+- 符号链接展开落在 `fs-zfs` 的 `canonical_path`，**必须保留 `MAX_PATH=112` 上限与 `.`/`..` 拒绝**，
+  否则引入目录穿越漏洞。
 ### 总体路线
 
 ```

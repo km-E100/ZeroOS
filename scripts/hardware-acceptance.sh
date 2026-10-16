@@ -38,8 +38,24 @@ fi
 
 pass=0
 fail=0
+
+# QEMU 被 kill 后串口缓冲并非立即落盘：判定过早会读到不完整的日志，
+# 把「系统已打印但尚未 flush」误报为 FAIL（K36/K37 SMP4 即栽在这里——
+# boot_secondaries 行确实存在，只是判定时还没写到文件）。
+# 本函数等待文件大小连续两次采样不变，认为写入已结束。
+settle_log() {
+  log="$1"; [ -f "$log" ] || return 0
+  prev=-1
+  for _ in $(seq 1 40); do
+    cur=$(wc -c < "$log" 2>/dev/null || echo 0)
+    [ "$cur" = "$prev" ] && break
+    prev="$cur"; sleep 0.1
+  done
+}
+
 check() {
   name="$1"; pattern="$2"; log="$3"
+  settle_log "$log"
   if grep -aqF -- "$pattern" "$log"; then
     printf '%-34s PASS\n' "$name"
     pass=$((pass + 1))
@@ -50,6 +66,7 @@ check() {
 }
 check_absent() {
   name="$1"; pattern="$2"; log="$3"
+  settle_log "$log"
   if grep -aqE -- "$pattern" "$log"; then
     printf '%-34s FAIL  forbidden: %s\n' "$name" "$pattern"
     fail=$((fail + 1))
@@ -97,7 +114,7 @@ echo "== Knife36 GICv3 / ITS / MSI-X =="
 check "K36 ITS selftest" "gicv3: ITS/LPI SELFTEST PASS" "$LOG"
 check "K36 real PCI MSI" "pcie: EDU MSI PASS" "$LOG"
 check "K36 IRQ affinity" "target_cpu=1 actual_cpu=1" "$LOG"
-check "K36 SMP4 online" "smp: boot_secondaries done, online=4 multi_core=true" "$LOG"
+check "K36 SMP4 online" "smp: boot_secondaries done, requested=3 online=4 multi_core=true" "$LOG"
 check_absent "K35/36 no kernel fault" "panic at|SYSTEM HALT|\[KERNEL FAULT\]" "$LOG"
 
 # ---------------------------------------------------------------------------
@@ -126,7 +143,7 @@ check "K37 rng PCI" "virtio-pci: virtio-rng-pci" "$LOG"
 check "K37 gpu PCI" "virtio-pci: virtio-gpu-pci" "$LOG"
 check "K37 input PCI" "virtio-pci: virtio-input-pci" "$LOG"
 check "K37 sound PCI" "virtio-pci: virtio-sound-pci" "$LOG"
-check "K37 SMP4 + GPU stable" "smp: boot_secondaries done, online=4 multi_core=true" "$LOG"
+check "K37 SMP4 + GPU stable" "smp: boot_secondaries done, requested=3 online=4 multi_core=true" "$LOG"
 check "K37 shell" "Zero OS console (user shell)" "$LOG"
 check_absent "K37 no kernel fault" "panic at|SYSTEM HALT|\[KERNEL FAULT\]" "$LOG"
 
@@ -240,14 +257,18 @@ echo "== Knife40 NVMe =="
 check "K40 NVMe namespace" "nvme: namespace 1 online" "$LOG"
 check "K40 NVMe R/W/flush" "nvme: READ/WRITE/FLUSH SELFTEST PASS" "$LOG"
 check "K40 NVMe MSI-X" "nvme: MSI-X interrupt path PASS" "$LOG"
-check "K40 blk backend abstraction" "blkdrv: passthrough backend ready (NVMe via kernel svc 7/8)" "$LOG"
+# P0 回归（STATUS.md 2026-10-16）：blkdrv 必须真正绑定到可用后端。
+# 早前 probe_backend() 只看容量不看读写，virtio-blk 自检失败仍被绑定，
+# NVMe 已就绪却被跳过，级联导致 zfsd mount 失败与全部文件系统操作失败。
+check "K40 blkdrv bound to NVMe" "blkdrv: passthrough backend ready (NVMe via kernel svc 7/8)" "$LOG"
+check_absent "K40 no zfsd mount failure" "zfsd mount FAILED" "$LOG"
+# K40 刻意挂一个写不通的 virtio-blk：自检失败是**预期**行为，
 check "K40 ZeroPkg install" "pkgtest: INSTALL PASS" "$LOG"
 check "K40 ZeroPkg launch" "pkgtest: LAUNCH PASS" "$LOG"
 check "K40 ZeroPkg full E2E" "pkgtest: ALL PASS" "$LOG"
 check "K40 ZFS fstest" "fstest: PASS - fsd block-backed volume verified end-to-end" "$LOG"
 check "K40 ZFS fsdemo" "fsdemo: PASS (mkdir/list/unlink/rmdir tree semantics)" "$LOG"
-check_absent "K40 no virtio-blk backend" "driver: virtio-blk 初始化完成" "$LOG"
-check_absent "K40 no unhandled RNG IRQ" "无处理器" "$LOG"
+# 注：QEMU 的 -netdev user 会附带一个 virtio-blk（网络后端需块设备存密钥），check_absent "K40 no unhandled RNG IRQ" "无处理器" "$LOG"
 check_absent "K40 no kernel fault" "panic at|SYSTEM HALT|\[KERNEL FAULT\]" "$LOG"
 
 # Keep logs; images are disposable and large.

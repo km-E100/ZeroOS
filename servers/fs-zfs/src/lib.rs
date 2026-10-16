@@ -1050,7 +1050,10 @@ where
 
 fn map_error(err: ServerError) -> u32 {
     match err {
-        ServerError::NotMounted => fs_proto::ERR_INVALID,
+        // 未挂载是「后端不可用」而非「调用方参数非法」：映射为 ERR_DEVICE，
+        // 使调用方能区分 fsd 侧故障与自己传错了参数。早前映射到 ERR_INVALID
+        // 时，块设备故障会伪装成参数错误，K40 排查因此绕了远路。
+        ServerError::NotMounted => fs_proto::ERR_DEVICE,
         ServerError::Fs(ZfsError::NotFound) => fs_proto::ERR_NOT_FOUND,
         ServerError::Fs(ZfsError::SignatureMismatch) => fs_proto::ERR_INVALID,
         ServerError::Fs(ZfsError::Device(DeviceError::Io)) => fs_proto::ERR_DEVICE,

@@ -47,6 +47,11 @@ struct VirtioBlkReq {
 struct VirtioBlkState {
     base: usize,
     ready: bool,
+    /// 读写往返自检是否通过。`ready` 仅代表设备枚举完成；K40 实测
+    /// 存在「自检写入失败但设备仍 ready」的情形，此时若 is_ready() 照旧
+    /// 返回 true，block_backend_kind() 会锁定这个坏设备并跳过已就绪的
+    /// NVMe，导致 fsd 挂载失败。此标志让后端选择回退到下一个候选设备。
+    healthy: bool,
     queue: Option<VirtQueue<QUEUE_SIZE>>,
     header: *mut VirtioBlkReq,
     status_ptr: *mut u8,
@@ -65,6 +70,7 @@ impl VirtioBlkState {
         Self {
             base: 0,
             ready: false,
+            healthy: false,
             queue: None,
             header: ptr::null_mut(),
             status_ptr: ptr::null_mut(),
@@ -149,10 +155,14 @@ pub fn init(descriptor: &DriverDescriptor) {
 }
 
 /// 上电自检：向专用测试扇区写入特征图案，读回逐字节比对。
-/// 失败仅告警不阻塞启动（设备保持 ready，交由调用方按错误处理）。
+///
+/// 返回自检是否真正通过。**失败会清除 STATE.healthy**，使 is_ready()
+/// 返回 false，block_backend_kind() 因而回退到下一候选后端（如 NVMe）。
+/// 早前版本失败仅告警而保留 ready=true，会让一个写不通的设备永久占据
+/// 块设备栈——K40 硬件矩阵正是因此全盘失效（见 STATUS.md P0）。
 const SELF_TEST_LBA: u64 = 2048; // 1MiB 偏移；避开 userdb（LBA 128）等既有数据
 
-fn self_test() {
+fn self_test() -> bool {
     let mut pattern = [0u8; SECTOR_SIZE];
     for (i, byte) in pattern.iter_mut().enumerate() {
         // 与 LBA 相关的确定性图案，全 0 盘也能区分"读到旧数据"与"比对一致"。
@@ -163,7 +173,8 @@ fn self_test() {
             "driver: virtio-blk 自检写入失败 (LBA={}): {:?}",
             SELF_TEST_LBA, e
         );
-        return;
+        mark_unhealthy();
+        return false;
     }
     let mut readback = [0u8; SECTOR_SIZE];
     if let Err(e) = read_blocks(SELF_TEST_LBA, &mut readback) {
@@ -171,7 +182,8 @@ fn self_test() {
             "driver: virtio-blk 自检读回失败 (LBA={}): {:?}",
             SELF_TEST_LBA, e
         );
-        return;
+        mark_unhealthy();
+        return false;
     }
     if readback != pattern {
         if let Some(off) = readback
@@ -186,21 +198,35 @@ fn self_test() {
         } else {
             warn!("driver: virtio-blk 自检比对不一致");
         }
-        return;
+        mark_unhealthy();
+        return false;
     }
     info!(
         "driver: virtio-blk 自检通过：LBA {} 写入+读回 {} 字节比对一致",
         SELF_TEST_LBA, SECTOR_SIZE
     );
+    STATE.lock().healthy = true;
+    true
 }
 
+/// 自检失败：标记设备不可用，使其不再被 block_backend_kind() 选中。
+/// 保留 ready（枚举确实完成）以便诊断打印，但数据面已不可信。
+fn mark_unhealthy() {
+    STATE.lock().healthy = false;
+}
+
+/// 设备是否可安全用于数据面：枚举完成 **且** 上电自检通过。
+///
+/// healthy 由 self_test() 在启动早期置位。自检未跑或已失败的设备返回
+/// false，使 block_backend_kind() 回退到其他候选后端而非绑定坏设备。
 pub fn is_ready() -> bool {
-    STATE.lock().ready
+    let state = STATE.lock();
+    state.ready && state.healthy
 }
 
 pub fn capacity_sectors() -> Option<u64> {
     let state = STATE.lock();
-    (state.ready && state.capacity_sectors > 0).then_some(state.capacity_sectors)
+    (state.ready && state.healthy && state.capacity_sectors > 0).then_some(state.capacity_sectors)
 }
 
 pub fn read_blocks(lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
