@@ -16,6 +16,13 @@ case "${1:-}" in
   --no-build) SKIP_BUILD=1 ;;
   *) echo "usage: $0 [--no-build]" >&2; exit 2 ;;
 esac
+# 同 hardware-acceptance.sh：非交互 shell 的 PATH 常缺 Homebrew bin，
+# 需回退到常见安装位置，否则会误用别处的旧版 QEMU 导致 UEFI 启动失败。
+if ! command -v "$QEMU" >/dev/null 2>&1; then
+  for cand in /opt/homebrew/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64; do
+    if [ -x "$cand" ]; then QEMU="$cand"; break; fi
+  done
+fi
 command -v "$QEMU" >/dev/null
 [ -f "$BIOS" ]
 if [ "$SKIP_BUILD" -eq 0 ]; then cargo run -p xtask -- build-iso; fi

@@ -29,6 +29,16 @@ case "${1:-}" in
   *) echo "hardware-acceptance: 用法: $0 [--no-build]" >&2; exit 2 ;;
 esac
 
+# 解析 QEMU：非交互 shell 的 PATH 往往不含 Homebrew bin，直接 command -v
+# 会报 "missing qemu-system-aarch64"；若此前跑到了别处的旧版 QEMU，UEFI
+# 固件会以 "Image type X64 canNOT be loaded on AARCH64" 这类与代码无关的
+# 失败告终（表现为 K35/36 日志里只有固件错误、系统根本没启动）。
+# 先按 PATH 找，找不到再查常见安装位置。
+if ! command -v "$QEMU" >/dev/null 2>&1; then
+  for cand in /opt/homebrew/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64; do
+    if [ -x "$cand" ]; then QEMU="$cand"; break; fi
+  done
+fi
 command -v "$QEMU" >/dev/null || { echo "missing $QEMU" >&2; exit 1; }
 [ -f "$BIOS" ] || { echo "missing BIOS $BIOS" >&2; exit 1; }
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -221,21 +231,66 @@ EOF
 cargo run -q -p zero-user-commands --bin zeropkg -- pack "$APP" -o "$FIX/pkgtest.zpkg" \
   --origin zero-os --sign-key tools/testkeys/zeropkg-zero-os-dev.seed.hex >/dev/null
 
-if lsof -iTCP:8443 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "hardware-acceptance: TCP 8443 already in use; K40 local repo needs it" >&2
+# K40 本地仓库 TLS 端口固定 8443：pkgtest 的 URL 在编译期硬编码
+# （servers/pkgtest/src/lib.rs:5），系统既无参数传递也无环境变量，端口无法
+# 运行时注入。因此这里只做**明确的前置检测**——本机 8443 可能被其他进程
+# 占用而 lsof 查不到（被系统锁定或属其他用户），此时 openssl s_server 只会写
+# 一行 BIO_bind:Address already in use 后静默退出，而 Zero OS 侧表现为
+# pkgtest: install failed: network，把宿主端口占用误报成网络栈缺陷。
+# K40 本地仓库 TLS 端口。pkgtest 的仓库地址在编译期硬编码为一组候选端口
+# （servers/pkgtest/src/lib.rs URL_CANDIDATES），系统既无参数传递也无环境
+# 变量，无法运行时注入端口，因此这里必须挑一个候选里真正可 bind 的。
+#
+# 用 bind 而不是 connect_ex 探测：openssl s_server 的成败取决于 bind，
+# 而宿主上 443/8443 可能被系统组件或网络扩展占用——bind 直接失败，
+# lsof 却查不到属主。若不预先挑选，s_server 会只写一行
+# "BIO_bind: Address already in use" 后静默退出，Zero OS 侧表现为
+# "pkgtest: install failed: network"，把宿主端口占用误报成网络栈缺陷。
+TLS_PORT=$(python3 -c "
+import socket
+for p in (8443, 8444, 18443):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('', p))
+        s.close()
+        print(p)
+        break
+    except OSError:
+        pass
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+" 2>/dev/null || true)
+[ -n "${TLS_PORT:-}" ] || {
+  echo "hardware-acceptance: 8443/8444/18443 均不可 bind，K40 无法进行" >&2
   exit 1
-fi
+}
+echo "hardware-acceptance: K40 本地仓库 TLS 端口 = $TLS_PORT"
 (
   cd "$FIX"
-  exec openssl s_server -accept 8443 \
+  exec openssl s_server -accept "$TLS_PORT" \
     -cert "$ROOT/tools/testkeys/zeropkg-repo-server.cert.pem" \
     -key "$ROOT/tools/testkeys/zeropkg-repo-server.key.pem" -WWW -quiet
 ) >"$OUT/k40.tls.log" 2>&1 &
 TLSPID=$!
-for i in $(seq 1 30); do
-  lsof -iTCP:8443 -sTCP:LISTEN >/dev/null 2>&1 && break
+# 端口检查与 s_server 启动之间存在竞态：前一次运行的残留进程可能尚未释放
+# 8443，导致本次 s_server 静默 bind 失败（日志仅写 BIO_bind:Address already in use），
+# 而 Zero OS 侧表现为 pkgtest: install failed: network——一个与网络栈毫无
+# 关系的失败表象。这里等待端口**确实**进入 LISTEN，否则直接报错退出，
+# 避免把基础设施故障误报为系统缺陷。
+TLS_UP=0
+for i in $(seq 1 50); do
+  if lsof -iTCP:"$TLS_PORT" -sTCP:LISTEN >/dev/null 2>&1; then TLS_UP=1; break; fi
   sleep .1
 done
+if [ "$TLS_UP" -ne 1 ]; then
+  echo "hardware-acceptance: TLS 测试服务器未能监听 $TLS_PORT（见 $OUT/k40.tls.log）" >&2
+  kill_pid "$TLSPID" 2>/dev/null || true
+  exit 1
+fi
 
 LOG="$OUT/k40.log"; DISK="$OUT/k40-nvme.img"; rm -f "$LOG" "$DISK"; truncate -s 32M "$DISK"
 {

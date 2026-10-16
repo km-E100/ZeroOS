@@ -2,7 +2,18 @@
 
 use zero_abi::{channels, ipc::Message, protocol::pkg as pp, syscall::SysError};
 
-const URL: &str = "https://10.0.2.2:8443/pkgtest.zpkg";
+/// 候选仓库地址。
+///
+/// 首选 8443（hardware-acceptance.sh 的默认端口），但该端口在部分宿主
+/// 环境下会被系统组件或网络扩展占��——bind 失败而 lsof 查不到属主，
+/// Zero OS 侧只会看到 "install failed: network"，把宿主端口占用误报成
+/// 网络栈缺陷。系统既无参数传递也无环境变量，端口无法注入，
+/// 因此这里按序尝试多个端口：任一可用即视为通过。
+const URL_CANDIDATES: [&str; 3] = [
+    "https://10.0.2.2:8443/pkgtest.zpkg",
+    "https://10.0.2.2:8444/pkgtest.zpkg",
+    "https://10.0.2.2:18443/pkgtest.zpkg",
+];
 const ID: &str = "org.zero.pkgtest";
 
 fn print(s: &str) {
@@ -48,7 +59,25 @@ pub extern "C" fn server_main() -> ! {
     // Clean up a prior interrupted run. Either outcome is acceptable.
     let _ = rpc(pp::REMOVE, ID);
 
-    expect_ok(pp::INSTALL_URL, URL, "pkgtest: INSTALL PASS\r\n", 91);
+    // 依次尝试候选地址。任一成功即继续后续校验。
+    let mut installed = false;
+    for url in URL_CANDIDATES.iter() {
+        match rpc(pp::INSTALL_URL, url) {
+            Ok(r) if r.code == pp::OK => {
+                installed = true;
+                break;
+            }
+            _ => {
+                // 该端口不可用，退避后试下一个，避免连续快速失败。
+                let _ = userlib::sleep_ticks(20);
+            }
+        }
+    }
+    if !installed {
+        print("pkgtest: FAIL: install failed on all candidate ports\r\n");
+        userlib::exit(91);
+    }
+    print("pkgtest: INSTALL PASS\r\n");
     expect_ok(pp::VERIFY, ID, "pkgtest: VERIFY PASS\r\n", 92);
     match rpc(pp::LIST, "") {
         Ok(r) if r.code == pp::OK && payload_text(&r).contains(ID) => {
